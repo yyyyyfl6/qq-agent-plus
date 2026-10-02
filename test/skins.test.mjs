@@ -7,6 +7,7 @@ import { ChatStore } from '../src/core/store.js';
 import { setRuntimeConfig, getConfig, DEFAULT_CONFIG } from '../src/core/config.js';
 import { MemoryStore } from '../src/memory/memory.js';
 import { SkinMemoryStore } from '../src/skins/memory.js';
+import { backupPersonBeforeConsolidation } from '../src/memory/memory-consolidation-backup.js';
 import { buildSystemPrompt } from '../src/llm/prompt.js';
 
 const skinModule = await import('../src/skins/skins.js').catch(() => ({}));
@@ -167,6 +168,10 @@ test('memory migration preserves originals, meta, handoff, people and backup iso
   const memoryDir = path.join(dir, 'memory');
   const legacy = new MemoryStore({ memoryDir });
   legacy.append('group:1', 'memberImpression', '鱼认识这个人', { userId: '42', target: '甲' });
+  // 上游旧备份包含全局人物快照；迁移时既要留下审计历史，也要剔除其它会话来源。
+  const person = legacy.getMember('', '42');
+  const mixed = { ...person, impressions: [...person.impressions, { content: '另一个会话的秘密', sourceChatKeys: ['group:2'] }] };
+  backupPersonBeforeConsolidation(mixed, { memoryDir, sourceChatKey: 'group:1' });
   legacy.setHandoff('group:1', { summary: '旧交接' });
   legacy.markConsolidated('group:1', 12345);
   const skins = new SkinManager({ store, getConfig });
@@ -174,6 +179,13 @@ test('memory migration preserves originals, meta, handoff, people and backup iso
   assert.match(memory.query('group:1').memberImpression[0].content, /鱼/);
   assert.equal(memory.getHandoff('group:1').summary, '旧交接');
   assert.ok(memory.consolidationState('group:1').lastConsolidatedAt >= 12345);
+  const fishRoot = path.join(memoryDir, 'group_1', 'skins', 'fish');
+  const snapshots = fs.readdirSync(path.join(fishRoot, 'backups', 'consolidation', '42'));
+  assert.equal(snapshots.length, 1);
+  const migratedSnapshot = fs.readFileSync(path.join(fishRoot, 'backups', 'consolidation', '42', snapshots[0]), 'utf8');
+  assert.match(migratedSnapshot, /鱼认识这个人/);
+  assert.ok(!migratedSnapshot.includes('秘密'));
+  assert.ok(!fs.readFileSync(path.join(fishRoot, 'backups', 'group_1', '42.json'), 'utf8').includes('秘密'));
   await skins.switchSkin('group:1', 'cat');
   assert.deepEqual(memory.query('group:1').memberImpression, []);
   assert.equal(memory.getHandoff('group:1'), null);

@@ -1872,7 +1872,7 @@ export function createApp({
     const chatKey = `${params[1]}:${params[2]}`;
     // 单群消息上限 2^20（Kondius 钦定）：约等于不限，存档一口气全给
     const limit = Math.min(1048576, Math.max(1, Number(url.searchParams.get('limit')) || 1048576));
-    const viewSkin = url.searchParams.get('skinId') || '';
+    const viewSkin = skins.enabled ? url.searchParams.get('skinId') || '' : '';
     if (viewSkin && !skins.settings.list.some((s) => s.id === viewSkin)) return json(res, 400, { error: '皮肤不存在' });
     const sourceMessages = skins.scope(chatKey, () => store.recent(chatKey, { limit }), viewSkin);
     const messages = sourceMessages.map((m) => ({

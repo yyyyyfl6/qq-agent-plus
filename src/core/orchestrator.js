@@ -845,6 +845,7 @@ export class Orchestrator {
     this.wakeTimers.delete(chatKey);
     this.pendingWake.delete(chatKey);
     this.firstPendingAt.delete(chatKey);
+    this.pendingRolls.delete(chatKey);
     const waiting = this.pendingSessions.get(chatKey);
     if (waiting) this.#discardWaiting(waiting);
     this.pendingSessions.delete(chatKey);
