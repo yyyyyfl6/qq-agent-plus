@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { DATA_DIR, getConfig } from './config.js';
+import { skinScope } from '../skins/context.js';
 import { estimateCost } from '../llm/llm.js';
 import { vendorOfConfig } from '../pricing/model-prices.js';
 import { todayKey } from './util.js';
@@ -101,6 +102,7 @@ export class SessionRegistry {
     return {
       id: s.id,
       chatKey: s.chatKey,
+      ...(s.skinId ? { skinId: s.skinId } : {}),
       startedAt: s.startedAt,
       endedAt: s.endedAt ?? null,
       status: s.status,                      // waiting | running | done | noreply | error | aborted
@@ -137,6 +139,7 @@ export class SessionRegistry {
     const session = {
       id: newSessionId(),
       chatKey,
+      ...(getConfig().skins?.enabled && skinScope()?.skinId ? { skinId: skinScope().skinId } : {}),
       startedAt: Date.now(),
       endedAt: null,
       status,

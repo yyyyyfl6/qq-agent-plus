@@ -1,3 +1,5 @@
+import { skinScope } from '../skins/context.js';
+import { normalizeSkins } from '../skins/skins.js';
 // Production configuration adapter.
 //
 // The historical normalizer/persistence implementation remains in
@@ -94,8 +96,9 @@ export function loadConfig() {
   return stabilize(legacy.loadConfig());
 }
 
-export function getConfig() {
-  return stabilize(legacy.getConfig(), { persist: true });
+export function getConfig({ unscoped = false } = {}) {
+  const cfg = stabilize(legacy.getConfig(), { persist: true });
+  return !unscoped && skinScope()?.resolveConfig ? skinScope().resolveConfig(cfg) : cfg;
 }
 
 /** The only administrator QQ configuration read/written by current code. */
@@ -297,6 +300,8 @@ export function updateConfig(patch) {
   const rawPatch = structuredClone(
     patch && typeof patch === 'object' ? patch : {}
   );
+  if (rawPatch.skins !== undefined) rawPatch.skins = normalizeSkins({ ...current.skins, ...rawPatch.skins,
+    handoffOnSwitch: { ...current.skins?.handoffOnSwitch, ...rawPatch.skins?.handoffOnSwitch } });
   const requestedAdmin = normalizedRequestedAdmin(rawPatch, current);
   const autoUpdateEnabled = hasOwn(rawPatch?.autoUpdate, 'enabled')
     ? rawPatch.autoUpdate.enabled === true

@@ -1,0 +1,77 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
+import { test } from 'node:test';
+
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-skins-api-'));
+process.env.QQ_AGENT_DATA_DIR = root;
+const { DEFAULT_CONFIG, updateConfig } = await import('../src/core/config.js');
+const { createApp } = await import('../src/console/app.js');
+
+test('real console APIs authenticate, preserve partial settings, isolate archives and route summaries to the leaving provider', async (t) => {
+  const requests = [];
+  const model = http.createServer(async (req, res) => {
+    let body = ''; for await (const chunk of req) body += chunk;
+    requests.push({ path: req.url, auth: req.headers.authorization, body: JSON.parse(body) });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: '鱼刚刚讨论了项目，接任者应继续核对。' }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }));
+  });
+  let app;
+  t.after(async () => { if (app) await app.stop(); await new Promise((r) => model.close(r)); fs.rmSync(root, { recursive: true, force: true }); });
+  await new Promise((resolve) => model.listen(0, '127.0.0.1', resolve));
+  const endpoint = `http://127.0.0.1:${model.address().port}`;
+  const cfg = structuredClone(DEFAULT_CONFIG);
+  cfg.server = { host: '127.0.0.1', port: 3210, token: 'skins-test-token' };
+  cfg.runtime.mode = 'observe';
+  cfg.onebot = { ...cfg.onebot, wsUrl: 'ws://127.0.0.1:1', httpUrl: 'http://127.0.0.1:1' };
+  cfg.api = { ...cfg.api, baseUrl: '', apiKey: '', priceRemoteUrl: 'none' };
+  cfg.providers = [{ id: 'ds', name: '鱼', baseURL: endpoint + '/ds/v1' }, { id: 'gm', name: '猫', baseURL: endpoint + '/gm/v1' }];
+  cfg.providerKeys = { ds: 'test-fish-key', gm: 'test-cat-key' };
+  cfg.skins.enabled = true;
+  cfg.skins.list[0].provider = 'ds'; cfg.skins.list[1].provider = 'gm';
+  cfg.skins.handoffOnSwitch.maxChars = 400;
+  updateConfig(cfg);
+  app = createApp({ log: () => {} });
+  // 只启动 HTTP 路由，避免真实 OneBot 重连、后台任务与外部模型探测干扰验收。
+  await new Promise((r) => app.server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${app.server.address().port}`;
+  const call = async (route, body, authed = true) => {
+    const res = await fetch(base + route, { method: body ? 'POST' : 'GET', headers: { 'content-type': 'application/json', ...(authed ? { 'x-console-token': 'skins-test-token' } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}) });
+    return { status: res.status, data: await res.json() };
+  };
+  assert.equal((await call('/api/skins', null, false)).status, 401);
+  assert.equal((await call('/api/chat-skins', { chatKey: 'group:1', skinId: 'cat' }, false)).status, 401);
+  const settings = await call('/api/skins');
+  assert.equal(settings.status, 200);
+  assert.ok(!JSON.stringify(settings.data).includes('test-fish-key'));
+  app.store.appendIncoming('group:1', { mid: 'fish-1', text: '鱼的项目', senderId: '42' });
+  const fish = app.skins.scope('group:1', () => app.sessions.create({ chatKey: 'group:1', trigger: [], triggerSummary: 'fish' }));
+  app.sessions.finish(fish.id, 'noreply');
+  assert.equal((await call('/api/chat-skins', { chatKey: 'group:1', skinId: 'cat' })).status, 200);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].path, '/ds/v1/chat/completions');
+  assert.equal(requests[0].auth, 'Bearer test-fish-key');
+  assert.equal(requests[0].body.model, 'deepseek-flash');
+  assert.match(app.skins.handoffPrompt('group:1'), /不是你亲历/);
+  app.store.appendIncoming('group:1', { mid: 'cat-1', text: '猫的项目', senderId: '42' });
+  const cat = app.skins.scope('group:1', () => app.sessions.create({ chatKey: 'group:1', trigger: [], triggerSummary: 'cat' }));
+  app.sessions.finish(cat.id, 'noreply');
+  const catArchive = await call('/api/chats/group_1/messages?skinId=cat');
+  assert.equal(catArchive.status, 200);
+  assert.deepEqual(catArchive.data.messages.map((m) => m.text), ['猫的项目']);
+  const fishArchive = await call('/api/chats/group_1/messages?skinId=fish');
+  assert.deepEqual(fishArchive.data.messages.map((m) => m.text), ['鱼的项目']);
+  const catSessions = await call('/api/sessions?skinId=cat');
+  assert.deepEqual(catSessions.data.sessions.map((s) => s.id), [cat.id]);
+  const off = await call('/api/skins', { handoffOnSwitch: { enabled: false } });
+  assert.equal(off.data.skins.handoffOnSwitch.maxChars, 400);
+  assert.equal(app.skins.handoffPrompt('group:1'), '');
+  await call('/api/chat-skins', { chatKey: 'group:1', skinId: 'fish' });
+  assert.equal(requests.length, 1, '关闭摘要后切换不应调用模型');
+  assert.equal((await call('/api/chat-skins?chatKey=group:1')).data.chats[0].skinId, 'fish');
+  assert.equal((await call('/api/skins', { list: [{ id: '../bad' }] })).status, 400);
+  await call('/api/skins', { enabled: false });
+  assert.deepEqual((await call('/api/chats/group_1/messages')).data.messages.map((m) => m.text), ['鱼的项目']);
+});

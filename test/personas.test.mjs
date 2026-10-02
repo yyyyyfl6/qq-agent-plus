@@ -111,6 +111,14 @@ test('每张内置卡都有正例示例段（示例里至少有 3 组「你可�
 
 test('名称即规格：每张卡都写明招牌的正向下限，且被问人设时报得出卡名', () => {
   for (const [id, p] of Object.entries(PERSONAS)) {
+    // 双人格卡由管理员原样提供；绰号不是鱼的自称，不能用旧卡的字面卡名规格逼它冒认。
+    if (id === 'blue_fish' || id === 'hajimi') {
+      assert.match(p.text, id === 'blue_fish' ? /你是 DeepSeek/ : /你是 Gemini/);
+      assert.match(p.text, /双人格共存/);
+      assert.match(p.text, /不是你的亲历记忆/);
+      assert.match(p.text, id === 'blue_fish' ? /开口就带/ : /开口带角色味/);
+      continue;
+    }
     // 卡名去掉括注就是这张卡必须兑现的特征名（损友 / 温柔陪聊 / 技术宅 / 猫娘 / 小鲸鱼）
     const cardName = p.name.replace(/（[^）]*）/g, '').trim();
     assert.ok(cardName, `${id} 的显示名解析不出卡名`);
@@ -137,6 +145,11 @@ test('名称即规格：每张卡都写明招牌的正向下限，且被问人�
 // 五张卡有三张先警惕反问，"帮我写个周报"温柔陪聊直接不回。
 test('每张内置卡都写明对管理员怎么相处（口吻比对群友软一档）', () => {
   for (const [id, p] of Object.entries(PERSONAS)) {
+    if (id === 'hajimi') {
+      assert.match(p.text, /管理员是自己人/);
+      assert.match(p.text, /不用警惕腔把他挡回去/);
+      continue;
+    }
     assert.match(p.text, /对管理员/, `${id} 缺少"对管理员"那一条`);
     assert.match(p.text, /\[管理员\] 标记/, `${id} 对管理员的那条要点明是按 [管理员] 标记认人`);
   }

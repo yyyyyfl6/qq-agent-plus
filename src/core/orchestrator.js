@@ -1,3 +1,4 @@
+import { skinScope } from '../skins/context.js';
 // 编排器：事件驱动的"无状态运行"核心。
 //
 // 流程（对应需求）：
@@ -383,6 +384,8 @@ export class Orchestrator {
     this.consolidating = new Set();    // 正在整理记忆的 chatKey
     this.runningChats = new Set();     // 正在运行的 chatKey
     this.activeRuns = new Map();       // chatKey -> sessionId
+    this.skinTasks = new Map();
+    this.skinSwitching = new Set();
     this.runSeq = new Map();           // chatKey -> 第几次处理（跨重启清零即可）
     // 预判时掷出的随机骰子：{ chatKey -> { roll, at } }。
     // 概率档下"要不要回"是随机的，预判（建等待会话）与实跑（真跑）必须用同一次，
@@ -518,6 +521,8 @@ export class Orchestrator {
 
   /** 收到新消息（已通过白名单校验并写入 store）。 */
   onIncoming(chatKey) {
+    if (this.skinSwitching.has(chatKey)) return;
+    if (this.skins?.enabled && skinScope()?.chatKey !== chatKey) return this.skins.scope(chatKey, () => this.onIncoming(chatKey));
     if (this.paused || this.aborted || !canRun(chatKey)) return;
     if (!this.#chatRuntimeDecision(chatKey).allowed) return;
     if (this.runningChats.has(chatKey)) return;   // 运行结束后 drain 会接管
@@ -736,6 +741,8 @@ export class Orchestrator {
   }
 
   scheduleWake(chatKey, delay = null) {
+    if (this.skinSwitching.has(chatKey)) return;
+    if (this.skins?.enabled && skinScope()?.chatKey !== chatKey) return this.skins.scope(chatKey, () => this.scheduleWake(chatKey, delay));
     if (this.paused || this.aborted || !canRun(chatKey)) return;
     if (!this.#chatRuntimeDecision(chatKey).allowed) return;
     const now = Date.now();
@@ -830,6 +837,22 @@ export class Orchestrator {
    * 而不是一条等了半天最后标着"中止"的条目（那会让人以为机器人坏了）。
    * 只有真正运行过（消耗了 token）的会话才走 #finishWaiting 留痕。
    */
+  async prepareSkinSwitch(chatKey) {
+    this.skinSwitching.add(chatKey);
+    this.controllers.get(chatKey)?.abort(new Error('皮肤切换，cancel 当前运行'));
+    await this.skinTasks.get(chatKey)?.catch(() => {});
+    clearTimeout(this.wakeTimers.get(chatKey));
+    this.wakeTimers.delete(chatKey);
+    this.pendingWake.delete(chatKey);
+    this.firstPendingAt.delete(chatKey);
+    const waiting = this.pendingSessions.get(chatKey);
+    if (waiting) this.#discardWaiting(waiting);
+    this.pendingSessions.delete(chatKey);
+    const scheduled = this.scheduledWakes.get(chatKey);
+    if (scheduled?.timer) clearTimeout(scheduled.timer);
+    this.scheduledWakes.delete(chatKey);
+  }
+
   #budgetNotifiedDay = '';
 
   /**
@@ -878,6 +901,8 @@ export class Orchestrator {
 
   /** 手动触发一次处理，并返回供控制台展示的明确结果。 */
   requestManualWake(chatKey) {
+    if (this.skinSwitching.has(chatKey)) return { ok: false, reason: '正在切换皮肤' };
+    if (this.skins?.enabled && skinScope()?.chatKey !== chatKey) return this.skins.scope(chatKey, () => this.requestManualWake(chatKey));
     if (this.aborted) return { ok: false, reason: 'Agent 正在停止' };
     if (this.paused) return { ok: false, reason: 'Agent 已暂停' };
     if (!canRun(chatKey)) {
@@ -916,13 +941,19 @@ export class Orchestrator {
   wake(chatKey, options = {}) {
     // #6：每次运行一个 trace id —— 运行期日志自动带 [id] 前缀，/api/status 的 lastTraceId
     // 记录"最近一次运行"（拿它去 journalctl / 日志文件捞整条链路）
-    const task = withTrace(newTraceId(), () => withTimeScope(chatKey, () => this.#wake(chatKey, options)));
+    const run = () => withTrace(newTraceId(), () => withTimeScope(chatKey, () => this.#wake(chatKey, options)));
+    const task = this.skins?.enabled
+      ? this.skins.scope(chatKey, run, this.skins.current(chatKey, '', { unscoped: true }).id)
+      : run();
+    this.skinTasks.set(chatKey, task);
+    task.finally(() => { if (this.skinTasks.get(chatKey) === task) this.skinTasks.delete(chatKey); }).catch(() => {});
     this.runTasks.add(task);
     task.then(() => this.runTasks.delete(task), () => this.runTasks.delete(task));
     return task;
   }
 
   async #wake(chatKey, { proactive = false, manual = false, waitingSessionId = null, wakeNote = '', paced = false } = {}) {
+    if (this.skinSwitching.has(chatKey)) return;
     if (!canRun(chatKey)) { if (waitingSessionId) this.#discardWaiting(waitingSessionId); return; }
     if (!this.#chatRuntimeDecision(chatKey).allowed) {
       if (waitingSessionId) this.#discardWaiting(waitingSessionId);
@@ -1466,7 +1497,7 @@ export class Orchestrator {
       return true;
     });
     const openAiTools = toOpenAiTools(toolDefs);
-    const systemPrompt = buildSystemPrompt({
+    let systemPrompt = buildSystemPrompt({
       // 与【此刻状态】用同一个名字（群名片优先），否则同一次请求里会出现两个"你在群里的名字"
       selfNickname,
       // 进行中的游戏：只注入公开摘要（不含词与身份）
@@ -1475,6 +1506,12 @@ export class Orchestrator {
       friendProposalAvailable,
       stickerEntries
     });
+    const skinHandoff = this.skins?.handoffPrompt(chatKey) || '';
+    if (skinHandoff) {
+      systemPrompt += '\n\n' + skinHandoff;
+      this.skins.markHandoffUsed(chatKey);
+    }
+    if (this.skins?.enabled) session.skinId = skinScope()?.skinId || '';
     const promptPrefixHash = crypto.createHash('sha256')
       .update(String(cfg.api.provider || ''))
       .update('\0')
@@ -2216,10 +2253,11 @@ export class Orchestrator {
    *   4) 既无名也无号 → 跳过。
    */
   consolidateMemoryForChat(chatKey, options = {}) {
-    return withTimeScope(chatKey, async () => {
+    const run = () => withTimeScope(chatKey, async () => {
       assertTimeAllowed();
       return this.#consolidateMemoryForChat(chatKey, options);
     });
+    return this.skins?.enabled ? this.skins.scope(chatKey, run) : run();
   }
 
   async #consolidateMemoryForChat(chatKey, { userIds = null, force = false } = {}) {

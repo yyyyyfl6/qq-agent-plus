@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>双人格皮肤 · QQ Agent</title><link rel="stylesheet" href="/style.css">
+  <style>
+    body { overflow:auto; } main { max-width:1000px; margin:32px auto; padding:24px; }
+    label { display:block; margin:16px 0; } input,select,textarea { max-width:100%; }
+    textarea { width:100%; min-height:300px; font-family:monospace; }
+    .skin-row { display:flex; flex-wrap:wrap; align-items:center; gap:12px; padding:12px 0; }
+    #skin-status { min-height:30px; } h1 { margin:20px 0; }
+  </style>
+</head>
+<body><main id="skins-page">
+  <a href="/">← 返回控制台</a><h1>双人格皮肤</h1>
+  <p>每个会话独立选择人格、提供商和模型。记忆与存档按皮肤保存，关闭功能保留所有数据。</p>
+  <p id="skin-status" role="status">加载中…</p>
+  <form id="skins-form">
+    <label><input id="skins-enabled" type="checkbox"> 启用皮肤系统</label>
+    <label><input id="skins-handoff" type="checkbox"> 切换时总结另一人格的最近对话</label>
+    <label>默认皮肤 <select id="skins-default"></select></label>
+    <label>切换回执 <input id="skins-ack" placeholder="已切换到 {label}"></label>
+    <label>皮肤列表（JSON；provider 填本实例的提供商 id）<textarea id="skins-list" spellcheck="false"></textarea></label>
+    <p id="skins-providers"></p>
+    <button class="btn" type="submit">保存皮肤设置</button>
+  </form>
+  <h2>会话绑定</h2><p>切换会结束当前线程；开启交接时会产生一次摘要调用。</p>
+  <div id="skins-chats"></div>
+  <p>在存档页可只查看某个皮肤的历史，也可单独切换正在使用的皮肤。</p>
+</main><script type="module" src="/skins.js"></script></body></html>

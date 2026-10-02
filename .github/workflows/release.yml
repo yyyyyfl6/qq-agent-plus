@@ -2,6 +2,8 @@ name: Release
 
 on:
   push:
+    branches:
+      - dual-skin
     tags:
       - 'v*'
 
@@ -63,16 +65,11 @@ jobs:
           for f in "${shells[@]}"; do bash -n "$f"; done
           echo "Shell 语法检查通过（${#shells[@]} 个）"
       - run: node src/ops.js scan --strict
-      - run: npm run test:unit
+      - run: npm test
       - run: npm run test:local
-      - name: 提示词 / 渲染 / 滚动 / 用量端到端回归
-        run: |
-          node test/test-prompt.mjs
-          node test/render-test.mjs
-          node test/scroll-test.mjs
-          node test/usage-e2e.mjs
 
   release:
+    if: startsWith(github.ref, 'refs/tags/')
     needs: verify
     runs-on: ubuntu-latest
     # 写权限只给这个 job：它只做"生成说明 + 建草稿 Release"，不跑 npm ci、不跑测试。
@@ -117,3 +114,29 @@ jobs:
             --draft \
             --title "${GITHUB_REF_NAME}" \
             --notes-file RELEASE_NOTES.md
+
+  # 主人已授权 fork 发版；普通开发提交只验证，显式发布提交才走这一步。
+  # 验证 job 没有写权限，不能由依赖安装或测试过程提前生成发布物。
+  publish-dual-skin:
+    if: github.repository == 'yyyyyfl6/qq-agent-plus' && github.ref == 'refs/heads/dual-skin' && contains(github.event.head_commit.message, '[release-dual-skin]')
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: 创建已验证 tag 和 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="v$(node -p 'require("./package.json").version')"
+          [ "$TAG" = v0.7.8 ] || { echo '版本不匹配'; exit 1; }
+          EXISTING="$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" --jq 'length')"
+          [ "$EXISTING" = 0 ] || { echo 'tag 已存在，禁止覆盖'; exit 1; }
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$GITHUB_SHA" >/dev/null
+          # GITHUB_TOKEN 创建的 tag 不会再次触发工作流；仍在本工作流内只建一份草稿。
+          gh release create "$TAG" --verify-tag --draft --title "$TAG · 双人格皮肤" --notes-file docs/RELEASE-v0.7.8.md
+          gh release edit "$TAG" --draft=false --latest

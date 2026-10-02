@@ -105,6 +105,15 @@ async function loadSessions({ quiet = false } = {}) {
     // 一次全取：后端上限 2^20（约等于不限），前端靠分页渲染（SESSION_PAGE）避免卡顿
     const data = await api('/api/sessions?limit=1048576');
     state.sessions = data.sessions || [];
+    state.sessionSkins = data.skins || [];
+    const skinFilter = $('#session-skin-filter');
+    if (skinFilter) {
+      skinFilter.hidden = !state.sessionSkins.length;
+      if (!state.sessionSkins.length) state.sessionSkinView = '';
+      skinFilter.innerHTML = '<option value="">全部皮肤</option>' + state.sessionSkins.map((s) => `<option value="${esc(s.id)}">${esc(s.label)}</option>`).join('');
+      skinFilter.value = state.sessionSkinView;
+      skinFilter.onchange = () => { state.sessionSkinView = skinFilter.value; renderSessionList(); };
+    }
     renderSessionList();
     // 自动跟随最新运行中的会话
     if (state.autoFollowRunning && !state.currentSessionId) {
@@ -185,7 +194,7 @@ function renderSessionList() {
   // 分页：一次只渲染 sessionLimit 条，滚到底部再加载下一批（见 SESSION_PAGE 常量）。
   // 会话可能积累到几百条，全量渲染会让列表变卡。
   state.sessionLimit = Math.max(SESSION_PAGE, Number(state.sessionLimit) || SESSION_PAGE);
-  const all = state.sessions || [];
+  const all = (state.sessions || []).filter((s) => !state.sessionSkinView || s.skinId === state.sessionSkinView);
   const displayItems = buildSessionDisplayItems(all);
   const shown = displayItems.slice(0, state.sessionLimit);
   const rest = displayItems.length - shown.length;

@@ -1,3 +1,4 @@
+import { logicalChatKey } from '../skins/context.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -7,8 +8,10 @@ import { safeSlice } from './util.js';
 
 function entry(row) {
   if (!row) return null;
+  const { skin_id: _skinId, ...legacyRow } = row;
+  legacyRow.chat_key = logicalChatKey(legacyRow.chat_key);
   return {
-    ...row, senderId: row.sender_id, senderName: row.sender_name,
+    ...legacyRow, senderId: row.sender_id, senderName: row.sender_name,
     self: !!row.self, read: row.state === 'acked',
     reply: row.reply ? JSON.parse(row.reply) : null,
     media: JSON.parse(row.media || '[]'),
@@ -25,7 +28,7 @@ function threadEntry(row) {
     participantIds = JSON.parse(row.participant_ids || '[]').map(String);
   } catch { /* keep empty */ }
   return {
-    chatKey: row.chat_key,
+    chatKey: logicalChatKey(row.chat_key),
     threadId: row.thread_id,
     mode: row.mode || 'threaded',
     state: row.state,
@@ -149,6 +152,16 @@ export class ChatStore {
     this.#importJson(dataDir);
   }
 
+  #tagSkin(table, chatKey) {
+    if (!this.skinManager?.initialized) return;
+    const skinId = chatKey.match(/\/skin\/([^/]+)$/)?.[1] || this.skinManager.legacySkin;
+    this.db.prepare(`UPDATE ${table} SET skin_id=? WHERE chat_key=?`).run(skinId, chatKey);
+  }
+
+  resolveChatKey(chatKey) { return this.skinManager?.storageKey(chatKey) || chatKey; }
+
+  transaction(fn) { return this.#transaction(fn); }
+
   #transaction(fn) {
     if (this.transactionDepth > 0) return fn();
     this.db.exec('BEGIN IMMEDIATE');
@@ -194,12 +207,16 @@ export class ChatStore {
   #append(chatKey, m, state) {
     const mid = m.mid == null ? null : String(m.mid);
     if (mid !== null) {
-      const existing = this.db.prepare('SELECT * FROM messages WHERE chat_key=? AND mid=?').get(chatKey, mid);
+      const baseKey = logicalChatKey(chatKey);
+      // 协议补拉和迟到回显不能把原皮肤的同一条消息重新归给当前皮肤。
+      const existing = this.skinManager?.enabled
+        ? this.db.prepare('SELECT * FROM messages WHERE (chat_key=? OR chat_key LIKE ?) AND mid=?').get(baseKey, `${baseKey}/skin/%`, mid)
+        : this.db.prepare('SELECT * FROM messages WHERE chat_key=? AND mid=?').get(chatKey, mid);
       if (existing) {
         // 首次落库与"后来才知道它是引擎私聊"可能竞速（发送端先写、回显后到，或反之）：
         // 命中重复时把 game-secret 补上，避免这行永远留在模型可见的历史里（2026-09-29 审查）
         if (m.eventKind === 'game-secret' && existing.event_kind !== 'game-secret') {
-          this.db.prepare("UPDATE messages SET event_kind='game-secret' WHERE chat_key=? AND mid=?").run(chatKey, mid);
+          this.db.prepare("UPDATE messages SET event_kind='game-secret' WHERE chat_key=? AND mid=?").run(existing.chat_key, mid);
           return { ...entry({ ...existing, event_kind: 'game-secret' }), duplicate: true, marked: true };
         }
         return { ...entry(existing), duplicate: true };
@@ -217,6 +234,10 @@ export class ChatStore {
       m.mentionsSelf ? 1 : 0, String(m.targetUserId || ''),
       String(m.eventKind || 'message'), state
     );
+    if (this.skinManager?.initialized) {
+      const skinId = chatKey.match(/\/skin\/([^/]+)$/)?.[1] || this.skinManager.legacySkin;
+      this.db.prepare('UPDATE messages SET skin_id=? WHERE chat_key=? AND id=?').run(skinId, chatKey, id);
+    }
     this.db.prepare('UPDATE chats SET next_id=next_id+1 WHERE chat_key=?').run(chatKey);
     if (this.maxPerChat > 0) {
       // Retention must never evict unprocessed or uncertain messages.
@@ -228,22 +249,28 @@ export class ChatStore {
   }
 
   appendIncoming(chatKey, message, { recordOnly = false } = {}) {
+    chatKey = this.resolveChatKey(chatKey);
     return this.#transaction(() => this.#append(
       chatKey, { ...message, self: false }, recordOnly ? 'acked' : 'pending'
     ));
   }
 
   appendSelf(chatKey, message) {
+    chatKey = this.resolveChatKey(chatKey);
     return this.#transaction(() => this.#append(chatKey, {
       ...message, self: true, senderId: 'self', senderName: '我'
     }, 'acked'));
   }
 
   setMaxPerChat(cap) { this.maxPerChat = Math.max(0, Number(cap) || 0); }
-  listChats() { return this.db.prepare('SELECT chat_key FROM chats ORDER BY chat_key').all().map((r) => r.chat_key); }
+  listChats() {
+    const keys = this.db.prepare('SELECT chat_key FROM chats ORDER BY chat_key').all().map((r) => r.chat_key);
+    return [...new Set(keys.filter((key) => this.skinManager?.enabled || !key.includes('/skin/')).map(logicalChatKey))];
+  }
   close() { this.db.close(); }
 
   getChatMeta(chatKey) {
+    chatKey = this.resolveChatKey(chatKey);
     const counts = this.db.prepare(`SELECT COUNT(*) AS total,
       COALESCE(SUM(state IN ('pending','leased')),0) AS unread,
       COALESCE(SUM(state='failed'),0) AS failed,
@@ -254,7 +281,7 @@ export class ChatStore {
     const thread = this.getConversationThread(chatKey);
     const { heldMessages, ...rest } = counts;
     return {
-      chatKey, ...rest, held: Math.max(Number(heldMessages) || 0, Number(uncertain) || 0),
+      chatKey: logicalChatKey(chatKey), ...rest, held: Math.max(Number(heldMessages) || 0, Number(uncertain) || 0),
       lastTs: last?.ts || 0, lastText: last?.text || '',
       thread: thread ? {
         threadId: thread.threadId,
@@ -275,17 +302,20 @@ export class ChatStore {
   }
 
   unreadCount(chatKey) {
+    chatKey = this.resolveChatKey(chatKey);
     return this.db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE chat_key=? AND self=0
       AND state='pending' AND available_at<=?`).get(chatKey, Date.now()).n;
   }
 
   peekUnread(chatKey, limit = 3) {
+    chatKey = this.resolveChatKey(chatKey);
     return this.db.prepare(`SELECT * FROM messages WHERE chat_key=? AND self=0
       AND state='pending' AND available_at<=? ORDER BY id LIMIT ?`)
       .all(chatKey, Date.now(), Math.max(1, Number(limit) || 3)).map(entry);
   }
 
   markRead(chatKey, ids) {
+    chatKey = this.resolveChatKey(chatKey);
     return this.#transaction(() => {
       let n = 0;
       const stmt = this.db.prepare(`UPDATE messages SET state='acked' WHERE chat_key=? AND id=? AND state='pending'`);
@@ -295,10 +325,12 @@ export class ChatStore {
   }
 
   markAllRead(chatKey) {
+    chatKey = this.resolveChatKey(chatKey);
     return this.db.prepare(`UPDATE messages SET state='acked' WHERE chat_key=? AND state='pending'`).run(chatKey).changes;
   }
 
   keepLatestPending(chatKey, { limit = 100, maxChars = 32000 } = {}) {
+    chatKey = this.resolveChatKey(chatKey);
     return this.#transaction(() => {
       const pending = this.db.prepare(`SELECT id, text FROM messages
         WHERE chat_key=? AND state='pending' ORDER BY id DESC`).all(chatKey);
@@ -323,6 +355,7 @@ export class ChatStore {
 
   // Administrative compatibility API. Agent execution uses claimUnread/ackLease instead.
   drainUnread(chatKey) {
+    chatKey = this.resolveChatKey(chatKey);
     const messages = this.peekUnread(chatKey, 1000000);
     this.markRead(chatKey, messages.map((m) => m.id));
     return messages;
@@ -332,10 +365,12 @@ export class ChatStore {
   // 调用方（尤其是"到点派发提醒"这类会标记已完成的路径）需要在派发前先查这个，
   // 否则会在静默空转之后照样把提醒标成已触发（2026-09-29 审查 P1）。
   hasLeasedRun(chatKey) {
+    chatKey = this.resolveChatKey(chatKey);
     return Boolean(this.db.prepare("SELECT 1 FROM runs WHERE chat_key=? AND state='leased'").get(chatKey));
   }
 
   claimUnread(chatKey, { limit = 100, maxChars = 32000, leaseMs = 240000 } = {}) {
+    chatKey = this.resolveChatKey(chatKey);
     return this.#transaction(() => {
       if (this.hasLeasedRun(chatKey)) return null;
       const pending = this.peekUnread(chatKey, Math.min(100, Math.max(1, limit)));
@@ -401,12 +436,14 @@ export class ChatStore {
   }
 
   retryFailed(chatKey) {
+    chatKey = this.resolveChatKey(chatKey);
     // Unknown/partially sent batches require operator review and are deliberately excluded.
     return this.db.prepare(`UPDATE messages SET state='pending',attempts=0,available_at=0
       WHERE chat_key=? AND state='failed'`).run(chatKey).changes;
   }
 
   resolveHeld(chatKey) {
+    chatKey = this.resolveChatKey(chatKey);
     return this.#transaction(() => {
       const messages = this.db.prepare("UPDATE messages SET state='acked' WHERE chat_key=? AND state='held'").run(chatKey).changes;
       const outbox = this.db.prepare(`DELETE FROM outbox
@@ -420,6 +457,7 @@ export class ChatStore {
   }
 
   listUnknownOperations(chatKey, limit = 100) {
+    chatKey = this.resolveChatKey(chatKey);
     return this.db.prepare(`SELECT id, run_id AS runId, chat_key AS chatKey,
       state, payload, message_id AS messageId, error
       FROM outbox WHERE chat_key=? AND state IN ('sending','unknown')
@@ -429,7 +467,7 @@ export class ChatStore {
     ).map((row) => {
       let payload = {};
       try { payload = JSON.parse(row.payload || '{}'); } catch { payload = {}; }
-      return { ...row, payload };
+      return { ...row, chatKey: logicalChatKey(row.chatKey), payload };
     });
   }
 
@@ -464,7 +502,7 @@ export class ChatStore {
       return {
         operationId: row.id,
         runId: row.runId,
-        chatKey: row.chatKey,
+        chatKey: logicalChatKey(row.chatKey),
         result,
         remaining
       };
@@ -472,6 +510,7 @@ export class ChatStore {
   }
 
   beginSend(chatKey, runId, payload) {
+    chatKey = this.resolveChatKey(chatKey);
     const id = crypto.randomUUID();
     this.db.prepare("INSERT INTO outbox(id,run_id,chat_key,state,payload) VALUES (?,?,?,'sending',?)")
       .run(id, runId || null, chatKey, JSON.stringify(payload));
@@ -534,6 +573,7 @@ export class ChatStore {
   }
 
   getConversationThread(chatKey, now = Date.now()) {
+    chatKey = this.resolveChatKey(chatKey);
     this.expireConversationThreads(now, chatKey);
     const row = this.db.prepare('SELECT * FROM conversation_threads WHERE chat_key=?').get(chatKey);
     return !row || row.state === 'closed' ? null : threadEntry(row);
@@ -548,6 +588,7 @@ export class ChatStore {
     continuationWindowMs = 180000,
     ttlMs = 1800000
   } = {}) {
+    chatKey = this.resolveChatKey(chatKey);
     const now = Date.now();
     this.expireConversationThreads(now, chatKey);
     return this.#transaction(() => {
@@ -610,7 +651,8 @@ export class ChatStore {
           thread.expiresAt, thread.lastMessageId, thread.promptHash,
           thread.transcriptChars, thread.version, thread.closeReason, thread.promptTokens
         );
-      return thread;
+      this.#tagSkin('conversation_threads', chatKey);
+      return { ...thread, chatKey: logicalChatKey(thread.chatKey) };
     });
   }
 
@@ -630,6 +672,7 @@ export class ChatStore {
     acceptedAt = null,
     now = Date.now()
   } = {}) {
+    chatKey = this.resolveChatKey(chatKey);
     const acceptedTime = Number(acceptedAt) || now;
     this.expireConversationThreads(Math.min(now, acceptedTime), chatKey);
     return this.#transaction(() => {
@@ -715,11 +758,13 @@ export class ChatStore {
         thread.transcriptChars = 0;
         thread.promptTokens = 0;
       }
-      return state === 'closed' ? null : thread;
+      this.#tagSkin('conversation_threads', chatKey);
+      return state === 'closed' ? null : { ...thread, chatKey: logicalChatKey(thread.chatKey) };
     });
   }
 
   armLifecycleRollover(chatKey, reason = 'context-budget', armedMs = 600000) {
+    chatKey = this.resolveChatKey(chatKey);
     return this.#transaction(() => {
       const row = this.db.prepare(`SELECT thread_id FROM conversation_threads
         WHERE chat_key=? AND mode='lifecycle' AND state!='closed'`).get(chatKey);
@@ -739,6 +784,7 @@ export class ChatStore {
   }
 
   closeConversationThread(chatKey, reason = 'closed') {
+    chatKey = this.resolveChatKey(chatKey);
     return this.#transaction(() => {
       const row = this.db.prepare(`SELECT thread_id FROM conversation_threads
         WHERE chat_key=? AND state!='closed'`).get(chatKey);
@@ -753,6 +799,7 @@ export class ChatStore {
   }
 
   appendThreadTurns(chatKey, threadId, runId, messages = []) {
+    chatKey = this.resolveChatKey(chatKey);
     if (!Array.isArray(messages) || !messages.length) return { added: 0, chars: 0 };
     return this.#transaction(() => {
       const row = this.db.prepare(`SELECT transcript_chars FROM conversation_threads
@@ -770,6 +817,7 @@ export class ChatStore {
         chars += json.length;
         insert.run(threadId, chatKey, runId || null, ++sequence, json, Date.now());
       }
+      this.#tagSkin('thread_turns', chatKey);
       const total = (Number(row.transcript_chars) || 0) + chars;
       this.db.prepare(`UPDATE conversation_threads SET transcript_chars=?,
         updated_at=? WHERE chat_key=? AND thread_id=?`)
@@ -805,6 +853,7 @@ export class ChatStore {
     forceRollover = '',
     rolloverArmedMs = 600000
   } = {}) {
+    chatKey = this.resolveChatKey(chatKey);
     return this.#transaction(() => {
       const acknowledged = leaseId
         ? this.ackLease(leaseId)
@@ -850,6 +899,7 @@ export class ChatStore {
   }
 
   appendThreadCheckpoint(chatKey, threadId, runId, state, sourceMessageIds = []) {
+    chatKey = this.resolveChatKey(chatKey);
     const thread = this.db.prepare(`SELECT version FROM conversation_threads
       WHERE chat_key=? AND thread_id=? AND state!='closed'`).get(chatKey, threadId);
     if (!thread) return null;
@@ -862,13 +912,14 @@ export class ChatStore {
         JSON.stringify((sourceMessageIds || []).map(Number).filter(Number.isFinite)),
         createdAt
       );
+    this.#tagSkin('thread_checkpoints', chatKey);
     this.db.prepare(`DELETE FROM thread_checkpoints WHERE chat_key=? AND id NOT IN (
       SELECT id FROM thread_checkpoints WHERE chat_key=? ORDER BY id DESC LIMIT 200
     )`).run(chatKey, chatKey);
     return {
       id: Number(result.lastInsertRowid),
       threadId,
-      chatKey,
+      chatKey: logicalChatKey(chatKey),
       runId: runId || null,
       version: Number(thread.version) || 1,
       state: structuredClone(state || {}),
@@ -878,6 +929,7 @@ export class ChatStore {
   }
 
   latestThreadCheckpoint(chatKey) {
+    chatKey = this.resolveChatKey(chatKey);
     const row = this.db.prepare(`SELECT * FROM thread_checkpoints
       WHERE chat_key=? ORDER BY id DESC LIMIT 1`).get(chatKey);
     if (!row) return null;
@@ -888,7 +940,7 @@ export class ChatStore {
     return {
       id: Number(row.id),
       threadId: row.thread_id,
-      chatKey: row.chat_key,
+      chatKey: logicalChatKey(row.chat_key),
       runId: row.run_id,
       version: Number(row.version) || 1,
       state,
@@ -898,6 +950,7 @@ export class ChatStore {
   }
 
   recent(chatKey, { limit = 80, offset = 0, includeSelf = true, readOnly = false, afterId = 0 } = {}) {
+    chatKey = this.resolveChatKey(chatKey);
     // afterId：只取 id 更大的消息（增量消费）。固定"最新 N 条"的窗口在积压超过 N 时
     // 会静默丢掉最老的那些——游戏 tick 丢的就是票（2026-09-29 审查 P2）
     return this.db.prepare(`SELECT * FROM messages WHERE chat_key=? ${includeSelf ? '' : 'AND self=0'}
@@ -908,14 +961,17 @@ export class ChatStore {
   }
 
   findByMid(chatKey, mid) {
+    chatKey = this.resolveChatKey(chatKey);
     return entry(this.db.prepare('SELECT * FROM messages WHERE chat_key=? AND mid=?').get(chatKey, normalizeMid(mid)));
   }
 
   findByLocalId(chatKey, localId) {
+    chatKey = this.resolveChatKey(chatKey);
     return entry(this.db.prepare('SELECT * FROM messages WHERE chat_key=? AND id=?').get(chatKey, Number(localId)));
   }
 
   updateByMid(chatKey, mid, { text, appendMedia = [] } = {}) {
+    chatKey = this.resolveChatKey(chatKey);
     const m = this.findByMid(chatKey, mid);
     if (!m) return false;
     const media = [...m.media];
@@ -931,12 +987,14 @@ export class ChatStore {
   }
 
   activeMembers(chatKey, limit = 10) {
+    chatKey = this.resolveChatKey(chatKey);
     return this.db.prepare(`SELECT sender_id AS userId, sender_name AS name, MAX(ts) AS lastTs,
       COUNT(*) AS count FROM messages WHERE chat_key=? AND self=0
       GROUP BY sender_id ORDER BY lastTs DESC LIMIT ?`).all(chatKey, Math.max(1, limit));
   }
 
   hasParticipant(chatKey, userId) {
+    chatKey = this.resolveChatKey(chatKey);
     const id = String(userId ?? '').trim();
     if (!id) return false;
     return Boolean(this.db.prepare(`SELECT 1 FROM messages
@@ -959,6 +1017,7 @@ export class ChatStore {
     exchangeWindowMs = 300000,
     selfId = ''
   } = {}) {
+    chatKey = this.resolveChatKey(chatKey);
     const source = String(chatKey || '');
     const uin = String(userId || '').trim();
     if (!/^(group|private):\d+$/.test(source) || !/^\d{1,15}$/.test(uin)) {
@@ -1031,6 +1090,7 @@ export class ChatStore {
     maxAgent = 24,
     maxChars = 12000
   } = {}) {
+    chatKey = this.resolveChatKey(chatKey);
     const source = String(chatKey || '');
     const uin = String(userId || '').trim();
     if (!/^(group|private):\d+$/.test(source) || !/^\d{1,15}$/.test(uin)) {
@@ -1105,9 +1165,9 @@ export class ChatStore {
       WHERE self=0 AND sender_id!=''
       GROUP BY sender_id, chat_key, sender_name
       ORDER BY lastSeenAt DESC
-    `).all().map((row) => ({
+    `).all().filter((row) => row.chatKey === this.resolveChatKey(logicalChatKey(row.chatKey))).map((row) => ({
       userId: String(row.userId || ''),
-      chatKey: String(row.chatKey || ''),
+      chatKey: logicalChatKey(String(row.chatKey || '')),
       name: String(row.name || ''),
       messageCount: Number(row.messageCount) || 0,
       firstSeenAt: Number(row.firstSeenAt) || 0,

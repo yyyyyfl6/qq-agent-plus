@@ -27,6 +27,8 @@ export function normalizeBehaviorProfile(value) {
 const readRole = (file) => readFileSync(new URL(`../roles/${file}`, import.meta.url), 'utf8').trim();
 
 export const PERSONAS = {
+  blue_fish: { name: '蓝色大肥鱼', behaviorProfile: 'legacy', text: readRole('blue-fish.md') },
+  hajimi: { name: '哈基米', behaviorProfile: 'legacy', text: readRole('hajimi.md') },
   xiaojingyu: {
     name: '小鲸鱼（默认）',
     behaviorProfile: 'legacy',

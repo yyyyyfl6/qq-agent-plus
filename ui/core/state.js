@@ -13,11 +13,16 @@ const state = {
   integrationStatus: null,
   autoUpdateStatus: null,
   sessions: [],          // 摘要列表
+  sessionSkinView: '',
+  sessionSkins: [],
   currentSessionId: null,
   sessionDetail: null,   // 完整记录
   sessionInspectorTab: 'input',
   chats: [],
   currentChatKey: null,
+  chatSkinView: '',
+  chatSkinInfo: null,
+  chatSkinRequest: 0,
   chatMessages: [],
   config: null,
   personaTemplates: {},

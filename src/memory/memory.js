@@ -11,7 +11,7 @@ export class MemoryStore extends BaseMemoryStore {
     // 启动时立即完成旧人物记忆迁移，确保 IdentityStore 随后的 rebuild
     // 看不到旧 group_*/<QQ>.json，从而不再维护第二份 legacy_memory_refs 内容。
     this.people.listSourceChats();
-    bindGlobalMemoryStore(this);
+    if (args[0]?.bindIdentity !== false) bindGlobalMemoryStore(this);
   }
 
   /** 全局人物列表：不再按 chatKey 过滤。 */
@@ -63,7 +63,7 @@ export class MemoryStore extends BaseMemoryStore {
       && person.sourceChatKeys.includes(source);
     if (destructive) {
       backupPersonBeforeConsolidation(person, {
-        sourceChatKey: source,
+        memoryDir: this.memoryDir, sourceChatKey: source,
         at: Date.now()
       });
     }
@@ -77,7 +77,7 @@ export class MemoryStore extends BaseMemoryStore {
   replaceMemberForConsolidation(chatKey, userId, name, contents, options = {}) {
     const person = this.getMember('', userId);
     backupPersonBeforeConsolidation(person, {
-      sourceChatKey: chatKey,
+      memoryDir: this.memoryDir, sourceChatKey: chatKey,
       at: Date.now()
     });
     return super.replaceMember(chatKey, userId, name, contents, { origin: 'consolidated', ...options });

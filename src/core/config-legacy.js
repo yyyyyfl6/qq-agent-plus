@@ -1,3 +1,4 @@
+import { DEFAULT_SKINS, normalizeSkins } from '../skins/skins.js';
 // 配置管理：data/config.json，UI 可写。所有字段都有默认值。
 import fs from 'node:fs';
 import os from 'node:os';
@@ -22,6 +23,7 @@ export const DATA_DIR = process.env.QQ_AGENT_DATA_DIR || path.join(ROOT, 'data')
 export const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 
 export const DEFAULT_CONFIG = {
+  skins: structuredClone(DEFAULT_SKINS),
   // OpenAI 兼容 API（必填才能跑）
   api: {
     // 每日花费上限（改进方案 #8，默认关闭＝升级不改变任何行为）。按**估算价**累计当日用量，
@@ -1139,6 +1141,11 @@ export function loadConfig() {
     if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
     const parsed = migrateConfig(JSON.parse(text));
     const merged = deepMerge(DEFAULT_CONFIG, parsed);
+    try { merged.skins = normalizeSkins(merged.skins); } catch {
+      // 新功能配错只关闭新功能；不能让旧 API 凭据和白名单跟着整份重置。
+      console.warn('[skins] 配置无效，已关闭皮肤系统，请在控制台重新配置');
+      merged.skins = structuredClone(DEFAULT_SKINS);
+    }
     // ── provider 迁移（2026-09-26）──
     // 默认 provider 从 local 改成 openai 之后，**没显式存过 provider** 的老配置语义会变：
     // 本机装了 whisper 的实例会从"能用"变成"没配齐"（静默失效，2026-09-26 审查 P1）。

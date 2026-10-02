@@ -496,6 +496,8 @@ function renderChatList() {
 
 async function selectChat(key) {
   state.currentChatKey = key;
+  state.chatSkinView = '';
+  state.chatSkinInfo = null;
   renderChatList();
   $('#chat-detail').innerHTML = '<div class="empty-hint">加载中…</div>';
   await loadChatMessages(key);
@@ -515,7 +517,11 @@ async function selectChat(key) {
  */
 async function loadChatMessages(key, { keepView = false } = {}) {
   try {
-    const data = await api(`/api/chats/${key.replace(':', '_')}/messages?limit=100000`);
+    const request = ++state.chatSkinRequest;
+    const view = state.chatSkinView || '';
+    const data = await api(`/api/chats/${key.replace(':', '_')}/messages?limit=100000${view ? '&skinId=' + encodeURIComponent(view) : ''}`);
+    if (state.chatSkinRequest !== request || (state.chatSkinView || '') !== view) return;
+    state.chatSkinInfo = data.skins ? data : null;
     // 期间用户可能切走了会话，那就别覆盖当前视图
     if (state.currentChatKey !== key) return;
     state.chatMessages = data.messages || [];
@@ -567,6 +573,7 @@ function renderChatMessages() {
       <div class="sub"><span data-field="chat-msg-count"></span><span>${esc(threadStatus)}</span></div>
     </div>
     <div class="chat-toolbar">
+      ${state.chatSkinInfo ? `<label>皮肤存档 <select id="chat-skin-view"><option value="">当前使用的皮肤</option>${state.chatSkinInfo.skins.map((s) => `<option value="${esc(s.id)}" ${state.chatSkinView === s.id ? 'selected' : ''}>${esc(s.label)}</option>`).join('')}</select></label><button class="btn btn-small" id="chat-skin-switch">使用所选皮肤</button>` : ''}
       <button class="btn btn-small" id="chat-wake-btn">主动唤醒</button>
       ${key.startsWith('group:') && state.config?.incidentPilot?.enabled === true
         ? `<button type="button" class="icon-btn" id="chat-runtime-control" title="更改会话运行模式" aria-label="更改会话运行模式">${chatControlIcon(meta).icon}</button>`
@@ -581,6 +588,22 @@ function renderChatMessages() {
     </div>
     <table class="archive-table"><tbody id="chat-msg-body"></tbody></table>
     <div class="list-more muted" id="chat-msg-more"></div>`;
+
+  $('#chat-skin-view')?.addEventListener('change', async (event) => {
+    state.chatSkinView = event.target.value;
+    await loadChatMessages(key);
+  });
+  $('#chat-skin-switch')?.addEventListener('click', async () => {
+    const skinId = state.chatSkinView || state.chatSkinInfo.activeSkinId;
+    if (!await askForConfirmation('切换该会话的人格与模型，并结束当前线程？')) return;
+    const button = $('#chat-skin-switch'); button.disabled = true;
+    try {
+      await api('/api/chat-skins', { method: 'POST', body: JSON.stringify({ chatKey: key, skinId }) });
+      state.chatSkinView = '';
+      await loadChats();
+      await loadChatMessages(key);
+    } catch (error) { alert(error.message); button.disabled = false; }
+  });
 
   // 工具栏事件：只在这里绑一次
   $('#chat-wake-btn').addEventListener('click', async () => {
