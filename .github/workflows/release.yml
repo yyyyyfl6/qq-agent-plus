@@ -36,7 +36,10 @@ jobs:
       - run: npm run lint
       # 与 ci.yml 同步：runner 没有 ffmpeg，缺了会让 GIF 帧条与语音转码的用例静默跳过
       - name: 安装 ffmpeg（GIF 帧条 / 音频转码用例依赖）
+        # runner 仓库更新实际挂住十分钟；限时失败后才能拿到日志定位，不能无限挂住发版。
+        timeout-minutes: 3
         run: |
+          set -x
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
           ffmpeg -version | head -n 1
