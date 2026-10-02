@@ -11,12 +11,14 @@
 | [OPS.md](OPS.md) | `src/ops.js` 运维入口（体检 / 扫描 / 备份 / 部署 / 看门狗 / 健康巡检 / 隧道）的环境变量与示例 |
 | [CONFIG-EXAMPLES.md](CONFIG-EXAMPLES.md) | 常用配置片段：思考模式、兜底模型、视觉、主动发言、表情包、节奏 |
 | [AUTO_UPDATE.md](AUTO_UPDATE.md) | Release 驱动的自动更新：判定规则、两条下载通道（git / API+源码包）、失败策略与状态字段 |
+| [RELEASE-v0.7.8.md](RELEASE-v0.7.8.md) | fork 双人格皮肤发布说明、升级影响与回滚方式 |
 
 ## 功能说明
 
 | 文档 | 说明 |
 | --- | --- |
 | [CONVERSATION_MODES.md](CONVERSATION_MODES.md) | 对话引擎三模式（legacy / threaded / lifecycle）的差异与选择 |
+| [DUAL_SKINS.md](DUAL_SKINS.md) | 双人格皮肤：配置、owner 命令、消息/记忆隔离、转述交接摘要与控制台 API |
 | [DAILY_MOMENTS.md](DAILY_MOMENTS.md) | 每日说说：生成、发布、去重与静默时段 |
 | [QZONE_INTERACTIONS.md](QZONE_INTERACTIONS.md) | 好友动态与评论回复的巡检节奏、退避与跳过原因 |
 | [model-prices.md](model-prices.md) | 价格体系：模型 id 归一化与别名、渠道价、账户口径三选一、实付/估算/未定价 |
