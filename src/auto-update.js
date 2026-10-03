@@ -53,6 +53,18 @@ export function autoUpdatePaths(dataDir) {
   };
 }
 
+export const UPDATE_PERMISSION_HINT = '请将数据目录和 config.json 的所有权恢复为运行 Agent 的服务用户，确认该用户能读写配置，再到控制台 → 控制 → 更新部署手动恢复自动更新。';
+
+export function assertUpdateConfigAccess(file, access = fs.accessSync) {
+  try {
+    access(file, fs.constants.R_OK | fs.constants.W_OK);
+    // 配置以临时文件 + rename 写入，目录也必须可写。
+    access(path.dirname(file), fs.constants.W_OK);
+  } catch (cause) {
+    throw Object.assign(new Error(`更新前配置读写检查失败（${cause?.code || 'ACCESS_ERROR'}）。${UPDATE_PERMISSION_HINT}`), { code: cause?.code, cause });
+  }
+}
+
 export function readAutoUpdateState(dataDir) {
   return readObject(autoUpdatePaths(dataDir).state, {
     version: 1,
@@ -275,10 +287,11 @@ export class AutoUpdateManager {
       branch: String(settings.branch || 'main'),
       intervalHours: Number(settings.intervalHours) || 6,
       ...network,
-      nextCheckAt: settings.enabled === true
+      nextCheckAt: settings.enabled === true && state.autoDisabled !== true
         ? Math.max(Date.now(), Number(state.lastCheckAt || 0) + intervalMs)
         : 0,
       ...state,
+      recoveryHint: /\b(EACCES|EPERM)\b/.test(state.error || '') ? UPDATE_PERMISSION_HINT : '',
       // 以 data/deployed-revision 为准：那是每次部署都会重写的"这台机器现在跑的版本"，
       // 而 state.currentRevision 只是"上一次更新器自己部署时"的快照。反过来会让控制台
       // 显示与实际不符的版本（2026-09-29 实测：线上跑的是未提交树 source-…，控制台却显示
@@ -517,12 +530,12 @@ export class AutoUpdateManager {
       && policy.disableOnFailure
       && this.config().autoUpdate?.enabled === true
     ) {
-      this.updateConfig({
-        autoUpdate: {
-          ...(this.config().autoUpdate || {}),
-          enabled: false
-        }
-      });
+      try {
+        this.updateConfig({ autoUpdate: { ...(this.config().autoUpdate || {}), enabled: false } });
+      } catch (error) {
+        // 配置权限坏了也必须继续通知；autoDisabled 状态本身已使更新停止。
+        writeAutoUpdateState(this.dataDir, { configWriteError: cleanText(error?.code || 'CONFIG_WRITE_FAILED') });
+      }
     }
     await this.resumeNotifications();
     return this.status();
@@ -559,6 +572,7 @@ export class AutoUpdateManager {
       `结果：${cleanText(state.error || '未知错误', 600)}`,
       '',
       action,
+      ...(/\b(EACCES|EPERM)\b/.test(state.error || '') ? [UPDATE_PERMISSION_HINT] : []),
       '处理入口：控制台 → 控制 → 更新部署'
     ].join('\n');
     try {

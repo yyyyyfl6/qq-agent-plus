@@ -1,6 +1,7 @@
 // 多提供商模型目录：统一使用 OpenAI 兼容接口，由控制台维护。
 import { getConfig, updateConfig } from './config.js';
 import { assertTimeAllowed, watchTimeWindow } from './time-gate.js';
+import { resolveProviderKey } from './provider-key.js';
 import { modelServiceOfBaseUrl, modelServiceById, resolveThinkingPatch, normalizeThinkingIntent, effectiveThinkingRaw, hostOf } from './provider-presets.js';
 
 /** 当前生效的提供商目录（配置里的 providers）。 */
@@ -17,7 +18,7 @@ export function setProviderKey(providerId, apiKey) {
   else delete keys[providerId];
   // 必须走 __replace__ 整体替换：deepMerge 只遍历 override 的键，普通传对象时
   // 被删掉的 id 会从旧配置原样复活 —— "清 Key"实际没清，明文还留在 config.json。
-  updateConfig({ providerKeys: { __replace__: keys } });
+  updateConfig({ providerKeys: { __replace__: keys }, providers: (getConfig().providers || []).map((p) => p.id === providerId ? { ...p, apiKeyFrom: 'manual' } : p) });
   return currentProviders().find((p) => p.id === providerId) || null;
 }
 
@@ -53,13 +54,7 @@ function normalizeModelInput(models) {
 
 /** 从当前配置里取 provider.apiKey 对应的真实值（含旧版 top-level key 回退）。 */
 function providerKeyValue(provider, cfg) {
-  if (provider && typeof provider === 'object') {
-    const top = String(provider.apiKey ?? '').trim();
-    if (top && top !== '******') return top;
-    const catalogKey = String(cfg?.providerKeys?.[provider.id] ?? '').trim();
-    if (catalogKey && catalogKey !== '******') return catalogKey;
-  }
-  return '';
+  return resolveProviderKey(provider, cfg);
 }
 
 /** 提供商对象里 apiKey 可能是掩码/引用，请求前必须解出真实 key。 */
@@ -301,7 +296,7 @@ export async function testOneProvider({ providerId = '', baseUrl = '', apiKey = 
 /** 新建提供商；若同 baseURL 已存在则合并模型。返回 { provider, created }。
  *  preset = 渠道预设 id（provider-presets.js），用于把"关思考"翻译成该渠道认识的参数形状；
  *  留空时运行期按 baseURL 主机名自动推断。 */
-export function upsertProvider({ baseUrl, apiKey, models = [], preset = '' }) {
+export function upsertProvider({ baseUrl, apiKey, models = [], preset = '', activate = true }) {
   const base = normalizeBaseUrl(baseUrl);
   if (!base) throw new Error('Base URL 不能为空');
   const presetId = String(preset || '').trim().toLowerCase();
@@ -318,6 +313,7 @@ export function upsertProvider({ baseUrl, apiKey, models = [], preset = '' }) {
     for (const m of entries) existing.modelNames[m.id] = m.name;
     if (presetId && existing.preset !== presetId) existing.preset = presetId;
     if (apiKey) {
+      existing.apiKeyFrom = 'manual';
       const keys = { ...(getConfig().providerKeys || {}) };
       keys[existing.id] = String(apiKey).trim();
       updateConfig({ providers, providerKeys: keys });
@@ -352,7 +348,7 @@ export function upsertProvider({ baseUrl, apiKey, models = [], preset = '' }) {
   updateConfig({
     providers,
     ...(apiKey ? { providerKeys: keys } : {}),
-    api: { provider: id, model: entries[0]?.id || '', baseUrl: base }
+    ...(activate ? { api: { provider: id, model: entries[0]?.id || '', baseUrl: base } } : {})
   });
   return { provider: withResolvedKey(provider), created: true };
 }

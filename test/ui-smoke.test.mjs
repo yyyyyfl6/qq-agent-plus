@@ -94,6 +94,20 @@ test('真实 DOM 冒烟：api() 走 fetch 桩', { skip: SKIP }, async () => {
   } finally { window.happyDOM?.abort?.(); }
 });
 
+test('updater failure is visible on homepage, opens control and clears after recovery', { skip: SKIP }, async () => {
+  const { window } = loadPage(); await settle();
+  try {
+    window.renderAutoUpdateFailure({ status: 'failed', autoDisabled: true, error: 'EACCES: config.json', recoveryHint: '恢复服务用户所有权，再手动恢复更新' });
+    const node = window.document.querySelector('#auto-update-failure');
+    assert.equal(node.classList.contains('hidden'), false);
+    assert.match(node.textContent, /自动更新已停止.*EACCES.*手动恢复/);
+    node.querySelector('button').click();
+    assert.equal(window.document.querySelector('#view-control').classList.contains('active'), true);
+    window.renderAutoUpdateFailure({ status: 'idle', autoDisabled: false });
+    assert.equal(node.classList.contains('hidden'), true);
+  } finally { window.happyDOM?.abort?.(); }
+});
+
 test('真实 DOM 冒烟：登录表单提交打到 /api/login 且不抛', { skip: SKIP }, async () => {
   const { window, fetchLog } = loadPage();
   await settle();

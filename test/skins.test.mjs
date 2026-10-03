@@ -21,7 +21,7 @@ const cfg = () => ({ ...structuredClone(DEFAULT_CONFIG), skins: {
   handoffOnSwitch: { enabled: true, maxChars: 1200, recentMessages: 40, provider: '', model: '' }
 }, providers: [{ id: 'ds', baseURL: 'https://ds.example/v1' }, { id: 'gm', baseURL: 'https://gm.example/v1' }],
 providerKeys: { ds: 'test-ds', gm: 'test-gm' }, api: { baseUrl: 'https://old.example/v1', model: 'old', apiKey: 'test-old' },
-admin: { ownerUin: '2272040465' }, autoUpdate: { ownerUin: '2272040465' } });
+admin: { ownerUin: '10001' }, autoUpdate: { ownerUin: '10001' } });
 
 test('skins configuration defaults are disabled; reject ambiguous IDs', () => {
   assert.equal(typeof normalizeSkins, 'function');
@@ -101,11 +101,24 @@ test('handoff on/off, failure and non-owner handling never leak or stop a switch
   assert.equal(calls, 1);
   assert.equal(await skins.consumeCommand('group:1', '42', '切猫'), false);
   assert.equal(skins.current('group:1').id, 'fish');
-  skins.summarize = async () => { throw new Error('offline'); };
+  const warnings = []; skins.warn = (text) => warnings.push(text);
+  skins.summarize = async () => { throw new Error('模型 API HTTP 401：Bearer secret-test and private prompt'); };
   setRuntimeConfig(cfg());
-  await skins.switchSkin('group:1', 'cat');
+  const result = await skins.switchSkin('group:1', 'cat');
+  assert.equal(result.handoffStatus, 'failed');
+  assert.match(result.handoffError, /HTTP 401/);
+  assert.ok(!JSON.stringify([result, warnings]).includes('secret-test'));
+  assert.ok(!JSON.stringify([result, warnings]).includes('private prompt'));
   assert.equal(skins.current('group:1').id, 'cat');
   assert.equal(skins.handoffPrompt('group:1'), '');
+});
+
+test('summary states distinguish disabled, no messages, empty reply and successful handoff', async (t) => {
+  const { store } = fixture(t); setRuntimeConfig(cfg());
+  const skins = new SkinManager({ store, getConfig, summarize: async () => '' });
+  assert.equal((await skins.switchSkin('group:1', 'cat')).handoffStatus, 'no-messages');
+  store.appendIncoming('group:1', { text: 'test', mid: '1' });
+  assert.equal((await skins.switchSkin('group:1', 'fish')).handoffStatus, 'empty-response');
 });
 
 test('message replay never copies old history into the new skin; handoff is consumed once', async (t) => {
@@ -229,7 +242,7 @@ test('disabled skins create no mutable skin state, do not change prompts or cons
   const disabled = cfg(); disabled.skins.enabled = false; setRuntimeConfig(disabled);
   const prompt = buildSystemPrompt({});
   const skins = new SkinManager({ store, getConfig });
-  assert.equal(await skins.consumeCommand('group:1', '2272040465', '切猫', '1'), false);
+  assert.equal(await skins.consumeCommand('group:1', '10001', '切猫', '1'), false);
   assert.equal(skins.scope('group:1', () => buildSystemPrompt({})), prompt);
   assert.equal(store.db.prepare("SELECT name FROM sqlite_master WHERE name='chat_skins'").get(), undefined);
 });
@@ -238,8 +251,8 @@ test('owner command replay is consumed once and acknowledgement uses configurati
   const { store } = fixture(t); setRuntimeConfig(cfg());
   const acks = [];
   const skins = new SkinManager({ store, getConfig, sendAck: async (_key, text) => acks.push(text) });
-  assert.equal(await skins.consumeCommand('group:1', '2272040465', '/skin cat', '99'), true);
-  assert.equal(await skins.consumeCommand('group:1', '2272040465', '/skin cat', '99'), true);
+  assert.equal(await skins.consumeCommand('group:1', '10001', '/skin cat', '99'), true);
+  assert.equal(await skins.consumeCommand('group:1', '10001', '/skin cat', '99'), true);
   assert.deepEqual(acks, ['已切换到 猫']);
   assert.deepEqual(store.recent('group:1'), []);
 });

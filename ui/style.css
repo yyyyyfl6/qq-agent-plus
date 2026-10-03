@@ -1646,6 +1646,8 @@ html.boot-show .loading-overlay { opacity: 1; }
 }
 .banner a { color: var(--accent); }
 .banner.hidden { display: none; }
+#auto-update-failure { display:flex; flex-wrap:wrap; align-items:center; gap:8px 14px; border-color:var(--orange); }
+#auto-update-failure span { flex:1; min-width:200px; overflow-wrap:anywhere; }
 
 /* ── 体检卡 ── */
 .h-item { display: flex; gap: 10px; align-items: baseline; padding: 3px 0; font-size: 13px; }

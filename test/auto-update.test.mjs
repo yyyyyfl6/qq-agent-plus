@@ -5,12 +5,22 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   AutoUpdateManager,
+  assertUpdateConfigAccess,
   autoUpdatePaths,
   autoUpdatePending,
   consumeAutoUpdateRequest,
   readAutoUpdateState,
   writeAutoUpdateState
 } from '../src/auto-update.js';
+
+test('configuration preflight checks file and atomic-write directory permissions', () => {
+  const checked = [];
+  assertUpdateConfigAccess(path.join('data', 'config.json'), (file, mode) => checked.push({ file, mode }));
+  assert.equal(checked.length, 2);
+  assert.equal(checked[0].mode, fs.constants.R_OK | fs.constants.W_OK);
+  assert.equal(checked[1].mode, fs.constants.W_OK);
+  assert.throws(() => assertUpdateConfigAccess('config.json', () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); }), /EACCES.*服务用户.*手动恢复/);
+});
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-auto-update-'));
@@ -81,6 +91,20 @@ function fixture(t) {
     notifications
   };
 }
+
+test('unreadable updater config still notifies from running Agent config and exposes recovery', async (t) => {
+  const f = fixture(t); f.setAutoUpdate({ enabled: true });
+  f.manager.updateConfig = () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); };
+  writeAutoUpdateState(f.dataDir, { status: 'failed', phase: 'config-access', error: 'EACCES: config.json', autoDisabled: true, notification: { pending: true, ownerUin: '' } });
+  await f.manager.handlePendingFailure(); await f.manager.handlePendingFailure();
+  assert.equal(f.notifications.length, 1);
+  assert.equal(f.notifications[0].ownerUin, '900001');
+  assert.match(f.notifications[0].text, /config.json.*服务用户/);
+  const state = f.manager.status();
+  assert.equal(state.enabled, false); assert.equal(state.nextCheckAt, 0);
+  assert.match(state.recoveryHint, /手动恢复/);
+  assert.equal(state.configWriteError, 'EACCES');
+});
 
 test('updater launch failure disables automation and queues an administrator notice', async (t) => {
   const f = fixture(t);

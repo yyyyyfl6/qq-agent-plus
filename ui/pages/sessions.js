@@ -110,7 +110,7 @@ async function loadSessions({ quiet = false } = {}) {
     if (skinFilter) {
       skinFilter.hidden = !state.sessionSkins.length;
       if (!state.sessionSkins.length) state.sessionSkinView = '';
-      skinFilter.innerHTML = '<option value="">全部皮肤</option>' + state.sessionSkins.map((s) => `<option value="${esc(s.id)}">${esc(s.label)}</option>`).join('');
+      skinFilter.innerHTML = '<option value="">全部人格</option>' + state.sessionSkins.map((s) => `<option value="${esc(s.id)}">${esc(s.label)}</option>`).join('');
       skinFilter.value = state.sessionSkinView;
       skinFilter.onchange = () => { state.sessionSkinView = skinFilter.value; renderSessionList(); };
     }

@@ -46,6 +46,7 @@ function getOpencodeSessionId() {
  * 兼容历史数据：providers[].apiKey 也可能存有明文（老配置），也认。
  */
 export function resolveApiKey(cfg) {
+  if (cfg?.activeSkinId) return String(cfg.api?.apiKey || '').trim() === '******' ? '' : String(cfg.api?.apiKey || '').trim();
   const pid = String(cfg?.api?.provider ?? '').trim();
   if (pid) {
     const fromCatalog = String(cfg?.providerKeys?.[pid] ?? '').trim();
@@ -338,6 +339,7 @@ export async function chatCompletion({
 }) {
   assertTimeAllowed();
   const api = overrides || effectiveApi();
+  if (api.requireApiKey && (!api.apiKey || api.apiKey === '******')) throw new Error('人格提供商缺少 API Key，请在提供商设置中保存');
   // 聊天这类"随口回一句"的任务关掉思考：省一半输出 token、少 1~3 秒；
   // 判断/写作类（表情包要不要收、说说、空间互动、身份评估）不传 purpose，继续思考。
   const thinking = thinkingFor(purpose, overrides);

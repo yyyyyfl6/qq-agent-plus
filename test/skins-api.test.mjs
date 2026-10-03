@@ -10,12 +10,13 @@ process.env.QQ_AGENT_DATA_DIR = root;
 const { DEFAULT_CONFIG, updateConfig } = await import('../src/core/config.js');
 const { createApp } = await import('../src/console/app.js');
 
-test('real console APIs authenticate, preserve partial settings, isolate archives and route summaries to the leaving provider', async (t) => {
+test('real console APIs manage providers, catalog and presets, isolate archives and use independent summaries', async (t) => {
   const requests = [];
   const model = http.createServer(async (req, res) => {
     let body = ''; for await (const chunk of req) body += chunk;
-    requests.push({ path: req.url, auth: req.headers.authorization, body: JSON.parse(body) });
+    requests.push({ path: req.url, auth: req.headers.authorization, body: body ? JSON.parse(body) : null });
     res.writeHead(200, { 'content-type': 'application/json' });
+    if (req.url.endsWith('/models')) { res.end(JSON.stringify({ data: [{ id: 'deepseek-flash' }, { id: 'gemini-added' }] })); return; }
     res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: '鱼刚刚讨论了项目，接任者应继续核对。' }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }));
   });
   let app;
@@ -27,7 +28,7 @@ test('real console APIs authenticate, preserve partial settings, isolate archive
   cfg.runtime.mode = 'observe';
   cfg.onebot = { ...cfg.onebot, wsUrl: 'ws://127.0.0.1:1', httpUrl: 'http://127.0.0.1:1' };
   cfg.api = { ...cfg.api, baseUrl: '', apiKey: '', priceRemoteUrl: 'none' };
-  cfg.providers = [{ id: 'ds', name: '鱼', baseURL: endpoint + '/ds/v1' }, { id: 'gm', name: '猫', baseURL: endpoint + '/gm/v1' }];
+  cfg.providers = [{ id: 'ds', name: '鱼', baseURL: endpoint + '/ds/v1', models: ['deepseek-flash', 'gemini-added'] }, { id: 'gm', name: '猫', baseURL: endpoint + '/gm/v1' }];
   cfg.providerKeys = { ds: 'test-fish-key', gm: 'test-cat-key' };
   cfg.skins.enabled = true;
   cfg.skins.list[0].provider = 'ds'; cfg.skins.list[1].provider = 'gm';
@@ -46,6 +47,17 @@ test('real console APIs authenticate, preserve partial settings, isolate archive
   const settings = await call('/api/skins');
   assert.equal(settings.status, 200);
   assert.ok(!JSON.stringify(settings.data).includes('test-fish-key'));
+  assert.ok(settings.data.providers[0].models.includes('gemini-added'));
+  const catalog = await call('/api/providers/fetch-models', { providerId: 'ds', baseUrl: endpoint + '/ds/v1' });
+  assert.deepEqual(catalog.data.models, ['deepseek-flash', 'gemini-added']);
+  assert.equal(requests.pop().auth, 'Bearer test-fish-key');
+  const added = await call('/api/providers', { baseUrl: endpoint + '/extra/v1', apiKey: 'test-extra-key', models: ['summary-custom'], activate: false });
+  assert.equal(added.status, 200);
+  assert.ok(!JSON.stringify(added.data).includes('test-extra-key'));
+  assert.equal((await call('/api/skins')).data.globalApi.baseUrl, '');
+  await call('/api/persona-templates', { name: '测试预设', text: '测试的角色设定' });
+  const custom = (await call('/api/skins')).data.templates.custom_0;
+  assert.equal(custom.name, '测试预设');
   app.store.appendIncoming('group:1', { mid: 'fish-1', text: '鱼的项目', senderId: '42' });
   const fish = app.skins.scope('group:1', () => app.sessions.create({ chatKey: 'group:1', trigger: [], triggerSummary: 'fish' }));
   app.sessions.finish(fish.id, 'noreply');
@@ -65,11 +77,17 @@ test('real console APIs authenticate, preserve partial settings, isolate archive
   assert.deepEqual(fishArchive.data.messages.map((m) => m.text), ['鱼的项目']);
   const catSessions = await call('/api/sessions?skinId=cat');
   assert.deepEqual(catSessions.data.sessions.map((s) => s.id), [cat.id]);
+  await call('/api/skins', { handoffOnSwitch: { provider: added.data.provider.id, model: 'summary-custom' } });
+  await call('/api/chat-skins', { chatKey: 'group:1', skinId: 'fish' });
+  assert.equal(requests[1].path, '/extra/v1/chat/completions');
+  assert.equal(requests[1].auth, 'Bearer test-extra-key');
+  assert.equal(requests[1].body.model, 'summary-custom');
   const off = await call('/api/skins', { handoffOnSwitch: { enabled: false } });
   assert.equal(off.data.skins.handoffOnSwitch.maxChars, 400);
   assert.equal(app.skins.handoffPrompt('group:1'), '');
+  await call('/api/chat-skins', { chatKey: 'group:1', skinId: 'cat' });
   await call('/api/chat-skins', { chatKey: 'group:1', skinId: 'fish' });
-  assert.equal(requests.length, 1, '关闭摘要后切换不应调用模型');
+  assert.equal(requests.length, 2, '关闭摘要后切换不应调用模型');
   assert.equal((await call('/api/chat-skins?chatKey=group:1')).data.chats[0].skinId, 'fish');
   assert.equal((await call('/api/skins', { list: [{ id: '../bad' }] })).status, 400);
   await call('/api/skins', { enabled: false });

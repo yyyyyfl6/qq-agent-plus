@@ -13,6 +13,21 @@ import {
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
+test('Linux permission failure stops updater before network/deployment and leaves a pending notice', { skip: process.platform === 'win32' }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-updater-permission-'));
+  const appDir = path.join(root, 'app'); const dataDir = path.join(root, 'data');
+  fs.mkdirSync(appDir); fs.mkdirSync(dataDir);
+  const file = path.join(dataDir, 'config.json');
+  fs.writeFileSync(file, '{}', { mode: 0o600 }); fs.chmodSync(file, 0o000);
+  t.after(() => { fs.chmodSync(file, 0o600); fs.rmSync(root, { recursive: true, force: true }); });
+  const result = runUpdater({ appDir, dataDir, env: { QQ_AGENT_UPDATE_NOTIFY_ATTEMPTS: '1', QQ_AGENT_UPDATE_NOTIFY_RETRY_MS: '10' } });
+  assert.equal(result.status, 1);
+  const state = readAutoUpdateState(dataDir);
+  assert.equal(state.phase, 'config-access'); assert.equal(state.autoDisabled, true);
+  assert.match(state.error, /EACCES/); assert.equal(state.notification.pending, true);
+  assert.ok(!fs.existsSync(autoUpdatePaths(dataDir).repository));
+});
+
 function writeDeployment(appDir, dataDir) {
   fs.writeFileSync(path.join(appDir, '.deployment.json'), JSON.stringify({
     root: appDir,

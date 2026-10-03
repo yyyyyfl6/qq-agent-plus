@@ -573,7 +573,7 @@ function renderChatMessages() {
       <div class="sub"><span data-field="chat-msg-count"></span><span>${esc(threadStatus)}</span></div>
     </div>
     <div class="chat-toolbar">
-      ${state.chatSkinInfo ? `<label>皮肤存档 <select id="chat-skin-view"><option value="">当前使用的皮肤</option>${state.chatSkinInfo.skins.map((s) => `<option value="${esc(s.id)}" ${state.chatSkinView === s.id ? 'selected' : ''}>${esc(s.label)}</option>`).join('')}</select></label><button class="btn btn-small" id="chat-skin-switch">使用所选皮肤</button>` : ''}
+      ${state.chatSkinInfo ? `<label>人格存档 <select id="chat-skin-view"><option value="">当前使用的人格</option>${state.chatSkinInfo.skins.map((s) => `<option value="${esc(s.id)}" ${state.chatSkinView === s.id ? 'selected' : ''}>${esc(s.label)}</option>`).join('')}</select></label><button class="btn btn-small" id="chat-skin-switch">使用所选人格</button>` : ''}
       <button class="btn btn-small" id="chat-wake-btn">主动唤醒</button>
       ${key.startsWith('group:') && state.config?.incidentPilot?.enabled === true
         ? `<button type="button" class="icon-btn" id="chat-runtime-control" title="更改会话运行模式" aria-label="更改会话运行模式">${chatControlIcon(meta).icon}</button>`

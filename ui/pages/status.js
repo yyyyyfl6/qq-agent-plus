@@ -144,11 +144,22 @@ function renderUpdateCheckNote(update = {}) {
 async function refreshAutoUpdateStatus() {
   try {
     state.autoUpdateStatus = await api('/api/auto-update/status');
+    renderAutoUpdateFailure(state.autoUpdateStatus);
     if (state.tab === 'control') renderControlHub(state.integrationStatus || {});
   } catch {
     // A deployment restart can briefly interrupt polling; EventSource and the
     // next interval will reconnect without replacing the current status.
   }
+}
+
+function renderAutoUpdateFailure(update = {}) {
+  const node = $('#auto-update-failure');
+  if (!node) return;
+  const visible = update.status === 'failed' || update.autoDisabled === true;
+  node.classList.toggle('hidden', !visible);
+  if (!visible) { node.replaceChildren(); return; }
+  node.innerHTML = `<strong>${update.autoDisabled ? '自动更新已停止' : '上次更新失败'}</strong><span>${esc(update.error || '请检查更新部署状态')}${update.recoveryHint ? ' · ' + esc(update.recoveryHint) : ''}</span><button type="button" class="btn btn-small">查看并处理</button>`;
+  node.querySelector('button').onclick = () => switchTab('control');
 }
 
 async function pauseAutoUpdate() {
@@ -274,6 +285,7 @@ async function refreshStatusImpl() {
     if (state.tab === 'friends') loadFriendFeaturePage();
     if (state.tab === 'incidents') loadIncidentFeaturePage();
     renderBanner();
+    await refreshAutoUpdateStatus();
   } catch (e) { /* 忽略瞬时错误 */ }
 }
 
@@ -319,6 +331,7 @@ async function loadTimeControlStatus() {
 
 
 export {
+  renderAutoUpdateFailure,
   ignoreUpdateVersion, lifecycleAggregate, loadTimeControlStatus, pauseAutoUpdate, refreshAutoUpdateStatus,
   refreshStatusImpl, renderLifecycleOverviewImpl, renderUpdateCheckNote, resumePause, runManualUpdate,
   runUpdateFromNotice, timeControlTargetOptions, updateTimeControlLiveState

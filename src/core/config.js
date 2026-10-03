@@ -301,7 +301,7 @@ export function updateConfig(patch) {
     patch && typeof patch === 'object' ? patch : {}
   );
   if (rawPatch.skins !== undefined) rawPatch.skins = normalizeSkins({ ...current.skins, ...rawPatch.skins,
-    handoffOnSwitch: { ...current.skins?.handoffOnSwitch, ...rawPatch.skins?.handoffOnSwitch } });
+    handoffOnSwitch: { ...current.skins?.handoffOnSwitch, ...rawPatch.skins?.handoffOnSwitch } }, rawPatch.customPersonas || current.customPersonas);
   const requestedAdmin = normalizedRequestedAdmin(rawPatch, current);
   const autoUpdateEnabled = hasOwn(rawPatch?.autoUpdate, 'enabled')
     ? rawPatch.autoUpdate.enabled === true

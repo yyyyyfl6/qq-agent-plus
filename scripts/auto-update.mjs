@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { parseArgs } from 'node:util';
 import {
   autoUpdateOwner,
+  assertUpdateConfigAccess,
   autoUpdatePaths,
   consumeAutoUpdateRequest,
   readAutoUpdateState,
@@ -732,10 +733,12 @@ async function run() {
   acquireLock();
   const request = consumeAutoUpdateRequest(dataDir);
   mode = request?.mode || 'scheduled';
+  phase = 'config-access';
   cfg = readObject(configFile);
   const settings = cfg.autoUpdate || {};
   networkSettings = normalizeUpdateNetworkSettings(settings);
   if (mode === 'scheduled' && settings.enabled !== true) return;
+  assertUpdateConfigAccess(configFile);
 
   const previous = readAutoUpdateState(dataDir);
   const now = Date.now();

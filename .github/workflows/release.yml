@@ -136,10 +136,10 @@ jobs:
         run: |
           set -euo pipefail
           TAG="v$(node -p 'require("./package.json").version')"
-          [ "$TAG" = v0.7.8 ] || { echo '版本不匹配'; exit 1; }
+          [ "$TAG" = v0.7.9 ] || { echo '版本不匹配'; exit 1; }
           EXISTING="$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" --jq 'length')"
           [ "$EXISTING" = 0 ] || { echo 'tag 已存在，禁止覆盖'; exit 1; }
           gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$GITHUB_SHA" >/dev/null
           # GITHUB_TOKEN 创建的 tag 不会再次触发工作流；仍在本工作流内只建一份草稿。
-          gh release create "$TAG" --verify-tag --draft --title "$TAG · 双人格皮肤" --notes-file docs/RELEASE-v0.7.8.md
+          gh release create "$TAG" --verify-tag --draft --title "$TAG · 人格管理与模型设置" --notes-file docs/RELEASE-v0.7.9.md
           gh release edit "$TAG" --draft=false --latest

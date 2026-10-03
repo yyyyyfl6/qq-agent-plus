@@ -7,7 +7,8 @@
 
 主控制台的「双人格皮肤」入口打开 `/skins.html`。先在主控制台登录，再打开此页。
 页面可以开关皮肤、开关交接摘要、编辑默认皮肤/确认文案/皮肤列表，以及查看和切换会话绑定。
-列表中的 provider 必须使用本实例已有的 id；页面会显示可用 id，密钥沿用已有 providerKeys。
+列表中的 provider 使用本实例目录。人格页支持编辑 Base URL/API Key、检索或手动添加模型，并用表单选择人格预设、模型和专属切换指令。
+显式跟随全局 Key 的提供商仅在同端点继承；手动 Key 按提供商保存，Key 不回显。
 提供商不存在时告警并回落完整当前 api 配置；不把全局 key 送到另一个端点。
 
 管理员由 `autoUpdate.ownerUin` 指定。精确文本命令 `/skin fish`、`/skin cat`、`切鱼`、`切猫`
@@ -23,12 +24,12 @@
     "enabled": false,
     "default": "fish",
     "list": [
-      {"id":"fish","label":"蓝色大肥鱼","templateId":"blue_fish","provider":"custom_muqe0tk5aoxs","model":"deepseek-flash","botName":"蓝色大肥鱼"},
-      {"id":"cat","label":"哈基米","templateId":"hajimi","provider":"custom_mur0pryme2t6","model":"gemini-3.8-flash","botName":"哈基米"}
+      {"id":"fish","label":"蓝色大肥鱼","templateId":"blue_fish","provider":"provider_deepseek","model":"deepseek-flash","botName":"蓝色大肥鱼","commands":[]},
+      {"id":"cat","label":"哈基米","templateId":"hajimi","provider":"provider_gemini","model":"gemini-3.8-flash","botName":"哈基米","commands":["变成哈基米"]}
     ],
     "switchCommands": ["/skin","切鱼","切猫"],
     "ack": "已切换到 {label}",
-    "handoffOnSwitch": {"enabled":true,"maxChars":1200,"recentMessages":40,"provider":"","model":""}
+    "handoffOnSwitch": {"enabled":true,"maxChars":1200,"recentMessages":40,"provider":"","model":"deepseek-flash"}
   }
 }
 ```
@@ -48,8 +49,10 @@ SQLite `chat_skins` 记录会话绑定，消息、线程、检查点和线程回
 背景整合、记忆工具和身份提示词使用同一路由。异步任务固定所属皮肤，切换后的迟到写入仍回原仓。
 切换会阻止新唤醒、取消并等待原运行收尾，然后原子保存摘要与绑定；再次切回读回原消息和记忆。
 
-摘要由离开皮肤的模型生成，或使用 `handoffOnSwitch.provider/model` 指定的摘要器。
-调用最多等待 20 秒，失败仍完成切换。正文被限制到 `maxChars`，必含另一 AI 的转述、非亲历声明。
+摘要默认使用 deepseek-flash；通过人格页独立选择总结提供商和模型，不随离开人格的聊天模型变化。
+自动选择优先找目录中提供该模型的提供商，否则使用全局 API。示例提供商 ID 为占位符，应选择本实例保存的目录项。
+调用最多等待 20 秒，失败仍完成切换。结果返回 `handoffStatus`（created/disabled/no-messages/empty-response/failed）；失败时附不含上游原文的 `handoffError`，日志、人格页及 QQ 指令回执均显示原因。
+正文被限制到 `maxChars`，必含另一 AI 的转述、非亲历声明。
 下一轮系统提示词增加独立块 `【另一人格留下的交接摘要（转述，非亲历）】`，之后标为已消费。
 摘要开关关闭时不调用摘要器，也不注入待消费摘要。
 皮肤系统关闭时使用原单仓和全局人设；分仓数据保留，重新启用仍恢复分仓。

@@ -1,6 +1,7 @@
 import { builtinPersonaTemplate } from '../personas.js';
 import { sanitizeUserText, safeSlice } from '../core/util.js';
 import { skinScope, withSkinScope, logicalChatKey } from './context.js';
+import { resolveProviderKey, sameApiEndpoint } from '../core/provider-key.js';
 
 export const DEFAULT_SKINS = {
   enabled: false, default: 'fish',
@@ -10,10 +11,18 @@ export const DEFAULT_SKINS = {
   ],
   switchCommands: ['/skin', '切鱼', '切猫'],
   ack: '已切换到 {label}',
-  handoffOnSwitch: { enabled: true, maxChars: 1200, recentMessages: 40, provider: '', model: '' }
+  handoffOnSwitch: { enabled: true, maxChars: 1200, recentMessages: 40, provider: '', model: 'deepseek-flash' }
 };
 
-export function normalizeSkins(raw = {}) {
+function personaPreset(id, customs = []) {
+  const builtin = builtinPersonaTemplate(id);
+  if (builtin) return builtin;
+  const match = /^custom_(\d+)$/.exec(String(id));
+  const custom = match && customs[Number(match[1])];
+  return custom?.text ? { ...custom, behaviorProfile: custom.behaviorProfile || 'legacy' } : null;
+}
+
+export function normalizeSkins(raw = {}, customs = []) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('skins 必须为对象');
   const value = { ...structuredClone(DEFAULT_SKINS), ...raw };
   value.enabled = raw.enabled === true;
@@ -22,19 +31,26 @@ export function normalizeSkins(raw = {}) {
   value.list = value.list.map((s) => {
     if (!s || !/^[a-z][a-z0-9_-]{0,39}$/.test(s.id) || ids.has(s.id)) throw new Error('皮肤 id 无效或重复');
     ids.add(s.id);
-    if (!builtinPersonaTemplate(s.templateId)) throw new Error('皮肤人格模板不存在');
-    return Object.fromEntries(['id', 'label', 'templateId', 'provider', 'model', 'botName'].map((k) => [k, String(s[k] || '').trim().slice(0, 200)]));
+    if (!personaPreset(s.templateId, customs)) throw new Error('人格预设不存在');
+    const commands = s.commands ?? [];
+    if (!Array.isArray(commands) || commands.length > 10 || commands.some((c) => typeof c !== 'string' || !c.trim() || c.length > 40 || /[\r\n]/.test(c))) throw new Error('人格切换指令无效');
+    return { ...Object.fromEntries(['id', 'label', 'templateId', 'provider', 'model', 'botName'].map((k) => [k, String(s[k] || '').trim().slice(0, 200)])), commands: [...new Set(commands.map((c) => c.trim()))] };
   });
   if (!ids.has(value.default)) throw new Error('默认皮肤不存在');
   if (!Array.isArray(value.switchCommands) || value.switchCommands.some((s) => typeof s !== 'string' || !s.trim() || s.length > 40)) throw new Error('切换命令无效');
   value.switchCommands = [...new Set(value.switchCommands.map((s) => s.trim()))];
+  const commands = new Set();
+  for (const skin of value.list) for (const command of skin.commands) {
+    if (commands.has(command) || value.switchCommands.includes(command) || value.switchCommands.some((c) => c.startsWith('/') && command.startsWith(`${c} `))) throw new Error('人格切换指令重复或与通用指令冲突');
+    commands.add(command);
+  }
   value.ack = String(value.ack || DEFAULT_SKINS.ack).slice(0, 300);
   const h = { ...DEFAULT_SKINS.handoffOnSwitch, ...value.handoffOnSwitch };
   h.enabled = h.enabled === true;
   h.maxChars = Math.min(4000, Math.max(120, Math.round(Number(h.maxChars) || 1200)));
   h.recentMessages = Math.min(100, Math.max(1, Math.round(Number(h.recentMessages) || 40)));
   h.provider = String(h.provider || '').trim().slice(0, 200);
-  h.model = String(h.model || '').trim().slice(0, 200);
+  h.model = String(h.model || 'deepseek-flash').trim().slice(0, 200);
   value.handoffOnSwitch = h;
   return { enabled: value.enabled, default: value.default, list: value.list, switchCommands: value.switchCommands, ack: value.ack,
     handoffOnSwitch: { enabled: h.enabled, maxChars: h.maxChars, recentMessages: h.recentMessages, provider: h.provider, model: h.model } };
@@ -43,25 +59,53 @@ export function normalizeSkins(raw = {}) {
 export function resolveSkinConfig(cfg, skinId, warn = () => {}) {
   const logWarning = warn;
   if (cfg.skins?.enabled !== true) return cfg;
-  const settings = normalizeSkins(cfg.skins);
+  const settings = normalizeSkins(cfg.skins, cfg.customPersonas);
   const skin = settings.list.find((s) => s.id === skinId) || settings.list.find((s) => s.id === settings.default);
-  const template = builtinPersonaTemplate(skin.templateId);
+  const template = personaPreset(skin.templateId, cfg.customPersonas);
   const p = (cfg.providers || []).find((p) => p.id === skin.provider);
   let api = cfg.api;
   if (p && (p.baseURL || p.baseUrl)) {
-    const key = String(cfg.providerKeys?.[p.id] || p.apiKey || '').trim();
-    // 绝不继承另一端点的顶层 Key；缺钥匙时正常报告配置错误。
-    api = { ...cfg.api, provider: p.id, baseUrl: p.baseURL || p.baseUrl, apiKey: key === '******' ? '' : key, model: skin.model || cfg.api.model };
+    api = { ...cfg.api, provider: p.id, baseUrl: p.baseURL || p.baseUrl, apiKey: resolveProviderKey(p, cfg), model: skin.model || cfg.api.model, requireApiKey: true };
   } else if (skin.provider) logWarning(`[skins] 皮肤 ${skin.id} 的 provider 不存在，回落当前 api 配置`);
-  return { ...cfg, api, persona: { ...cfg.persona, templateId: skin.templateId, roleText: template.text, behaviorProfile: template.behaviorProfile, botName: skin.botName || skin.label }, activeSkinId: skin.id };
+  else api = { ...cfg.api, model: skin.model || cfg.api.model };
+  return { ...cfg, api, persona: { ...cfg.persona, templateId: skin.templateId, roleText: template.text, customRules: template.customRules || '', behaviorProfile: template.behaviorProfile, botName: skin.botName || skin.label }, activeSkinId: skin.id };
+}
+
+export function resolveSummaryApi(cfg, settings = {}) {
+  const model = String(settings.model || 'deepseek-flash').trim();
+  // 未指定提供商时优先找目录里有这个模型的家，再沿用全局端点；不随当前人格变动。
+  const matches = (cfg.providers || []).filter((p) => (p.models || []).some((m) => (typeof m === 'string' ? m : m.id) === model));
+  const provider = settings.provider
+    ? (cfg.providers || []).find((p) => p.id === settings.provider)
+    : matches.find((p) => resolveProviderKey(p, cfg)) || matches[0];
+  if (settings.provider && !provider) throw new Error('总结提供商不存在，请重新选择');
+  const globalProvider = (cfg.providers || []).find((p) => p.id === cfg.api?.provider && sameApiEndpoint(p.baseURL || p.baseUrl, cfg.api?.baseUrl));
+  const api = provider ? { ...cfg.api, provider: provider.id, baseUrl: provider.baseURL || provider.baseUrl, apiKey: resolveProviderKey(provider, cfg), model }
+    : { ...cfg.api, apiKey: globalProvider ? resolveProviderKey(globalProvider, cfg) : cfg.api?.apiKey, model };
+  if (!api.apiKey || api.apiKey === '******') throw new Error('总结提供商缺少 API Key，请在提供商设置中保存');
+  return { ...api, requireApiKey: true };
+}
+
+export function handoffErrorReason(error) {
+  const status = Number(error?.status || error?.statusCode || error?.httpStatus) || Number(/\b(?:HTTP|status)\s*[:=]?\s*(\d{3})\b/i.exec(String(error?.message || ''))?.[1]);
+  if (status >= 400 && status <= 599) return `HTTP ${status}${status === 401 || status === 403 ? '：认证失败，请检查总结提供商的 Key' : '：总结服务请求失败'}`;
+  if (/API Key/.test(String(error?.message))) return '总结提供商缺少 API Key，请在提供商设置中保存';
+  if (/提供商不存在/.test(String(error?.message))) return '总结提供商不存在，请重新选择';
+  if (/timeout|超时/i.test(String(error?.name) + String(error?.message))) return '总结请求超时';
+  const code = String(error?.cause?.code || error?.code || '');
+  if (['ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'EAI_AGAIN'].includes(code)) return `总结网络连接失败（${code}）`;
+  // 上游错误常回显 prompt / 凭据；只输出已知分类，绝不输出原文。
+  return '总结请求失败，请检查提供商连接与模型配置';
 }
 
 export function parseSkinCommand(text, cfg) {
   if (cfg.skins?.enabled !== true) return null;
-  const settings = normalizeSkins(cfg.skins);
+  const settings = normalizeSkins(cfg.skins, cfg.customPersonas);
   const s = String(text || '').trim();
-  if (settings.switchCommands.includes('切鱼') && s === '切鱼') return { skinId: 'fish' };
-  if (settings.switchCommands.includes('切猫') && s === '切猫') return { skinId: 'cat' };
+  const custom = settings.list.find((skin) => skin.commands.includes(s));
+  if (custom) return { skinId: custom.id };
+  if (settings.switchCommands.includes('切鱼') && s === '切鱼') return settings.list.some((p) => p.id === 'fish') ? { skinId: 'fish' } : { error: true };
+  if (settings.switchCommands.includes('切猫') && s === '切猫') return settings.list.some((p) => p.id === 'cat') ? { skinId: 'cat' } : { error: true };
   const prefix = settings.switchCommands.find((c) => c.startsWith('/') && (s === c || s.startsWith(`${c} `)));
   if (!prefix) return null;
   const args = s.slice(prefix.length).trim().split(/\s+/);
@@ -78,7 +122,7 @@ export class SkinManager {
   }
   get config() { return this.getConfig({ unscoped: true }); }
   get enabled() { return this.config.skins?.enabled === true; }
-  get settings() { return normalizeSkins(this.config.skins || {}); }
+  get settings() { return normalizeSkins(this.config.skins || {}, this.config.customPersonas); }
   ensureSchema() {
     if (this.initialized) return;
     const db = this.store.db;
@@ -143,20 +187,23 @@ export class SkinManager {
     await this.beforeSwitch?.(chatKey);
     const h = this.settings.handoffOnSwitch;
     let summary = '';
+    let handoffStatus = h.enabled ? 'no-messages' : 'disabled';
+    let handoffError = '';
     if (h.enabled && this.summarize) {
       try {
         const recent = this.scope(chatKey, () => this.store.recent(chatKey, { limit: h.recentMessages }), old.id);
         if (recent.length) {
+          handoffStatus = 'empty-response';
           const text = await this.scope(chatKey, () => this.summarize({ chatKey, sourceSkin: old, targetSkin: this.current(chatKey, skinId), messages: recent, settings: h }), old.id);
           // 固定声明放最前，避免长标签挤掉“非亲历”这一必要边界。
           const marker = '这是另一个 AI 在这个身体里干的，不是你亲历的。';
-          if (String(text || '').trim()) summary = safeSlice(`${marker}\n${String(text).trim()}`, h.maxChars);
+          if (String(text || '').trim()) { summary = safeSlice(`${marker}\n${String(text).trim()}`, h.maxChars); handoffStatus = 'created'; }
         }
-      } catch { this.warn('[skins] 交接摘要失败，继续切换'); }
+      } catch (error) { handoffStatus = 'failed'; handoffError = handoffErrorReason(error); this.warn(`[skins] 交接摘要失败，继续切换：${handoffError}`); }
     }
     // 摘要和绑定同一事务落盘；失败/关闭时删目标旧摘要，不能复活上次交接。
     if (!this.enabled) throw new Error('皮肤系统已关闭，取消切换');
-    if (!this.settings.handoffOnSwitch.enabled) summary = '';
+    if (!this.settings.handoffOnSwitch.enabled) { summary = ''; handoffStatus = 'disabled'; handoffError = ''; }
     const db = this.store.db;
     this.store.transaction(() => {
       this.scope(chatKey, () => this.store.closeConversationThread(chatKey, 'skin-changed'), old.id);
@@ -164,7 +211,7 @@ export class SkinManager {
       if (summary) db.prepare('INSERT INTO skin_handoffs(chat_key,skin_id,source_skin_id,summary,updated_at) VALUES (?,?,?,?,?)').run(chatKey, skinId, old.id, summary, Date.now());
       db.prepare('INSERT INTO chat_skins VALUES (?,?,?) ON CONFLICT(chat_key) DO UPDATE SET skin_id=excluded.skin_id,updated_at=excluded.updated_at').run(chatKey, skinId, Date.now());
     });
-    return { ok: true, skinId, changed: true, handoff: Boolean(summary) };
+    return { ok: true, skinId, changed: true, handoff: Boolean(summary), handoffStatus, ...(handoffError ? { handoffError } : {}) };
   }
   async consumeCommand(chatKey, senderId, text, mid = null) {
     const parsed = parseSkinCommand(text, this.config);
@@ -180,9 +227,10 @@ export class SkinManager {
       await this.sendAck?.(chatKey, `可用皮肤：${this.settings.list.map((s) => s.id).join('、')}`);
       return true;
     }
-    await this.switchSkin(chatKey, parsed.skinId);
+    const result = await this.switchSkin(chatKey, parsed.skinId);
     const skin = this.current(chatKey);
-    await this.sendAck?.(chatKey, this.settings.ack.replaceAll('{label}', skin.label).replaceAll('{id}', skin.id));
+    const ack = this.settings.ack.replaceAll('{label}', skin.label).replaceAll('{id}', skin.id);
+    await this.sendAck?.(chatKey, result.handoffError ? `${ack}\n交接总结失败：${result.handoffError}` : ack);
     return true;
   }
 }
