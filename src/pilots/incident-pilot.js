@@ -3,6 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { openDatabase } from '../core/sqlite.js';
 import { redactText } from '../core/redact.js';
+import { safeSlice } from '../core/util.js';
 
 const DB_NAME = 'incident-pilot.sqlite';
 const INCIDENT_STATES = new Set(['open', 'acknowledged', 'resolved']);
@@ -11,6 +12,19 @@ const SEVERITY_ORDER = { info: 0, warning: 1, error: 2, critical: 3 };
 
 // 脱敏规则统一在 core/redact.js（orchestrator 写 journal 的工具有错行同口径）
 const cleanText = redactText;
+
+export function formatIncidentNotification(incident) {
+  const severity = { critical: '严重', error: '错误', warning: '警告', info: '信息' }[incident.severity] || cleanText(incident.severity, 20);
+  const message = cleanText(incident.message);
+  const summary = message.length > 220 ? `${safeSlice(message, 220)}…（已截断，详情见控制台）` : message;
+  return [
+    '【实验功能 · QQ Agent 异常】', `等级：${severity}`,
+    `模块：${cleanText(incident.source, 60)}`,
+    ...(incident.chatKey ? [`会话：${cleanText(incident.chatKey, 80)}`] : []),
+    `结果：${summary}`, `次数：${incident.count}`, `编号：${cleanText(incident.id, 80)}`,
+    '', '处理入口：控制台 → 异常'
+  ].join('\n');
+}
 
 function sanitizeDetails(value, depth = 0) {
   if (depth > 3) return '[truncated]';

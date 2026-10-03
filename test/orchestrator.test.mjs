@@ -16,7 +16,8 @@ const {
 } = await import('../src/core/orchestrator.js');
 const { ChatStore } = await import('../src/core/store.js');
 const { SessionRegistry } = await import('../src/core/sessions.js');
-const { setRuntimeConfig, DEFAULT_CONFIG } = await import('../src/core/config.js');
+const { setRuntimeConfig, getConfig, DEFAULT_CONFIG } = await import('../src/core/config.js');
+const { SkinManager } = await import('../src/skins/skins.js');
 const { ReminderStore } = await import('../src/core/reminders.js');
 const { todayKey } = await import('../src/core/util.js');
 const { currentTraceId, lastTraceId } = await import('../src/core/logger.js');
@@ -141,6 +142,77 @@ describe('Orchestrator', () => {
     assert.equal(calls, 1);
     assert.equal(store.findByMid('group:1', 1).read, true);
     assert.equal(store.findByMid('group:1', 2).read, false);
+  });
+
+  for (const mode of ['legacy', 'threaded', 'lifecycle']) {
+    it(`retains the other persona handoff after a silent ${mode} request`, async (t) => {
+      const { cfg, runner, store, append } = fixture(t);
+      cfg.conversation.mode = mode;
+      cfg.skins = {
+        enabled: true, default: 'fish',
+        list: [
+          { id: 'fish', label: '鲸鱼娘', templateId: 'blue_fish', model: 'mock-fish' },
+          { id: 'cat', label: '哈基米', templateId: 'hajimi', model: 'mock-cat' }
+        ]
+      };
+      setRuntimeConfig(cfg);
+      const skins = new SkinManager({ store, getConfig, summarize: async ({ messages }) => {
+        assert.equal(messages.at(-1).text, '你是谁');
+        return '用户刚问鲸鱼娘“你是谁”，她回答自己是 DeepSeek 小鲸鱼。';
+      } });
+      runner.skins = skins;
+      append(1, '你是谁');
+      await skins.switchSkin('group:1', 'cat');
+      assert.deepEqual(store.recent('group:1'), []);
+      const requests = [];
+      globalThis.fetch = async (_url, options) => {
+        requests.push(JSON.parse(options.body));
+        return Response.json({ choices: [{ message: { content: 'No reply needed' } }], usage: { total_tokens: 10 } });
+      };
+      append(2, '路过的一句话');
+      await runner.wake('group:1');
+      const firstThread = store.getConversationThread('group:1');
+      append(3, '刚才我问了蓝色大肥鱼什么问题');
+      await runner.wake('group:1');
+      assert.equal(requests.length, 2);
+      for (const request of requests) {
+        assert.equal(request.model, 'mock-cat');
+        assert.match(request.messages[0].content, /另一人格留下的交接摘要/);
+        assert.match(request.messages[0].content, /用户刚问鲸鱼娘“你是谁”/);
+        assert.match(request.messages[0].content, /可依据.*转述.*回答/);
+      }
+      assert.equal(requests[0].messages[0].content, requests[1].messages[0].content);
+      if (mode === 'lifecycle') assert.equal(store.getConversationThread('group:1').threadId, firstThread.threadId);
+      const restarted = new SkinManager({ store, getConfig });
+      assert.match(restarted.handoffPrompt('group:1'), /你是谁/);
+      assert.equal(restarted.handoffPrompt('group:2'), '');
+      cfg.skins.handoffOnSwitch = { enabled: false };
+      setRuntimeConfig(cfg);
+      append(4, '关闭后的消息');
+      await runner.wake('group:1');
+      assert.doesNotMatch(requests[2].messages[0].content, /用户刚问鲸鱼娘“你是谁”/);
+    });
+  }
+
+  it('does not mark a persona handoff delivered before a failed model request', async (t) => {
+    const { cfg, runner, store, append } = fixture(t);
+    cfg.skins = { enabled: true };
+    setRuntimeConfig(cfg);
+    const skins = new SkinManager({ store, getConfig, warn: () => {}, summarize: async () => '鱼的交接内容' });
+    runner.skins = skins;
+    append(1, '鱼的话题');
+    await skins.switchSkin('group:1', 'cat');
+    append(2, '猫的问题');
+    globalThis.fetch = async () => new Response('bad request', { status: 400 });
+    await runner.wake('group:1');
+    assert.equal(store.db.prepare('SELECT consumed_at FROM skin_handoffs').get().consumed_at, 0);
+    assert.equal(store.retryFailed('group:1'), 1);
+    globalThis.fetch = async (_url, options) => {
+      assert.match(JSON.parse(options.body).messages[0].content, /鱼的交接内容/);
+      return Response.json({ choices: [{ message: { content: 'done' } }], usage: { total_tokens: 10 } });
+    };
+    await runner.wake('group:1', { manual: true });
+    assert.ok(store.db.prepare('SELECT consumed_at FROM skin_handoffs').get().consumed_at > 0);
   });
 
   it('preserves failed input and recorded token usage without clearing a run', async (t) => {

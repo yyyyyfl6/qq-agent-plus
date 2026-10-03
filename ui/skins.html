@@ -6,38 +6,39 @@
 </head>
 <body class="personas-body"><main id="skins-page">
   <header class="personas-header"><a href="/">← 控制台</a><h1>人格</h1><p>给每个人格选择预设和模型，用指令切换。对话、记忆与存档各自保留。</p></header>
-  <nav class="personas-nav" aria-label="本页导航"><a href="#personality-settings">人格管理</a><a href="#provider-settings">API 与模型</a><a href="#summary-settings">交接总结</a><a href="#chat-settings">会话绑定</a></nav>
+  <nav class="personas-nav" aria-label="本页导航"><a href="#personality-settings">人格管理</a><a href="#summary-settings">交接总结</a><a href="#chat-settings">会话绑定</a></nav>
   <p id="skin-status" class="personas-status" role="status" aria-live="polite">加载中…</p>
-  <form id="skins-form">
     <section id="personality-settings" class="personas-section">
-      <div class="section-title"><h2>人格管理</h2><button id="skin-add" type="button" class="btn">＋ 添加人格</button></div>
-      <label class="check-label"><input id="skins-enabled" type="checkbox">启用多个人格</label>
-      <div class="personas-fields"><label>默认人格<select id="skins-default"></select></label><label>切换回执<input id="skins-ack" placeholder="已切换到 {label}" maxlength="300"></label></div>
-      <p class="muted">只有全局管理员可以用指令切换。通用指令如 <code>/skin cat</code>；每个人格也可以设置独立指令。</p>
-      <label>通用切换指令（每行一条）<textarea id="skins-prefixes" rows="3" aria-label="通用切换指令"></textarea></label>
+      <div class="section-title"><h2>人格管理</h2><button id="skin-add" type="button" class="btn btn-primary" disabled>＋ 新增人格</button></div>
+      <p class="muted">每个人格都有自己的预设、模型和切换指令。新增或编辑后，在编辑框内保存即可。</p>
       <div id="skins-list" class="personas-list"></div>
+    </section>
+  <form id="skins-form">
+    <section class="personas-section">
+      <h2>切换设置</h2>
+      <label class="check-label"><input id="skins-enabled" type="checkbox">启用多个人格</label>
+      <label>默认人格<select id="skins-default"></select></label>
+      <p class="muted">管理员发送人格的切换指令即可切换当前会话，对话、记忆与存档各自保留。</p>
+      <details><summary>切换提示与通用指令</summary><label>切换回执<input id="skins-ack" placeholder="已切换到 {label}" maxlength="300"></label><label>通用切换指令（每行一条）<textarea id="skins-prefixes" rows="2" aria-label="通用切换指令"></textarea></label></details>
     </section>
     <section id="summary-settings" class="personas-section">
       <h2>交接总结</h2><label class="check-label"><input id="skins-handoff" type="checkbox">切换时总结最近对话，交给接任人格</label>
       <div class="personas-fields"><label>总结提供商<select id="skins-summary-provider"></select></label><label>总结模型<input id="skins-summary-model" list="summary-model-options" placeholder="deepseek-flash" required><datalist id="summary-model-options"></datalist></label><label>最近消息数<input id="skins-summary-recent" type="number" min="1" max="100" required></label><label>摘要最大字符数<input id="skins-summary-chars" type="number" min="120" max="4000" required></label></div>
       <p class="muted">默认使用 deepseek-flash。自动选择会优先寻找提供该模型的提供商；无匹配时使用全局 API。摘要失败仍会切换，并显示原因。</p>
     </section>
-    <div class="personas-save"><button type="submit" class="btn btn-primary" id="skins-save">保存人格与总结设置</button><span class="muted">API 设置在下方独立保存</span></div>
+    <div class="personas-save"><button type="submit" class="btn btn-primary" id="skins-save" disabled>保存切换与总结设置</button></div>
   </form>
-  <section id="provider-settings" class="personas-section">
-    <h2>API 与模型</h2><p class="muted">同一个中转站可以同时提供 DeepSeek、Gemini 等模型。目录保留所有模型，也支持手动添加。</p>
-    <form id="skins-provider-form">
-      <label>编辑提供商<select id="skin-provider-edit"></select></label>
-      <div class="personas-fields"><label>Base URL<input id="skin-provider-url" type="url" placeholder="https://api.example.com/v1" required></label><label>API Key<input id="skin-provider-key" type="password" autocomplete="new-password" placeholder="填写这家提供商的 Key"></label></div>
-      <p id="skin-provider-key-note" class="muted"></p>
-      <div class="personas-actions"><button type="button" class="btn" id="skin-fetch-models">检索模型</button><span id="skin-model-count" class="muted"></span></div>
-      <label>模型目录（每行一个模型 ID，可手动补充）<textarea id="skin-provider-models" rows="5" placeholder="deepseek-flash&#10;gemini-3.8-flash"></textarea></label>
-      <button class="btn" id="skin-provider-save" type="submit">保存提供商与模型</button>
+  <dialog id="persona-dialog" aria-labelledby="persona-title">
+    <form id="persona-form">
+      <h2 id="persona-title">新增人格</h2>
+      <label>人格名称<input id="persona-name" maxlength="200" required placeholder="例如：鲸鱼娘"></label>
+      <label>预设<select id="persona-preset" required></select></label>
+      <div class="personas-fields"><label>模型提供商<select id="persona-provider"></select></label><label>模型<input id="persona-model" list="persona-model-options" required placeholder="选择或输入模型 ID"><datalist id="persona-model-options"></datalist></label></div>
+      <label>自定义切换指令（每行一条）<textarea id="persona-commands" rows="3" placeholder="例如：切换鲸鱼娘&#10;/whale"></textarea></label>
+      <p class="muted">完整匹配指令。预设和模型目录沿用控制台已有设置。</p>
+      <p id="persona-error" class="personas-error" role="alert"></p>
+      <div class="personas-actions"><button id="persona-save" type="submit" class="btn btn-primary">保存人格</button><button id="persona-cancel" type="button" class="btn">取消</button></div>
     </form>
-    <p id="skin-provider-status" role="status" aria-live="polite"></p>
-  </section>
-  <section id="preset-settings" class="personas-section">
-    <details><summary>添加自定义人格预设</summary><form id="skins-preset-form"><div class="personas-fields"><label>预设名称<input id="skin-preset-name" maxlength="50" required></label><label>行为档位<select id="skin-preset-profile"><option value="legacy">角色扮演</option><option value="grounded">务实交流</option></select></label></div><label>角色设定<textarea id="skin-preset-text" rows="5" placeholder="填写这个人格的身份、性格与说话方式" required></textarea></label><button type="submit" class="btn">保存为预设</button><p id="skin-preset-status" role="status"></p></form></details>
-  </section>
+  </dialog>
   <section id="chat-settings" class="personas-section"><h2>会话绑定</h2><p class="muted">切换会结束当前线程。开启交接时会产生一次摘要调用。</p><div id="skins-chats"></div><p id="skin-switch-status" role="status" aria-live="polite"></p></section>
 </main><script type="module" src="/skins.js"></script></body></html>

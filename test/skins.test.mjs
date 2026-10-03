@@ -11,7 +11,7 @@ import { backupPersonBeforeConsolidation } from '../src/memory/memory-consolidat
 import { buildSystemPrompt } from '../src/llm/prompt.js';
 
 const skinModule = await import('../src/skins/skins.js').catch(() => ({}));
-const { normalizeSkins, resolveSkinConfig, parseSkinCommand, SkinManager } = skinModule;
+const { normalizeSkins, resolveSkinConfig, parseSkinCommand, SkinManager, skinSummaryInput } = skinModule;
 const cfg = () => ({ ...structuredClone(DEFAULT_CONFIG), skins: {
   enabled: true, default: 'fish',
   list: [
@@ -121,7 +121,7 @@ test('summary states distinguish disabled, no messages, empty reply and successf
   assert.equal((await skins.switchSkin('group:1', 'fish')).handoffStatus, 'empty-response');
 });
 
-test('message replay never copies old history into the new skin; handoff is consumed once', async (t) => {
+test('message replay never copies old history; delivered handoff persists until replaced', async (t) => {
   const { store } = fixture(t); setRuntimeConfig(cfg());
   const skins = new SkinManager({ store, getConfig, summarize: async () => '旧鱼的话题' });
   store.appendIncoming('group:1', { mid: 'old', text: '旧鱼', senderId: '42' });
@@ -132,9 +132,27 @@ test('message replay never copies old history into the new skin; handoff is cons
   assert.equal(store.identityActivityRows().length, 0);
   assert.ok(skins.handoffPrompt('group:1'));
   skins.markHandoffUsed('group:1');
-  assert.equal(skins.handoffPrompt('group:1'), '');
+  assert.match(skins.handoffPrompt('group:1'), /旧鱼的话题/);
   store.appendIncoming('group:1', { mid: 'new', text: '新猫', senderId: '42' });
   assert.equal(store.identityActivityRows()[0].chatKey, 'group:1');
+  await skins.switchSkin('group:1', 'fish');
+  skins.summarize = async () => '新鱼的话题';
+  await skins.switchSkin('group:1', 'cat');
+  assert.match(skins.handoffPrompt('group:1'), /新鱼的话题/);
+  assert.doesNotMatch(skins.handoffPrompt('group:1'), /旧鱼的话题/);
+});
+
+test('summary input keeps complete recent questions and answers when the old history exceeds the budget', () => {
+  const messages = Array.from({ length: 40 }, (_, i) => ({ text: `${i}:` + '旧话题'.repeat(2000), senderName: '用户' }));
+  messages.push({ text: '你是谁', senderName: '用户' }, { text: 'DeepSeek，小鲸鱼', self: true });
+  const input = skinSummaryInput(messages, { label: '鲸鱼娘' });
+  assert.ok(input.length <= 20000);
+  const rows = JSON.parse(input);
+  assert.deepEqual(rows.slice(-2), [{ speaker: '用户', text: '你是谁' }, { speaker: '鲸鱼娘', text: 'DeepSeek，小鲸鱼' }]);
+  assert.ok(!rows[0].text.startsWith('0:'));
+  const escaped = skinSummaryInput([{ text: '最新问题：' + '\u0001'.repeat(6000), senderName: '用户' }], { label: '鲸鱼娘' });
+  assert.ok(escaped.length <= 20000);
+  assert.match(JSON.parse(escaped)[0].text, /^最新问题：/);
 });
 
 test('disabling during a cat task pins its writes; bindings and legacy owner survive restart', async (t) => {
@@ -253,6 +271,6 @@ test('owner command replay is consumed once and acknowledgement uses configurati
   const skins = new SkinManager({ store, getConfig, sendAck: async (_key, text) => acks.push(text) });
   assert.equal(await skins.consumeCommand('group:1', '10001', '/skin cat', '99'), true);
   assert.equal(await skins.consumeCommand('group:1', '10001', '/skin cat', '99'), true);
-  assert.deepEqual(acks, ['已切换到 猫']);
+  assert.deepEqual(acks, ['已切换到 猫\n原人格没有可总结的消息，未生成交接摘要']);
   assert.deepEqual(store.recent('group:1'), []);
 });

@@ -20,6 +20,51 @@ const {
 const { DEFAULT_CONFIG, setRuntimeConfig } = await import('../src/core/config.js');
 
 describe('LLM client', () => {
+  it('filters unsupported Gemini media before sending, preserves text and does not mutate history', async (t) => {
+    const original = globalThis.fetch;
+    t.after(() => { globalThis.fetch = original; });
+    const gif = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+    const png = 'data:image/png;base64,iVBORw0KGgo=';
+    const messages = [{ role: 'user', content: [
+      { type: 'text', text: '保留文字' }, { type: 'image_url', image_url: { url: gif } },
+      { type: 'image_url', image_url: { url: png } },
+      { type: 'file', file: { file_data: 'data:application/zip;base64,YWJj' } }
+    ] }];
+    globalThis.fetch = async (_url, request) => {
+      const body = JSON.parse(request.body);
+      const payload = JSON.stringify(body.messages);
+      assert.doesNotMatch(payload, /image\/gif|R0lGODlh|application\/zip|YWJj/);
+      assert.match(payload, /保留文字/);
+      assert.match(payload, /已过滤不支持/);
+      assert.ok(body.messages[0].content.some((p) => p.image_url?.url === png));
+      return Response.json({ choices: [{ message: { content: 'ok' } }] });
+    };
+    await chatCompletion({ messages, overrides: { baseUrl: 'https://gateway.invalid/v1', model: 'gemini-test' } });
+    assert.equal(messages[0].content[1].image_url.url, gif);
+    await chatCompletion({ messages: [], overrides: { baseUrl: 'https://gateway.invalid/v1', model: 'mock', extraBody: { model: 'gemini-test', messages } } });
+  });
+
+  it('filters GIF bytes mislabeled as PNG and remote GIF URLs, but keeps JPEG frame strips', async (t) => {
+    const original = globalThis.fetch;
+    t.after(() => { globalThis.fetch = original; });
+    globalThis.fetch = async (_url, request) => {
+      const body = JSON.parse(request.body);
+      assert.doesNotMatch(JSON.stringify(body), /R0lGODlh|example\.invalid\/a\.gif/);
+      assert.ok(body.messages[0].content.some((p) => p.image_url?.url.startsWith('data:image/jpeg;')));
+      return Response.json({ choices: [{ message: { content: 'ok' } }] });
+    };
+    await chatCompletion({ messages: [{ role: 'user', content: [
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,R0lGODlhAQABAIAAAAAAAP///w==' } },
+      { type: 'image_url', image_url: { url: 'https://example.invalid/a.gif?key=private' } },
+      { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,/9j/AA==' } }
+    ] }], overrides: { baseUrl: 'https://gateway.invalid/v1', model: 'gemini-test' } });
+  });
+
+  it('does not retry deterministic MIME conversion failures even when a relay reports HTTP 500', () => {
+    assert.equal(isRetryableError(new Error('模型 API HTTP 500：mime type is not supported by Gemini')), false);
+    assert.equal(isRetryableError(new Error('模型 API HTTP 500：convert_request_failed')), false);
+  });
+
   it('reads cached input tokens from supported provider response shapes', () => {
     assert.equal(cachedTokensOfUsage({
       prompt_tokens_details: { cached_tokens: 120 }

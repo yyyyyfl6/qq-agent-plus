@@ -7,6 +7,8 @@ import { resolveModelPrice, priceAt } from '../pricing/model-prices.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { assertTimeAllowed, watchTimeWindow } from '../core/time-gate.js';
 import { createLogger } from '../core/logger.js';
+import { imageType } from '../core/image-type.js';
+import { redactText } from '../core/redact.js';
 
 const log = createLogger('llm');
 
@@ -88,6 +90,8 @@ export function isRetryableError(error) {
   // 明确的客户端错误：重试也不会变好，只会白烧额度
   if (/HTTP\s*(401|400|403|404|405|409|413|422)/i.test(msg)) return false;
   if (/unauthorized|forbidden|invalid api.?key|incorrect api.?key/i.test(msg)) return false;
+  // 中转站把格式不兼容包装成 500；相同附件重发仍会失败。
+  if (/mime type[^\n]*not supported|unsupported[^\n]*(?:mime|media)|convert_request_failed/i.test(msg)) return false;
 
   // 明确的暂时性故障
   if (/HTTP\s*5\d\d/i.test(msg)) return true;                        // 5xx
@@ -315,13 +319,36 @@ export async function chatCompletionWithRetry(args, retries = 2) {
  * 返回 { message, usage, raw }；usage 形如 { prompt_tokens, completion_tokens, total_tokens }。
  * overrides: { baseUrl, apiKey, model, timeoutMs } 可选，用于记忆整理专用模型等场景。
  */
-/** 请求体里的内容清洗：字符串直接清，多模态数组逐段清 text（图片段原样保留）。 */
-function cleanContentForRequest(content) {
+/** 最终请求边界：保留文字与兼容图片，不支持的附件用文字说明代替。 */
+function cleanContentForRequest(content, model = '') {
   if (typeof content === 'string') return stripLoneSurrogates(content);
   if (Array.isArray(content)) {
-    return content.map((part) => (part && typeof part.text === 'string'
-      ? { ...part, text: stripLoneSurrogates(part.text) }
-      : part));
+    const omitted = () => ({ type: 'text', text: '[已过滤不支持的附件，原消息文字保留]' });
+    return content.map((part) => {
+      if (part?.type === 'image_url') {
+        const url = String(part.image_url?.url || '');
+        let mime = '';
+        const header = /^data:([^;,]+)[^,]*,/i.exec(url.slice(0, 160));
+        if (/^data:/i.test(url)) {
+          if (!header) return omitted();
+          mime = imageType(Buffer.from(url.slice(header[0].length, header[0].length + 48), 'base64')) || header[1].toLowerCase();
+        } else {
+          try {
+            const extension = /\.(gif|svg|bmp|tiff?|heic|heif)$/i.exec(new URL(url).pathname)?.[1]?.toLowerCase();
+            if (extension) mime = `image/${extension}`;
+          } catch { return omitted(); }
+        }
+        const compatible = ['image/png', 'image/jpeg', 'image/jpg', 'image/webp'];
+        if (!/gemini/i.test(String(model))) compatible.push('image/gif');
+        if (mime && !compatible.includes(mime)) return omitted();
+        // 声明 MIME 与魔数不一致时，以实际图片格式为准。
+        return header && mime !== header[1].toLowerCase()
+          ? { ...part, image_url: { ...part.image_url, url: `data:${mime};base64,${url.slice(header[0].length)}` } } : part;
+      }
+      if (part?.type === 'refusal') return part;
+      if (part?.type !== 'text') return omitted();
+      return { ...part, text: stripLoneSurrogates(part.text) };
+    });
   }
   return content;
 }
@@ -412,6 +439,8 @@ export async function chatCompletion({
     }
     body.stream = false;
   }
+  // extraBody 也能覆盖 model/messages，必须按最终模型再次检查，覆盖历史与工具结果中的附件。
+  if (Array.isArray(body.messages)) body.messages = body.messages.map((message) => ({ ...message, content: cleanContentForRequest(message.content, body.model) }));
 
   const controller = new AbortController();
   const timeoutMs = Math.max(5000, Number(api.timeoutMs) || 180000);
@@ -449,12 +478,12 @@ export async function chatCompletion({
         for (const k of patchKeys) delete retryBody[k];
         if (!thinkingParamRejectedWarned.has(api.model)) {
           thinkingParamRejectedWarned.add(api.model);
-          log.warn('[llm] 模型拒绝思考参数，已去掉后重试（每个模型提示一次）：', api.model, '|', text.slice(0, 160));
+          log.warn('[llm] 模型拒绝思考参数，已去掉后重试（每个模型提示一次）：', api.model, '|', redactText(text, 160));
         }
         res = await send(retryBody);
         if (!res.ok) text = await res.text();
       }
-      if (!res.ok) throw new Error(`模型 API HTTP ${res.status}：${text.slice(0, 500)}`);
+      if (!res.ok) throw new Error(`模型 API HTTP ${res.status}：${redactText(text, 500)}`);
     }
     const data = await res.json();
     const choice = data?.choices?.[0];

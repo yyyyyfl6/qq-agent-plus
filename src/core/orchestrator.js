@@ -1510,8 +1510,8 @@ export class Orchestrator {
     const skinHandoff = this.skins?.handoffPrompt(chatKey) || '';
     if (skinHandoff) {
       systemPrompt += '\n\n' + skinHandoff;
-      this.skins.markHandoffUsed(chatKey);
     }
+    session.skinHandoffIncluded = Boolean(skinHandoff);
     if (this.skins?.enabled) session.skinId = skinScope()?.skinId || '';
     const promptPrefixHash = crypto.createHash('sha256')
       .update(String(cfg.api.provider || ''))
@@ -1738,6 +1738,7 @@ export class Orchestrator {
         purpose: 'chat'
       });
       signal.throwIfAborted();
+      if (skinHandoff) this.skins.markHandoffUsed(chatKey);
       session.model = response.model || session.model;
       addUsage(session.usage, response.usage);
       session.usage.calls += 1;

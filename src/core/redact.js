@@ -8,6 +8,9 @@
 // 后者拦得住字段名不含关键词、但值本身就是密钥的场景（审计快照里的 extraBody/headers 等）。
 export function redactSecretValue(value) {
   return String(value ?? '')
+    // 上游错误有时回显整个图片/附件，日志与通知不保留 base64 二进制内容。
+    .replace(/data:[a-z0-9.+-]+\/[a-z0-9.+-]+(?:;[^,\s]*)?;base64,[a-z0-9+/=_-]+/gi, '[附件内容已省略]')
+    .replace(/\bbase64:\/\/[a-z0-9+/=_-]+/gi, '[附件内容已省略]')
     // Bearer/Basic 头：值吃到空白为止（连同结尾引号）。保持既有语义不动。
     .replace(/\b(bearer|basic)\s+\S+/gi, '$1 [redacted]')
     // 查询串里的令牌参数：名字本身在表内的（token/key/apikey/…），或"分隔符 + 令牌词"结尾的

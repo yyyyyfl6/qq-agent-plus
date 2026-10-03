@@ -2,8 +2,7 @@ import { api } from './core/api.js';
 import { esc } from './core/dom.js';
 
 export async function initSkinsPage() {
-  const page = document.getElementById('skins-page');
-  if (!page) return;
+  if (!document.getElementById('skins-page')) return;
   const el = (id) => document.getElementById(id);
   const status = el('skin-status');
   const report = (node, message, error = false) => { node.textContent = message; node.classList.toggle('personas-error', error); };
@@ -11,63 +10,31 @@ export async function initSkinsPage() {
   const option = (value, label, selected) => `<option value="${esc(value)}" ${value === selected ? 'selected' : ''}>${esc(label)}</option>`;
   const modelIds = (p) => (p?.models || []).map((m) => typeof m === 'string' ? m : m.id).filter(Boolean);
   let data;
-  let bindings;
-  const readRows = () => [...el('skins-list').querySelectorAll('.persona-editor')].map((row) => Object.fromEntries(
-    [...row.querySelectorAll('[data-field]')].map((input) => [input.dataset.field, input.dataset.field === 'commands' ? lines(input.value) : input.value.trim()])
-  ));
-  const providerOptions = (selected, auto = false) => {
-    const known = data.providers.some((p) => p.id === selected);
-    return option('', auto ? '自动选择（或全局 API）' : '全局 API', selected)
-      + (!known && selected ? option(selected, `${selected}（未找到，请重新选择）`, selected) : '')
-      + data.providers.map((p) => option(p.id, p.name, selected)).join('');
+  let bindings = { chats: [] };
+  let editing;
+  let busy = false;
+  // 把旧的鱼/猫快捷指令移入对应人格，保持原行为并允许在编辑框内修改。
+  const editableSettings = (skins) => {
+    const next = structuredClone(skins);
+    for (const [command, id] of [['切鱼', 'fish'], ['切猫', 'cat']]) {
+      const persona = next.list.find((s) => s.id === id);
+      if (persona && next.switchCommands.includes(command) && (persona.commands || []).length < 10) {
+        persona.commands = [...new Set([...(persona.commands || []), command])];
+        next.switchCommands = next.switchCommands.filter((s) => s !== command);
+      }
+    }
+    return next;
   };
+  const providerOptions = (selected, auto = false) => option('', auto ? '自动选择（或全局 API）' : '全局 API', selected)
+    + (selected && !data.providers.some((p) => p.id === selected) ? option(selected, `${selected}（未找到，请重新选择）`, selected) : '')
+    + data.providers.map((p) => option(p.id, p.name, selected)).join('');
   const updateModels = (input, list, pid) => {
     const models = pid ? modelIds(data.providers.find((p) => p.id === pid)) : [data.globalApi.model, ...data.providers.flatMap(modelIds)];
     list.innerHTML = [...new Set([input.value, ...models].filter(Boolean))].map((m) => option(m, m, '')).join('');
   };
   const updateDefault = () => {
     const current = el('skins-default').value || data.skins.default;
-    el('skins-default').innerHTML = readRows().map((s) => option(s.id, s.label || s.id, current)).join('');
-  };
-  const renderRows = (list) => {
-    el('skins-list').innerHTML = list.map((s, i) => `<article class="persona-editor">
-      <div class="section-title"><h3>${esc(s.label || s.id)}</h3><button type="button" class="btn btn-small" data-remove ${list.length === 1 ? 'disabled' : ''}>移除配置</button></div>
-      <div class="personas-fields">
-        <label>人格 ID<input data-field="id" value="${esc(s.id)}" pattern="[a-z][a-z0-9_-]{0,39}" maxlength="40" required ${data.skins.list.some((old) => old.id === s.id) ? 'readonly' : ''}></label>
-        <label>显示名称<input data-field="label" value="${esc(s.label)}" maxlength="200" required></label>
-        <label>人格预设<select data-field="templateId">${Object.entries(data.templates).map(([id, p]) => option(id, p.name, s.templateId)).join('')}</select></label>
-        <label>提供商<select data-field="provider">${providerOptions(s.provider)}</select></label>
-        <label>模型（输入可搜索，也可手填 ID）<input data-field="model" value="${esc(s.model)}" list="skin-models-${i}" required><datalist id="skin-models-${i}"></datalist></label>
-        <label>机器人称呼<input data-field="botName" value="${esc(s.botName)}" maxlength="200"></label>
-      </div>
-      <label>专属切换指令（每行一条，完整匹配）<textarea data-field="commands" rows="2" placeholder="例如：切换哈基米">${esc((s.commands || []).join('\n'))}</textarea></label>
-      <p class="muted">已保存的人格 ID 保持固定，用于定位历史与记忆。移除配置会保留其数据。</p>
-    </article>`).join('');
-    for (const row of el('skins-list').querySelectorAll('.persona-editor')) {
-      const provider = row.querySelector('[data-field="provider"]');
-      const input = row.querySelector('[data-field="model"]');
-      const listNode = row.querySelector('datalist');
-      updateModels(input, listNode, provider.value);
-      provider.onchange = () => { updateModels(input, listNode, provider.value); };
-      row.querySelector('[data-field="label"]').oninput = () => { row.querySelector('h3').textContent = row.querySelector('[data-field="label"]').value; updateDefault(); };
-      row.querySelector('[data-field="id"]').oninput = updateDefault;
-      row.querySelector('[data-remove]').onclick = () => {
-        if (!confirm('移除这个人格的配置？已有存档与记忆会保留。')) return;
-        renderRows(readRows().filter((_, index) => index !== [...el('skins-list').children].indexOf(row)));
-      };
-    }
-    updateDefault();
-    el('skin-add').disabled = list.length >= 16;
-  };
-  const refreshCatalog = async () => {
-    const rows = readRows();
-    const fresh = await api('/api/skins');
-    data.providers = fresh.providers; data.templates = fresh.templates; data.globalApi = fresh.globalApi;
-    renderRows(rows);
-    const selected = el('skins-summary-provider').value;
-    el('skins-summary-provider').innerHTML = providerOptions(selected, true);
-    updateModels(el('skins-summary-model'), el('summary-model-options'), selected);
-    el('skin-provider-edit').innerHTML = option('', '＋ 添加提供商', '') + data.providers.map((p) => option(p.id, p.name, '')).join('');
+    el('skins-default').innerHTML = data.skins.list.map((s) => option(s.id, s.label || s.id, current)).join('');
   };
   const renderBindings = () => {
     const skins = data.skins;
@@ -84,73 +51,88 @@ export async function initSkinsPage() {
       } catch (error) { report(el('skin-switch-status'), '切换失败：' + error.message, true); button.disabled = false; }
     };
   };
+  const renderPersonas = () => {
+    el('skins-list').innerHTML = data.skins.list.map((s) => `<article class="persona-card">
+      <div class="section-title"><h3>${esc(s.label || s.id)}</h3><div class="personas-actions"><button type="button" class="btn" data-edit="${esc(s.id)}">编辑人格</button><button type="button" class="btn btn-small" data-remove="${esc(s.id)}" ${data.skins.list.length === 1 ? 'disabled' : ''}>移除</button></div></div>
+      <dl><div><dt>预设</dt><dd>${esc(data.templates[s.templateId]?.name || s.templateId)}</dd></div><div><dt>模型</dt><dd>${esc(s.model || data.globalApi.model || '全局模型')}</dd></div><div><dt>切换指令</dt><dd>${s.commands?.length ? s.commands.map((c) => `<code>${esc(c)}</code>`).join(' ') : '未设置，点击编辑人格添加'}</dd></div></dl>
+    </article>`).join('');
+    for (const button of el('skins-list').querySelectorAll('[data-edit]')) button.onclick = () => openEditor(button.dataset.edit);
+    for (const button of el('skins-list').querySelectorAll('[data-remove]')) button.onclick = async () => {
+      if (busy || !confirm('移除这个人格的配置？已有存档与记忆会保留。')) return;
+      busy = true; button.disabled = true;
+      try {
+        const next = structuredClone(data.skins); next.list = next.list.filter((s) => s.id !== button.dataset.remove);
+        if (next.default === button.dataset.remove) next.default = next.list[0].id;
+        await saveSettings(next); report(status, '人格已移除，已有存档与记忆保留。');
+      } catch (error) { report(status, '移除失败：' + error.message, true); button.disabled = false; }
+      finally { busy = false; }
+    };
+    el('skin-add').disabled = data.skins.list.length >= 16;
+    updateDefault();
+  };
+  const saveSettings = async (skins) => {
+    const result = await api('/api/skins', { method: 'POST', body: JSON.stringify({ skins }) });
+    data.skins = editableSettings(result.skins); renderPersonas(); renderBindings();
+  };
+  const openEditor = (id) => {
+    if (busy) return;
+    editing = data.skins.list.find((s) => s.id === id);
+    const preset = editing?.templateId || Object.keys(data.templates)[0];
+    el('persona-form').reset();
+    el('persona-title').textContent = editing ? '编辑人格' : '新增人格';
+    el('persona-name').value = editing?.label || '';
+    el('persona-preset').innerHTML = Object.entries(data.templates).map(([key, p]) => option(key, p.name, preset)).join('');
+    const provider = editing?.provider || '';
+    el('persona-provider').innerHTML = providerOptions(provider);
+    el('persona-model').value = editing?.model || data.globalApi.model || 'deepseek-flash';
+    updateModels(el('persona-model'), el('persona-model-options'), provider);
+    el('persona-commands').value = (editing?.commands || []).join('\n');
+    report(el('persona-error'), ''); el('persona-save').disabled = false;
+    el('persona-dialog').showModal(); el('persona-name').focus();
+  };
   try {
-    [data, bindings] = await Promise.all([api('/api/skins'), api('/api/chat-skins')]);
+    data = await api('/api/skins'); data.skins = editableSettings(data.skins);
     const skins = data.skins;
-    el('skins-enabled').checked = skins.enabled;
-    el('skins-handoff').checked = skins.handoffOnSwitch.enabled;
-    el('skins-ack').value = skins.ack;
-    el('skins-prefixes').value = skins.switchCommands.join('\n');
+    el('skins-enabled').checked = skins.enabled; el('skins-handoff').checked = skins.handoffOnSwitch.enabled;
+    el('skins-ack').value = skins.ack; el('skins-prefixes').value = skins.switchCommands.join('\n');
     el('skins-summary-provider').innerHTML = providerOptions(skins.handoffOnSwitch.provider, true);
     el('skins-summary-model').value = skins.handoffOnSwitch.model || 'deepseek-flash';
-    el('skins-summary-recent').value = skins.handoffOnSwitch.recentMessages;
-    el('skins-summary-chars').value = skins.handoffOnSwitch.maxChars;
+    el('skins-summary-recent').value = skins.handoffOnSwitch.recentMessages; el('skins-summary-chars').value = skins.handoffOnSwitch.maxChars;
     el('skins-summary-provider').onchange = () => updateModels(el('skins-summary-model'), el('summary-model-options'), el('skins-summary-provider').value);
     updateModels(el('skins-summary-model'), el('summary-model-options'), skins.handoffOnSwitch.provider);
-    renderRows(skins.list); renderBindings();
-    report(status, skins.enabled ? '已启用 · 修改后记得保存' : '已关闭 · 保存时启用即可使用多个人格');
-    el('skin-add').onclick = () => {
-      const rows = readRows();
-      renderRows([...rows, { id: `persona_${Date.now().toString(36)}`, label: '新人格', templateId: Object.keys(data.templates)[0], provider: data.providers[0]?.id || '', model: modelIds(data.providers[0])[0] || data.globalApi.model || 'deepseek-flash', botName: '', commands: [] }]);
-      el('skins-list').lastElementChild.querySelector('[data-field="label"]').focus();
+    renderPersonas(); report(status, skins.enabled ? '已启用多个人格' : '可以新增和编辑人格；启用多个人格后即可切换。');
+    el('skin-add').onclick = () => openEditor();
+    el('persona-provider').onchange = () => updateModels(el('persona-model'), el('persona-model-options'), el('persona-provider').value);
+    el('persona-cancel').onclick = () => { if (!busy) el('persona-dialog').close(); };
+    el('persona-dialog').oncancel = (event) => { if (busy) event.preventDefault(); };
+    el('persona-form').onsubmit = async (event) => {
+      event.preventDefault(); if (busy) return;
+      const label = el('persona-name').value.trim();
+      if (!label) { report(el('persona-error'), '请填写人格名称。', true); return; }
+      if (!el('persona-model').value.trim()) { report(el('persona-error'), '请选择或填写模型。', true); return; }
+      busy = true; el('persona-save').disabled = true;
+      try {
+        const next = structuredClone(data.skins);
+        const persona = { ...editing, id: editing?.id || `persona_${Date.now().toString(36)}`, label, templateId: el('persona-preset').value, provider: el('persona-provider').value, model: el('persona-model').value.trim(), commands: lines(el('persona-commands').value), botName: !editing || editing.botName === editing.label ? label : editing.botName };
+        if (editing) next.list = next.list.map((s) => s.id === editing.id ? persona : s);
+        else next.list.push(persona);
+        await saveSettings(next); el('persona-dialog').close();
+        report(status, `${editing ? '人格修改已保存' : '新的人格已添加'}：${label}${data.skins.enabled ? '' : '。启用多个人格后即可切换。'}`);
+      } catch (error) { report(el('persona-error'), '保存失败：' + error.message, true); }
+      finally { busy = false; el('persona-save').disabled = false; }
     };
+    el('skins-save').disabled = false;
     el('skins-form').onsubmit = async (event) => {
-      event.preventDefault(); el('skins-save').disabled = true;
+      event.preventDefault(); if (busy) return; busy = true; el('skins-save').disabled = true;
       try {
-        const result = await api('/api/skins', { method: 'POST', body: JSON.stringify({ skins: { ...data.skins, enabled: el('skins-enabled').checked, default: el('skins-default').value, ack: el('skins-ack').value, switchCommands: lines(el('skins-prefixes').value), list: readRows(), handoffOnSwitch: { enabled: el('skins-handoff').checked, provider: el('skins-summary-provider').value, model: el('skins-summary-model').value.trim() || 'deepseek-flash', maxChars: Number(el('skins-summary-chars').value), recentMessages: Number(el('skins-summary-recent').value) } } }) });
-        data.skins = result.skins; renderRows(data.skins.list); renderBindings();
-        report(status, '人格与总结设置已保存。');
+        await saveSettings({ ...data.skins, enabled: el('skins-enabled').checked, default: el('skins-default').value, ack: el('skins-ack').value, switchCommands: lines(el('skins-prefixes').value), handoffOnSwitch: { enabled: el('skins-handoff').checked, provider: el('skins-summary-provider').value, model: el('skins-summary-model').value.trim() || 'deepseek-flash', maxChars: Number(el('skins-summary-chars').value), recentMessages: Number(el('skins-summary-recent').value) } });
+        report(status, '切换与总结设置已保存。');
       } catch (error) { report(status, '保存失败：' + error.message, true); }
-      finally { el('skins-save').disabled = false; }
+      finally { busy = false; el('skins-save').disabled = false; }
     };
-    el('skin-provider-edit').innerHTML = option('', '＋ 添加提供商', '') + data.providers.map((p) => option(p.id, p.name, '')).join('');
-    el('skin-provider-edit').onchange = () => {
-      const p = data.providers.find((p) => p.id === el('skin-provider-edit').value);
-      el('skin-provider-url').value = p?.baseURL || '';
-      el('skin-provider-key').value = '';
-      el('skin-provider-key-note').textContent = p?.hasKey ? '已保存可用 Key；留空保留。修改 URL 会创建新提供商，需要填写它的 Key。' : '请输入这家提供商的 Key。Key 不会回显。';
-      el('skin-provider-models').value = modelIds(p).join('\n');
-      el('skin-model-count').textContent = `${modelIds(p).length} 个已保存模型`;
-    };
-    el('skin-fetch-models').onclick = async () => {
-      const button = el('skin-fetch-models'); button.disabled = true;
-      try {
-        report(el('skin-provider-status'), '正在检索模型…');
-        const result = await api('/api/providers/fetch-models', { method: 'POST', body: JSON.stringify({ providerId: el('skin-provider-edit').value, baseUrl: el('skin-provider-url').value.trim(), apiKey: el('skin-provider-key').value.trim() }) });
-        el('skin-provider-models').value = [...new Set([...lines(el('skin-provider-models').value), ...result.models])].join('\n');
-        el('skin-model-count').textContent = `${lines(el('skin-provider-models').value).length} 个模型`;
-        report(el('skin-provider-status'), `检索到 ${result.models.length} 个模型；点击保存后即可在人格中选择。`);
-      } catch (error) { report(el('skin-provider-status'), '检索失败：' + error.message + '；可以手动填写模型 ID 后保存。', true); }
-      finally { button.disabled = false; }
-    };
-    el('skins-provider-form').onsubmit = async (event) => {
-      event.preventDefault(); el('skin-provider-save').disabled = true;
-      try {
-        const result = await api('/api/providers', { method: 'POST', body: JSON.stringify({ baseUrl: el('skin-provider-url').value.trim(), apiKey: el('skin-provider-key').value.trim(), models: lines(el('skin-provider-models').value), activate: false }) });
-        el('skin-provider-key').value = ''; await refreshCatalog();
-        el('skin-provider-edit').value = result.provider.id; el('skin-provider-edit').onchange();
-        report(el('skin-provider-status'), '提供商与模型已保存。现在可以在人格或总结设置中选择。');
-      } catch (error) { report(el('skin-provider-status'), '保存失败：' + error.message, true); }
-      finally { el('skin-provider-save').disabled = false; }
-    };
-    el('skins-preset-form').onsubmit = async (event) => {
-      event.preventDefault();
-      try {
-        await api('/api/persona-templates', { method: 'POST', body: JSON.stringify({ name: el('skin-preset-name').value.trim(), text: el('skin-preset-text').value.trim(), behaviorProfile: el('skin-preset-profile').value }) });
-        await refreshCatalog(); el('skins-preset-form').reset(); report(el('skin-preset-status'), '预设已保存，可以在上方选择。');
-      } catch (error) { report(el('skin-preset-status'), '保存失败：' + error.message, true); }
-    };
-  } catch (error) { report(status, '加载失败：' + error.message + '。请先在主控制台登录，再刷新此页。', true); }
+    try { bindings = await api('/api/chat-skins'); renderBindings(); }
+    catch (error) { report(el('skin-switch-status'), '会话读取失败：' + error.message, true); }
+  } catch (error) { report(status, '人格加载失败：' + error.message + '。请先在主控制台登录，再刷新此页。', true); }
 }
 
 document.addEventListener('DOMContentLoaded', initSkinsPage);
