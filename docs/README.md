@@ -12,6 +12,7 @@
 | [CONFIG-EXAMPLES.md](CONFIG-EXAMPLES.md) | 常用配置片段：思考模式、兜底模型、视觉、主动发言、表情包、节奏 |
 | [AUTO_UPDATE.md](AUTO_UPDATE.md) | Release 驱动的自动更新：判定规则、两条下载通道（git / API+源码包）、失败策略与状态字段 |
 | [RELEASE-v0.7.8.md](RELEASE-v0.7.8.md) | fork 双人格皮肤发布说明、升级影响与回滚方式 |
+| [RELEASE-v0.7.9.md](RELEASE-v0.7.9.md) | 人格管理、API 与模型目录、独立总结模型及修复说明 |
 
 ## 功能说明
 
