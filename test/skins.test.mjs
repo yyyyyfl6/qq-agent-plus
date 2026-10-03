@@ -95,6 +95,7 @@ test('handoff on/off, failure and non-owner handling never leak or stop a switch
   assert.equal(calls, 1);
   assert.match(skins.handoffPrompt('group:1'), /另一个 AI.*不是你亲历/);
   assert.match(skins.handoffPrompt('group:1'), /另一人格留下的交接摘要（转述，非亲历）/);
+  assert.match(skins.handoffPrompt('group:1'), /来源人格：【鱼】/);
   const disabled = cfg(); disabled.skins.handoffOnSwitch.enabled = false; setRuntimeConfig(disabled);
   assert.equal(skins.handoffPrompt('group:1'), '');
   await skins.switchSkin('group:1', 'fish');

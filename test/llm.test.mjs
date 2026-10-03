@@ -20,6 +20,24 @@ const {
 const { DEFAULT_CONFIG, setRuntimeConfig } = await import('../src/core/config.js');
 
 describe('LLM client', () => {
+  it('per-call thinking off uses the task channel and leaves ordinary chat thinking unchanged', async (t) => {
+    const original = globalThis.fetch;
+    t.after(() => { globalThis.fetch = original; setRuntimeConfig(structuredClone(DEFAULT_CONFIG)); });
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.api.thinking = 'on'; cfg.api.extraBody = {};
+    setRuntimeConfig(cfg);
+    const bodies = [];
+    globalThis.fetch = async (_url, request) => {
+      bodies.push(JSON.parse(request.body));
+      return Response.json({ choices: [{ message: { content: 'ok' } }] });
+    };
+    await chatCompletion({ messages: [], thinking: 'off', overrides: { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-flash' } });
+    assert.deepEqual(bodies[0].thinking, { type: 'disabled' });
+    await chatCompletion({ messages: [], thinking: 'off', overrides: { baseUrl: 'https://amr-link.open-design.ai/v1', model: 'deepseek-flash' } });
+    assert.equal(bodies[1].reasoning_effort, 'none');
+    await chatCompletion({ messages: [], overrides: { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-flash' } });
+    assert.equal(bodies[2].thinking, undefined);
+  });
   it('filters unsupported Gemini media before sending, preserves text and does not mutate history', async (t) => {
     const original = globalThis.fetch;
     t.after(() => { globalThis.fetch = original; });

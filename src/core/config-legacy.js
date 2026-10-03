@@ -1141,10 +1141,18 @@ export function loadConfig() {
     if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
     const parsed = migrateConfig(JSON.parse(text));
     const merged = deepMerge(DEFAULT_CONFIG, parsed);
-    try { merged.skins = normalizeSkins(merged.skins); } catch {
-      // 新功能配错只关闭新功能；不能让旧 API 凭据和白名单跟着整份重置。
-      console.warn('[skins] 配置无效，已关闭皮肤系统，请在控制台重新配置');
-      merged.skins = structuredClone(DEFAULT_SKINS);
+    try { merged.skins = normalizeSkins(merged.skins, merged.customPersonas); } catch {
+      // 关闭运行时功能，但保留人格列表、指令和总结设置，自动保存不能吃掉用户配置。
+      // 原件另存，连 enabled 的原值也可恢复；备份含凭据，沿用配置文件的权限。
+      const backup = `${CONFIG_FILE}.skins-invalid-${Date.now()}`;
+      try {
+        fs.copyFileSync(CONFIG_FILE, backup);
+        fs.chmodSync(backup, 0o600);
+        console.warn('[skins] 配置无效，已关闭皮肤系统；原配置已备份为 config.json.skins-invalid-*，请修复预设或人格设置');
+      } catch {
+        console.warn('[skins] 配置无效，已关闭皮肤系统；原配置备份失败，现有人格设置保留，请修复预设或人格设置');
+      }
+      merged.skins = { ...(isPlainObject(merged.skins) ? merged.skins : structuredClone(DEFAULT_SKINS)), enabled: false };
     }
     // ── provider 迁移（2026-09-26）──
     // 默认 provider 从 local 改成 openai 之后，**没显式存过 provider** 的老配置语义会变：

@@ -171,7 +171,7 @@ function currentServiceId() {
   }
 }
 
-function thinkingFor(purpose, overrides = null) {
+function thinkingFor(purpose, overrides = null, intentOverride = undefined) {
   let raw = null;
   let customParams = null;
   let serviceId = '';
@@ -191,6 +191,8 @@ function thinkingFor(purpose, overrides = null) {
       serviceId = currentServiceId();
     }
   } catch { /* 取不到就走默认 */ }
+  // 独立任务（如交接摘要）可显式覆盖聊天/供应商的思考设置。
+  if (intentOverride !== undefined) raw = intentOverride;
   const intent = normalizeThinkingIntent(raw, purpose);
   if (intent === 'on') return { mode: 'on', patch: null, approx: false, effectiveOff: false, serviceId };
   // 自定义/表外渠道优先用用户的档位映射（api.thinkingParams）。
@@ -362,14 +364,15 @@ export async function chatCompletion({
   overrides = null,
   cacheKey = '',
   maxTokens = null,
-  purpose = ''
+  purpose = '',
+  thinking: intentOverride = undefined
 }) {
   assertTimeAllowed();
   const api = overrides || effectiveApi();
   if (api.requireApiKey && (!api.apiKey || api.apiKey === '******')) throw new Error('人格提供商缺少 API Key，请在提供商设置中保存');
   // 聊天这类"随口回一句"的任务关掉思考：省一半输出 token、少 1~3 秒；
   // 判断/写作类（表情包要不要收、说说、空间互动、身份评估）不传 purpose，继续思考。
-  const thinking = thinkingFor(purpose, overrides);
+  const thinking = thinkingFor(purpose, overrides, intentOverride);
   const thinkingOff = thinking.effectiveOff;
   const body = {
     model: api.model,

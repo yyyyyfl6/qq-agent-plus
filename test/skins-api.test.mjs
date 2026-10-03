@@ -33,6 +33,8 @@ test('real console APIs manage providers, catalog and presets, isolate archives 
   cfg.skins.enabled = true;
   cfg.skins.list[0].provider = 'ds'; cfg.skins.list[1].provider = 'gm';
   cfg.skins.handoffOnSwitch.maxChars = 400;
+  cfg.api.thinking = 'on';
+  cfg.api.extraBody = { thinking: { type: 'enabled' }, reasoning_effort: 'high', enable_thinking: true };
   updateConfig(cfg);
   app = createApp({ log: () => {} });
   // 只启动 HTTP 路由，避免真实 OneBot 重连、后台任务与外部模型探测干扰验收。
@@ -79,6 +81,11 @@ test('real console APIs manage providers, catalog and presets, isolate archives 
   assert.equal(requests[0].path, '/ds/v1/chat/completions');
   assert.equal(requests[0].auth, 'Bearer test-fish-key');
   assert.equal(requests[0].body.model, 'deepseek-flash');
+  assert.deepEqual(requests[0].body.thinking, { type: 'disabled' }, '交接摘要不能继承聊天的思考设置');
+  assert.equal(requests[0].body.reasoning_effort, undefined);
+  assert.equal(requests[0].body.enable_thinking, undefined);
+  assert.match(requests[0].body.messages[0].content, /【蓝色大肥鱼】/);
+  assert.match(app.skins.handoffPrompt('group:1'), /来源人格：【蓝色大肥鱼】/);
   assert.match(app.skins.handoffPrompt('group:1'), /不是你亲历/);
   app.store.appendIncoming('group:1', { mid: 'cat-1', text: '猫的项目', senderId: '42' });
   const cat = app.skins.scope('group:1', () => app.sessions.create({ chatKey: 'group:1', trigger: [], triggerSummary: 'cat' }));
