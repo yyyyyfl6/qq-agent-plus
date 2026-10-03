@@ -1,4 +1,6 @@
-# v0.7.9 · 人格管理与模型设置
+# hajimi and fatfish
+
+开发分支为 `hajimi-and-fatfish`；发布 tag 使用 `hajimi-and-fatfish-<提交短 SHA>`，与上游版本命名分开。首次更新原修补版的 Release 名称和 tag，原 tag 与提交历史保留。
 
 人格页改为表单管理，不再要求编辑 JSON：添加人格、选择内置/自定义预设和模型、设置专属切换指令。提供商支持配置 Base URL/API Key、检索模型及手动补充 ID；同站 DeepSeek 与 Gemini 模型均显示。页面新增提供商时不会改变全局聊天模型。
 
@@ -12,7 +14,7 @@
 
 ## 升级与回滚
 
-部署使用 fork 的 v0.7.9 或对应 dual-skin 分支提交。先备份 data/config.json、聊天 SQLite 和 data/memory；此版本没有新增运行依赖，也没有迁移存储格式。
+部署使用 fork 的已发布 `hajimi-and-fatfish-<提交短 SHA>` tag。先备份 data/config.json、聊天 SQLite 和 data/memory；此版本没有新增运行依赖，也没有迁移存储格式。
 
 升级后进入「人格」，检查实际提供商、预设、模型和指令，再保存。默认未启用的实例仍保持关闭。旧的空总结模型自动按 deepseek-flash 处理；需要原聊天模型总结的实例请明确选回该模型。
 

@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - dual-skin
+      - hajimi-and-fatfish
     tags:
       - 'v*'
 
@@ -120,8 +121,8 @@ jobs:
 
   # 主人已授权 fork 发版；普通开发提交只验证，显式发布提交才走这一步。
   # 验证 job 没有写权限，不能由依赖安装或测试过程提前生成发布物。
-  publish-dual-skin:
-    if: github.repository == 'yyyyyfl6/qq-agent-plus' && github.ref == 'refs/heads/dual-skin' && contains(github.event.head_commit.message, '[release-dual-skin]')
+  publish-personas:
+    if: github.repository == 'yyyyyfl6/qq-agent-plus' && github.ref == 'refs/heads/hajimi-and-fatfish' && contains(github.event.head_commit.message, '[release-hajimi-and-fatfish]')
     needs: verify
     runs-on: ubuntu-latest
     permissions:
@@ -130,16 +131,31 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: 创建已验证 tag 和 Release
+      - name: 使用分支名称发布
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG="v$(node -p 'require("./package.json").version')"
-          [ "$TAG" = v0.7.9 ] || { echo '版本不匹配'; exit 1; }
-          EXISTING="$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" --jq 'length')"
-          [ "$EXISTING" = 0 ] || { echo 'tag 已存在，禁止覆盖'; exit 1; }
-          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$GITHUB_SHA" >/dev/null
-          # GITHUB_TOKEN 创建的 tag 不会再次触发工作流；仍在本工作流内只建一份草稿。
-          gh release create "$TAG" --verify-tag --draft --title "$TAG · 人格管理与模型设置" --notes-file docs/RELEASE-v0.7.9.md
-          gh release edit "$TAG" --draft=false --latest
+          # 用分支名和提交后缀生成不可变 tag；首次把已发布的修补版改名。
+          RELEASE_ID=402374737
+          CURRENT_TAG="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq '.tag_name')"
+          TAG="$GITHUB_REF_NAME-${GITHUB_SHA:0:7}"
+          EXISTING_SHA="$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" --jq ".[] | select(.ref == \"refs/tags/$TAG\") | .object.sha")"
+          if [ -z "$EXISTING_SHA" ]; then
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$GITHUB_SHA" >/dev/null
+          else
+            [ "$EXISTING_SHA" = "$GITHUB_SHA" ] || { echo 'tag 已存在且指向不同提交，禁止覆盖'; exit 1; }
+          fi
+          if [ "$CURRENT_TAG" = v0.7.9 ] || [ "$CURRENT_TAG" = "$TAG" ]; then
+            # 更新同一份 Release，保留旧 tag 和公开历史，不重复通知创建。
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+              -f "tag_name=$TAG" -f 'name=hajimi and fatfish' \
+              -f "target_commitish=$GITHUB_SHA" -F draft=false -f make_latest=true \
+              -F 'body=@docs/RELEASE-hajimi-and-fatfish.md' >/dev/null
+          else
+            # GITHUB_TOKEN 创建的 tag 不会再次触发工作流；只在这里创建 Release。
+            if ! gh release view "$TAG" >/dev/null 2>&1; then
+              gh release create "$TAG" --verify-tag --draft --title 'hajimi and fatfish' --notes-file docs/RELEASE-hajimi-and-fatfish.md
+            fi
+            gh release edit "$TAG" --draft=false --latest
+          fi
