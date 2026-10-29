@@ -17,15 +17,52 @@ const { synthesizeSpeech, synthesizeVolc, synthesizeMinimax, volcClusterForVoice
 const { synthesizeDoubao, parseTtsStream, explainVolcError, doubaoResourceIdForVoice } = await import('../src/llm/tts-doubao.js');
 const { TTS_SERVICES, ttsServiceById, ttsVoicesFor, ttsServiceOfBaseUrl, ttsKeyFor } = await import('../src/llm/tts-presets.js');
 
-test('预设表：六家齐全，火山 v1 / 豆包 2.0 / MiniMax 标记了 provider 与凭据需求', () => {
+test('ttsKeyFor 的单槽兜底按归属走：换服务不带 Key 时不外发（2026-10-03）', async () => {
+  const { ttsKeyFor } = await import('../src/llm/tts-presets.js');
+  // 老配置形态：单槽 apiKey + 没有 keys 映射
+  const legacy = { provider: 'openai', baseUrl: 'https://api.siliconflow.cn/v1', apiKey: 'SK-OLD', keys: {} };
+  assert.equal(ttsKeyFor(legacy, 'siliconflow'), 'SK-OLD', '自己家照旧能用（升级零行为变化）');
+  assert.equal(ttsKeyFor(legacy, 'doubao'), '', '别家拿不到这把');
+
+  // 提交过 Key 的：归属被记住，只有那家能用
+  const owned = { ...legacy, apiKeyService: 'siliconflow' };
+  assert.equal(ttsKeyFor(owned, 'siliconflow'), 'SK-OLD');
+  assert.equal(ttsKeyFor(owned, 'volc'), '', '归属记在硅基流动，火山拿不到');
+
+  // 缺省（不传 serviceId）= 当前这家
+  assert.equal(ttsKeyFor(owned), 'SK-OLD');
+
+  // **这条才区分得开**：配置当前指向豆包，但那把 Key 归属硅基流动（切换过、或手改过配置）——
+  // 退回"只认当前这家"的实现会把这把硅基流动的 Key 发给豆包。
+  const stale = {
+    provider: 'doubao', baseUrl: 'https://openspeech.bytedance.com/api/v3/tts/unidirectional',
+    apiKey: 'SK-OLD', apiKeyService: 'siliconflow', keys: {}
+  };
+  assert.equal(ttsKeyFor(stale, 'doubao'), '', '当前是豆包、归属在硅基流动 → 豆包拿不到这把');
+  assert.equal(ttsKeyFor(stale, 'siliconflow'), 'SK-OLD', '归属方照旧能用');
+});
+
+test('ttsKeyFor 只认自有属性：service=constructor 不会把函数源码当成 Key（2026-10-03 全量审查）', async () => {
+  const { ttsKeyFor } = await import('../src/llm/tts-presets.js');
+  const cfg = { provider: 'openai', baseUrl: 'https://api.siliconflow.cn/v1', keys: {} };
+  assert.equal(ttsKeyFor(cfg, 'constructor'), '', '不吃原型链上的 constructor');
+  assert.equal(ttsKeyFor(cfg, '__proto__'), '');
+  assert.equal(ttsKeyFor(cfg, 'toString'), '');
+  assert.equal(ttsKeyFor({ ...cfg, keys: { minimax: 'MM-KEY' } }, 'minimax'), 'MM-KEY', '自有键照常读到');
+});
+
+test('预设表：七家齐全，火山 v1 / 豆包 2.0 / MiniMax / MiMo 标记了 provider 与凭据需求', () => {
   const ids = TTS_SERVICES.map((s) => s.id);
-  assert.deepEqual(ids, ['siliconflow', 'openai', 'volc', 'doubao', 'minimax', 'custom']);
+  assert.deepEqual(ids, ['siliconflow', 'openai', 'volc', 'doubao', 'minimax', 'mimo', 'custom']);
   assert.equal(ttsServiceById('volc').provider, 'volc');
   assert.deepEqual(ttsServiceById('volc').creds, ['appId', 'key']);
   assert.equal(ttsServiceById('doubao').provider, 'doubao');
   assert.equal(ttsServiceById('doubao').resourceId, 'seed-tts-2.0');
   assert.equal(ttsServiceById('minimax').provider, 'minimax');
   assert.deepEqual(ttsServiceById('minimax').creds, ['key', 'groupId']);
+  assert.equal(ttsServiceById('mimo').provider, 'mimo');
+  assert.deepEqual(ttsServiceById('mimo').creds, ['key']);
+  assert.ok(ttsVoicesFor('mimo', 'mimo-v2.5-tts').includes('Chloe'));
   assert.ok(ttsVoicesFor('siliconflow', 'FunAudioLLM/CosyVoice2-0.5B').includes('anna'));
   assert.ok(ttsServiceById('volc').voicesFlat.includes('BV001_streaming'));
   assert.ok(ttsVoicesFor('minimax', 'speech-01-turbo').includes('female-shaonv'));

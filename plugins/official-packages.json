@@ -1,0 +1,38 @@
+{
+  "note": "官方插件的**期望包指纹**：index 与包都已搬到独立仓库（https://github.com/sakurawwwxh/qq-agent-plugins），而源码仍在本仓库 examples/plugins/<id>。这份文件是两边之间的『对齐锚』——本仓库的用例拿它跟『现打源码得到的 sha256』比，所以**改了源码忘了重打包会立刻变红**；同时它也是『哪些插件算官方插件』的唯一清单（每个 examples/plugins/<id> 都必须在这里有一条，test/plugin-official-plugins.test.mjs 会按这份清单跑通用护栏）。发布流程里更新索引仓库时，必须同时更新这里的值（见 docs/PLUGINS.md 的上架流程）。",
+  "updatedAt": "2026-10-28",
+  "packages": {
+    "bilibili": {
+      "version": "1.1.0",
+      "sha256": "bcf038ad9139bcf896e693990b818876cadded40c67d8af84cbc213b828ba907"
+    },
+    "exchange-rate": {
+      "version": "1.0.0",
+      "sha256": "fe487376a7d07b97416ff717b3fb5b31400d6fafc1a6cd31c7cb2fde0fc7026b"
+    },
+    "gh-activity": {
+      "version": "1.0.0",
+      "sha256": "cb367361368dcfc114364736030e8a61c36aa30e07247a050fbaed8eda1689d8"
+    },
+    "hot-topics": {
+      "version": "1.0.0",
+      "sha256": "e82e89c232a1913f28e4a167bbc32d481a5b8bf6f5f3b98e594805f04abeb301"
+    },
+    "ip-info": {
+      "version": "1.0.0",
+      "sha256": "2bfd82d3675700688c1b197b90f2b87b300fa97856d24047cea01425ecaa0ffe"
+    },
+    "rss": {
+      "version": "1.0.0",
+      "sha256": "3bc768a4305b7f1176977243f21dffe47711454960a6b7c030346810d15c21da"
+    },
+    "translate": {
+      "version": "1.0.0",
+      "sha256": "dd26e12b1f41b9ca860804568d77e50e1ed5c9832d537461b4d35d361864a659"
+    },
+    "weather": {
+      "version": "1.0.0",
+      "sha256": "08fd0e0341cbd5cc3988fda9ae0484746541d8fee81ea0affa0f98c2f66daf9c"
+    }
+  }
+}

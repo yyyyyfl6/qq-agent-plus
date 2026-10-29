@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "QQ Agent Plus plugin manifest (plugin.json)",
+  "type": "object",
+  "required": ["id", "apiVersion", "name", "version", "entry", "capabilities", "tools"],
+  "additionalProperties": true,
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,31}$" },
+    "apiVersion": { "type": "integer", "enum": [1, 2] },
+    "name": { "type": "string", "minLength": 1 },
+    "version": { "type": "string", "minLength": 1 },
+    "description": { "type": "string" },
+    "entry": { "type": "string", "minLength": 1 },
+    "author": { "type": "string" },
+    "capabilities": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "enum": ["tools", "log", "config", "http", "storage", "secrets", "approval", "quota", "media", "send", "observe", "schedule"]
+      }
+    },
+    "httpDomains": { "type": "array", "items": { "type": "string" } },
+    "httpMaxBytes": { "type": "integer", "minimum": 40960, "maximum": 524288 },
+    "tools": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 12,
+      "items": {
+        "type": "object",
+        "required": ["name", "description", "parameters"],
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "parameters": { "type": "object" },
+          "action": { "type": "string" },
+          "actionTarget": { "type": ["string", "array"] },
+          "actionPreview": { "type": "string" },
+          "timeoutMs": { "type": "integer", "minimum": 1000, "maximum": 300000 }
+        }
+      }
+    },
+    "approvals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["action", "label"],
+        "properties": {
+          "action": { "type": "string" },
+          "label": { "type": "string" },
+          "description": { "type": "string" },
+          "defaultUses": { "type": "integer", "minimum": 1 }
+        }
+      }
+    },
+    "quotas": {
+      "type": "object",
+      "additionalProperties": { "type": "integer", "minimum": 1, "maximum": 10000 }
+    },
+    "settings": {
+      "type": "object",
+      "properties": {
+        "groups": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["key", "title", "fields"],
+            "properties": {
+              "key": { "type": "string" },
+              "title": { "type": "string" },
+              "description": { "type": "string" },
+              "fields": { "type": "array" }
+            }
+          }
+        }
+      }
+    },
+    "schedule": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "everyMs"],
+        "properties": {
+          "name": { "type": "string" },
+          "everyMs": { "type": "integer", "minimum": 60000, "maximum": 604800000 }
+        }
+      }
+    },
+    "engines": {
+      "type": "object",
+      "properties": { "minVersion": { "type": "string" } }
+    }
+  }
+}

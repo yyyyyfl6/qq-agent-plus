@@ -2,6 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { normalizeUpdateNetworkSettings } from './update-network.js';
+import { isContainerRuntime, containerUpdateHint } from './core/runtime.js';
+import { idList } from './core/list.js';
 
 const STATE_FILE = 'auto-update.json';
 const REQUEST_FILE = 'auto-update-request.json';
@@ -204,6 +206,60 @@ export function sanitizeUpdateError(error) {
   return cleanText(error?.message ?? error ?? '更新失败');
 }
 
+/**
+ * 失败命令的"值得展示的详情"。
+ *
+ * 旧口径是"输出结尾 2000 字符"，对 `node --test` 的 TAP 输出会把失败项甩掉：
+ * 测试文件并行跑、按字典序收尾，结尾往往是狼人杀/卧底这类排在最后的测试文件，
+ * 真正的失败可以离结尾好几百条 —— 2026-10-10 线上实测：更新失败信息里整段是群游戏
+ * 测试名（用户被问"为什么爆群游戏的内容"），真正的失败（snowluma 用例）一条看不见，
+ * 误导了整个排查过程。有 TAP 的 `not ok` 行时改为列出**失败项本身**
+ * （名字 + 紧随的诊断 error/message，最多 10 行）加结尾汇总；没有则退回旧口径。
+ *
+ * 两个细节都踩过：`describe()` 内的用例失败时 TAP 行带缩进（按嵌套层级缩进 4 空格/层，
+ * 2026-10-10 实测 `    not ok 1 - …`），所以匹配要允许行首空白；`error: |-` 是 YAML 块
+ * 形式（assert.equal 的 actual/expected 对比就在块里），要把块内容一起收进来。
+ */
+export function failureDetail(result) {
+  const stdout = String(result?.stdout || '');
+  const picked = [];
+  if (/^\s*not ok \d+ - /m.test(stdout)) {
+    const lines = stdout.split('\n');
+    for (let i = 0; i < lines.length && picked.length < 10; i += 1) {
+      if (!/^\s*not ok \d+ - /.test(lines[i])) continue;
+      picked.push(lines[i].trim());
+      for (let j = i + 1; j < Math.min(lines.length, i + 20); j += 1) {
+        const m = /^(\s+)(error|message):\s*(.*)$/.exec(lines[j]);
+        if (m) {
+          const keyIndent = m[1].length;
+          picked.push(`  ${m[2]}: ${m[3]}`);
+          // YAML 块形式（`error: |-`）：真实内容在更深缩进的后续行里，收集到下一个
+          // 同级键或 `...` 为止（空行跳过），最多 6 行
+          if (/^\|[-+]?$/.test(m[3].trim())) {
+            let took = 0;
+            for (let k = j + 1; k < Math.min(lines.length, j + 12) && took < 6; k += 1) {
+              const line = lines[k];
+              if (!line.trim()) continue;
+              const indent = line.length - line.trimStart().length;
+              if (indent <= keyIndent || line.trim() === '...') break;
+              picked.push(`    ${line.trim()}`);
+              took += 1;
+            }
+          }
+          break;
+        }
+        if (/^\s*(?:ok|not ok) \d|^\s*# /.test(lines[j])) break;
+      }
+    }
+    const summary = (stdout.match(/^\s*# (?:tests|pass|fail|skipped) .+$/gm) || []).map((s) => s.trim()).join('\n');
+    if (summary) picked.push(summary);
+  }
+  const detail = picked.length
+    ? picked.join('\n')
+    : String(result?.stderr || result?.stdout || '').trim().slice(-2000);
+  return detail.slice(0, 2000);
+}
+
 export class AutoUpdateManager {
   constructor({
     appDir,
@@ -248,12 +304,14 @@ export class AutoUpdateManager {
   }
 
   installed() {
+    // 容器里没有 update service（也不该有）：deploy.sh/auto-update.mjs 都不在容器的可写面里。
+    if (isContainerRuntime()) return false;
     return Boolean(this.serviceName())
       && fs.existsSync(path.join(this.appDir, 'scripts', 'auto-update.mjs'));
   }
 
   serviceActive() {
-    if (!this.installed()) return false;
+    if (isContainerRuntime() || !this.installed()) return false;
     const result = this.runSystemctl([
       '--quiet',
       'is-active',
@@ -267,6 +325,44 @@ export class AutoUpdateManager {
     const settings = cfg.autoUpdate || {};
     const network = normalizeUpdateNetworkSettings(settings);
     const state = readAutoUpdateState(this.dataDir);
+    const container = isContainerRuntime();
+    if (container) {
+      // 不读 systemd、不看 pending：容器里的更新状态由镜像 tag 决定，控制台只展示
+      // "由 compose 管理"与当前配置，不把宿主机的旧状态误报成"卡住/失败"。
+      // 容器里的"当前版本"就是镜像里的 package.json 版本；不要把旧卷的
+      // deployed-revision（裸机提交 SHA）当成当前版本显示。
+      let imageVersion = '';
+      try {
+        imageVersion = String(JSON.parse(fs.readFileSync(path.join(this.appDir, 'package.json'), 'utf8')).version || '').trim();
+      } catch { /* 测试/裁剪镜像可能没有 package.json */ }
+      return {
+        installed: false,
+        managedBy: 'docker',
+        container: true,
+        hint: containerUpdateHint(),
+        enabled: false,
+        busy: false,
+        ownerUin: autoUpdateOwner(cfg),
+        repository: String(settings.repository || ''),
+        branch: String(settings.branch || 'main'),
+        intervalHours: Number(settings.intervalHours) || 6,
+        ...network,
+        nextCheckAt: 0,
+        // 旧卷里的 auto-update.json 可能带着 failed / pending：容器模式不跑更新，
+        // 这些字段必须清干净，否则控制台会永久显示一条无法自愈的失败，甚至触发旧通知。
+        status: 'idle',
+        phase: '',
+        error: '',
+        targetVersion: '',
+        targetRevision: '',
+        startedAt: 0,
+        progressAt: 0,
+        lastCheckAt: 0,
+        completedAt: 0,
+        autoDisabled: false,
+        currentRevision: imageVersion
+      };
+    }
     const intervalMs = Math.max(1, Number(settings.intervalHours) || 6) * 60 * 60 * 1000;
     // 与「发现新版本」提示用同一套判据（autoUpdatePending）：一处说"在跑"、另一处说"卡住"
     // 会让用户卡在"提示弹出来了、按钮却是灰的"。基准见 autoUpdatePending 的注释。
@@ -334,6 +430,9 @@ export class AutoUpdateManager {
   }
 
   resume({ ownerUin, intervalHours = 6 } = {}) {
+    if (isContainerRuntime()) {
+      throw updateError(containerUpdateHint());
+    }
     const current = this.config();
     const adminPatch = ownerUin === undefined
       ? null
@@ -346,6 +445,9 @@ export class AutoUpdateManager {
       },
       ...(adminPatch ? { admin: adminPatch } : {})
     });
+    // 显式恢复更新：清掉失败自停标记，否则更新器仍按 autoDisabled 跳过
+    //（2026-10-07 复审：与 scripts/auto-update.mjs 的 autoDisabled 判定配套）。
+    try { writeAutoUpdateState(this.dataDir, { autoDisabled: false }); } catch { /* 状态文件写不进去不影响恢复 */ }
     // 更新正在跑时不要把它写成 idle：那会清掉"已提交未跑完"的抑制与 busy 判据，
     // 让控制台一边显示在跑、一边又能再点一次（直接调接口才会遇到，2026-09-22 审查发现）
     if (!this.serviceActive() && !autoUpdatePending(this.dataDir)) {
@@ -381,6 +483,9 @@ export class AutoUpdateManager {
   }
 
   requestManual({ version = '' } = {}) {
+    if (isContainerRuntime()) {
+      throw updateError(containerUpdateHint());
+    }
     if (!this.installed()) {
       throw updateError('自动更新服务尚未安装，请先用 deploy.sh 部署当前版本');
     }
@@ -401,7 +506,7 @@ export class AutoUpdateManager {
       }
       if (
         cfg.allowAllWhenEmpty !== true
-        && !(cfg.allow?.private || []).map(String).includes(ownerUin)
+        && !idList(cfg.allow?.private).includes(ownerUin)
       ) {
         throw updateError('全局管理员 QQ 必须同时加入私聊白名单', 400);
       }
@@ -494,6 +599,8 @@ export class AutoUpdateManager {
   }
 
   start() {
+    // 容器里没有 systemd unit，通知器也没有可投递的更新状态；启动它只会定期空转。
+    if (isContainerRuntime()) return;
     this.stop();
     this.notificationTimer = setInterval(() => {
       this.resumeNotifications();
@@ -514,6 +621,9 @@ export class AutoUpdateManager {
   }
 
   resumeNotifications() {
+    // OneBot 连上时会无条件调这里（console/app.js 的 onStatus）。容器里没有更新器，
+    // 旧卷遗留的 notification.pending 会让 owner 收到一条"更新部署失败"的假告警。
+    if (isContainerRuntime()) return null;
     if (this.notificationTask) return this.notificationTask;
     this.notificationTask = this.#notifyPending()
       .catch((error) => this.log(`[auto-update] 管理员通知失败：${error?.message ?? error}`))
@@ -522,6 +632,7 @@ export class AutoUpdateManager {
   }
 
   async handlePendingFailure() {
+    if (isContainerRuntime()) return;
     const state = readAutoUpdateState(this.dataDir);
     const policy = normalizeUpdateNetworkSettings(this.config().autoUpdate || {});
     if (

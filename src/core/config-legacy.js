@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { PERSONAS, normalizeBehaviorProfile, applyPersonaTemplate } from '../personas.js';
+import { PERSONAS, normalizeBehaviorProfile, applyPersonaTemplate, applyPersonaPerChatTemplates } from '../personas.js';
+import { idList } from './list.js';
 import {
   clampProbability,
   legacySliderToProbability,
@@ -14,8 +15,15 @@ import {
 import { DEFAULT_TIME_CONTROL, normalizeTimeControl } from './time-control.js';
 import { normalizeTokenSaverMode } from './token-saver.js';   // 零依赖模块，避免循环依赖
 import { normalizeMomentWindows } from '../features/moment-schedule.js';
+import { PLATFORM_GATE_KEYS } from './platform-gates.js';   // 零依赖模块：按群覆盖的键名校验
+import { LIVING_MEMORY_DEFAULTS, normalizeLivingMemoryConfig } from '../living-memory/config.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// 控制台把 updateConfig 的校验失败映射成 400：用显式标记，不靠匹配错误文案
+//（英文校验信息会被当成 500，文件系统错误也可能反而被误判成用户输入）。
+function invalidConfig(message) {
+  return Object.assign(new Error(message), { httpStatus: 400 });
+}
 // 本文件在 src/core/ 下：仓库根要多退一层（挪目录时最容易漏的就是这里）
 export const ROOT = path.resolve(__dirname, '..', '..');
 // 测试/便携场景可重定向数据目录
@@ -98,17 +106,19 @@ export const DEFAULT_CONFIG = {
   // 多提供商模型目录（设置页手动维护）
   providers: [],
   providerKeys: {},      // providerId -> 真实 API Key（providers[] 里不存明文 Key）
-  // 联网搜索（默认 Bing 网页解析，无需 key；可选 DeepSeek/智谱/博查/百度/秘塔）
+  // 联网搜索（默认 Bing 网页解析，无需 key；可选 DeepSeek/智谱/博查/百度/秘塔/360）
   webSearch: {
     enabled: true,
     searchUrl: 'https://cn.bing.com/search',
     maxResults: 6,
-    // 可选：'bing' | 'deepseek' | 'zhipu' | 'bocha' | 'baidu' | 'metaso' | 'doubao' | 'tavily' | 'aggregate'
+    // 可选：'bing' | 'deepseek' | 'zhipu' | 'bocha' | 'baidu' | 'metaso' | 'doubao' | 'tavily' | 'so360' | 'sogou' | 'bilibili' | 'aggregate'
     provider: 'bing',
     deepseek: {
       apiKey: '',                     // 留空时回退环境变量 DEEPSEEK_API_KEY
-      baseUrl: 'https://api.deepseek.com/responses',
-      model: 'deepseek-v4-flash',     // Responses API 模型名：deepseek-v4-flash / deepseek-v4-pro
+      baseUrl: 'https://api.deepseek.com',  // 新 Search API 用 /v1/tools/search；老配置的 /responses 会被自动剥掉
+      model: 'deepseek-v4-flash',     // 仅旧 Responses 兜底用
+      count: 10,                      // 新 Search API 返回条数（1-50；展示上限仍受 maxResults 约束）
+      needContent: false,             // true = 每条额外返回 content（更费 token）
       timeoutMs: 60000
     },
     zhipu: {
@@ -132,7 +142,7 @@ export const DEFAULT_CONFIG = {
     },
     metaso: {
       apiKey: '',                     // 留空时回退环境变量 METASO_API_KEY（无 key 也尝试官方免费额度）
-      baseUrl: 'https://metaso.cn/api/open/v1/search',
+      baseUrl: 'https://metaso.cn/api/v1/search',   // 官方路径；/api/open/v1/search 是 404（issue #38）
       count: 6,
       timeoutMs: 20000
     },
@@ -148,6 +158,18 @@ export const DEFAULT_CONFIG = {
       count: 5,
       searchDepth: 'basic',
       timeoutMs: 20000
+    },
+    // 360 / 搜狗网页解析（均无 Key）：中文新词和抖音梗的命中率明显好于 Bing。
+    // Bing 仍是默认主源；疑似梗查询会先用搜狗补一次，再以 360 兜底；也可以把 provider 直接切到其中之一。
+    so360: {
+      searchUrl: 'https://www.so.com/s'
+    },
+    sogou: {
+      searchUrl: 'https://www.sogou.com/web'
+    },
+    // B 站视频搜索（无 Key）：很多新梗会先出现「梗知识/梗百科」类视频，标题和简介比搜索引擎直接。
+    bilibili: {
+      searchUrl: 'https://api.bilibili.com/x/web-interface/wbi/search/type'
     },
     // 聚合搜索（provider='aggregate'）：并发跑多个源，URL 去重、结果带 source 标注，
     // 单源失败不影响整体，全部失败才报错。sources 顺序 = 结果优先级。
@@ -210,7 +232,7 @@ export const DEFAULT_CONFIG = {
   // 开启前填好 baseUrl 与 model（voice 按服务商文档填）。
   tts: {
     enabled: false,
-    provider: 'openai',       // openai（兼容 /audio/speech）/ volc（火山 v1）/ doubao（豆包语音合成 2.0，v3）/ minimax（T2A v2）
+    provider: 'openai',       // openai（兼容 /audio/speech）/ volc（火山 v1）/ doubao（豆包语音合成 2.0，v3）/ minimax（T2A v2）/ mimo（小米 token-plan）
     baseUrl: '',
     apiKey: '',
     appId: '',                // 火山 v1：语音技术控制台的 AppID（纯数字）；豆包 2.0 可不填
@@ -220,9 +242,16 @@ export const DEFAULT_CONFIG = {
     // 按服务分别存 Key（切预设不串用；切回来还能看到已存的那把）：
     //   { "siliconflow": "sk-…", "volc": "<access token>", "doubao": "<api key>", "minimax": "…" }
     keys: {},
+    apiKeyService: '',          // 上面那个单槽 apiKey 是给哪家存的（提交时记；老配置留空 = 按"当前这家"兜底）
+    // 每家上次用的音色（切预设时恢复，不把小米的 Chloe 原样发给豆包）：
+    //   { "doubao": "ICL_uranus_zh_female_bingruoshaonv_tob", "mimo": "Chloe" }
+    voices: {},
     model: '',
     voice: '',
     format: 'mp3',
+    // MiMo 的导演指令（角色/场景/语气）。send_voice 的 emotion 会追加一行具体情绪；
+    // 其它供应商忽略这一栏。留空用内置的「群聊口语」默认提示。
+    director: '',
     speed: 1,                 // 语速（0.25~4；实测硅基流动真实生效，聊天语速 1.05~1.15 更活）
     gain: 0,                  // 音量增益 dB（-10~10；觉得发闷可以 +2~+4）
     timeoutMs: 30000
@@ -243,6 +272,8 @@ export const DEFAULT_CONFIG = {
     size: '',                 // 如 1024x1024；留空由服务商默认
     responseFormat: '',       // 留空最兼容（新版 OpenAI 会因未知参数 400）；可填 b64_json / url
     maxPerHour: 6,            // 全局每小时最多生成几张（按张计费，硬闸门）
+    autoSend: true,           // 生成成功后直接发到当前会话（false = 只入库，等 send_sticker）
+    sendAs: 'sticker',        // 自动发送格式：sticker=表情（默认，旧行为）/ image=普通图片（可保存）
     timeoutMs: 120000,        // 生图比对话慢
     extraBody: {}             // 额外请求参数（个别网关要 quality/style 之类）
   },
@@ -267,7 +298,7 @@ export const DEFAULT_CONFIG = {
     botName: '小鲸鱼',
     selfNickname: '',                       // 在群里的展示名（留空用 QQ 昵称）
     roleText: PERSONAS.xiaojingyu.text,     // 默认人设：原版"小鲸鱼"角色卡（适配版）
-    behaviorProfile: 'legacy',             // legacy | grounded，选择模板时一起切换
+    behaviorProfile: 'legacy',             // legacy | grounded | card，选择模板时一起切换
     participation: 'medium',                // low | medium | high —— 参与度参考
     customRules: '',                        // 追加自定义规则（可选）
     // 选中的内置卡 id（roles/*.md 的登记名）。非空表示"正文跟着卡文件走"：
@@ -277,6 +308,9 @@ export const DEFAULT_CONFIG = {
   },
   // 用户自定义人设库（保存在配置里，可在设置页添加/选择）
   customPersonas: [],
+  // 按群人设：chatKey（`group:<群号>` / `private:<QQ>`）→ 覆盖字段。
+  // 空 = 所有会话跟随全局 persona，行为与升级前完全一致。
+  personaPerChat: {},
   // 接入白名单
   allow: { groups: [], private: [] },
   deny: { groups: [], private: [] },
@@ -301,6 +335,11 @@ export const DEFAULT_CONFIG = {
     silentIdleMs: 300000,            // lifecycle：沉默状态 5 分钟无消息即结束
     activeIdleMs: 1200000,           // lifecycle：活跃状态 20 分钟无消息即结束
     hardLifetimeMs: 1800000,         // lifecycle：绝对生命周期上限 30 分钟
+    // 该回没发时的补救（私聊 / 被 @ / 引用机器人 / 点名）：模型只输出了正文、没调 send_message
+    // 时做一次纠正；仍未发送就发一条固定说明。默认开（只在失败时多一次调用）。
+    replyGuardEnabled: true,
+    // 拍一拍机器人算直接互动（必回、即时处理、纳入回复纠正）。关掉后按普通群消息处理。
+    pokeReplyEnabled: true,
     rolloverArmedMs: 600000,         // 活跃线程撞硬上限后，一次性任意消息触发期限
     lifecycleContextCount: 100,      // 生命周期首次运行携带的历史条数
     lifecycleRolloverInputTokens: 32000, // 上次实际输入达到此值时，下一批先换代
@@ -313,26 +352,104 @@ export const DEFAULT_CONFIG = {
     byLengthMs: 20,         // 按字数附加的间隔（毫秒/字）
     maxPerMinute: 80,
     maxPerHour: 500,
-    hardSplitAt: 4000       // QQ 硬限制切分（0 = 不限制）
+    hardSplitAt: 4000,      // QQ 硬限制切分（0 = 不限制）
+    typingIndicator: true   // 私聊发言前亮「正在输入」（群聊 QQ 没有这个能力）
+  },
+  // 人类化（可选）：只影响"怎么发"，不改模型内容本身。
+  // 默认关闭：延迟发送会改变用户可感知的节奏，升级后应由管理员显式打开。
+  humanize: {
+    enabled: false,
+    // 角色卡优先（behaviorProfile='card'）时，平台不再用状态行/助手腔过滤去改卡的语气。
+    respectPersonaCard: true,
+    // 回复前的等待：按本轮总字数模拟"读完再打字"的时间，夹在 [minMs,maxMs] 内再叠加字数。
+    replyDelay: {
+      enabled: true,
+      minMs: 500,
+      maxMs: 1800,
+      perCharMs: 12,
+      capMs: 8000
+    },
+    // 反 AI 味：去掉/拦截"作为一个 AI""希望对你有帮助"这类客服腔。
+    antiAi: {
+      enabled: true,
+      blockSevere: true
+    },
+    // 气泡整形：模型只给一段时按句子拆成 1-3 条；已分好的数组不重排。
+    shape: {
+      enabled: true,
+      maxBubbles: 3,
+      maxChars: 60
+    },
+    // 精力/心情/作息影响语气（同一人设跨群共享；只写一句提示词，不调模型）。
+    personaState: {
+      enabled: true,
+      sleepStart: '00:00',
+      sleepEnd: '07:00'
+    },
+    // 记住和每个人的互动次数，格式化成"关系：刚认识/有点熟/熟/很熟"。
+    relationship: {
+      enabled: true
+    },
+    // 梗密度：off=不主动用梗；light=只接对方用过的梗；normal=贴合时用一次；heavy=闲聊里更主动。
+    // 技术/学习/情绪严肃场景仍由平台规则压住，不受这里影响。
+    memeUse: {
+      level: 'normal'
+    },
+    // 动作策略：同一种动作在会话内有冷却，整轮有次数上限，避免连续贴纸/拍一拍/语音。
+    actions: {
+      enabled: true,
+      maxPerRun: 4,
+      stickerCooldownMs: 60000,
+      pokeCooldownMs: 300000,
+      voiceCooldownMs: 600000,
+      reactCooldownMs: 30000
+    }
   },
   // 主动开话题（可选）
   proactive: {
     enabled: false,
     checkIntervalMinMs: 1800000,
     checkIntervalMaxMs: 5400000,
-    idleThresholdMs: 1800000,   // 群里静默多久才算"冷场"
+    idleThresholdMs: 1800000,   // 会话静默多久才算"冷场"
     probability: 0.25,
+    // 冷场开话题的作用范围（控制台「主动开话题」的两个复选框）：
+    // groupEnabled 沿用 allow.groups；privateEnabled 沿用 allow.private（deny 优先）。
+    // 群聊默认开（保持升级前行为）；私聊默认关 —— 主动私聊是直接打扰，需显式打开。
+    groupEnabled: true,
+    privateEnabled: false,
+    // shared = 群聊/私聊范围各共用一次机会；perChat = 每个群/私聊独立判定。
+    scopeMode: 'shared',
+    perChatMaxPerTick: 2,
     // 下面两条是独立开关（控制台「主动开话题」分区各一个复选框），**不跟随上面的 enabled**：
     // 补话与模型自安排唤醒在引入开关之前一直是常开，默认 true 保持升级前后行为一致；
-    // 只想关掉它们的人各关各的，不想主动开口的三个一起关。
+    // 只想关掉它们的人各关各的，不想主动开口的几个一起关。
     followUpEnabled: true,      // 发言后没人接话，过十来分钟补一句
     selfWakeEnabled: true       // 模型用 schedule_wake 给自己安排稍后的主动发言
   },
+  // 生活层（见闻）：定期觅食 B 站公开内容，存候选队列，供主动发言轮次挑选分享。
+  // 默认关闭；按实验功能管理（enabled = 运行开关，graduated = 是否转正）。
+  // 觅食是宿主能力而不是插件：插件协议没有 llm/wake 能力，拿不到人设与上下文。
+  lifeFeed: {
+    enabled: false,
+    graduated: false,
+    sources: ['bilibili'],
+    forageIntervalMinutes: 360,   // 6 小时 ±20% 抖动
+    maxCandidates: 200,
+    maxPerForage: 30,
+    maxOffersPerDay: 2,           // 每天最多领取/分享几次（防刷屏）
+    minDurationSec: 60,           // 太短的（切片/广告）不要
+    maxDurationSec: 3600,         // 超过 1 小时的看不完，不要
+    extraKeywords: [],
+    excludeKeywords: [],
+    groups: []                    // 空 = 沿用 allow.groups
+  },
   // 自主节奏（可选）：消息不再即时触发，改由模型按自己安排的节奏醒来统一处理。
-  // 默认关闭；开启后建议先在小范围（scope）试，确认能接受"延迟接话"的节奏。
+  // 默认关闭；开启后建议先观察一段，确认能接受"延迟接话"的节奏。
   pacing: {
     enabled: false,
-    scope: 'group',            // group | all —— 对哪些会话启用（私聊永远即时，不受影响）
+    // group | all —— 目前只有群聊与私聊两种会话，私聊永远即时，所以两种取值效果一致；
+    // 控制台只开放开关与节奏参数，scope 留在配置文件里。
+    scope: 'group',
     instantOnMention: true,    // 被 @ 时立刻处理，不排队
     defaultWakeMinutes: 20,    // 默认多久后自己醒一次看看
     minWakeMinutes: 5,         // 两次自主醒来之间的最短间隔
@@ -344,11 +461,24 @@ export const DEFAULT_CONFIG = {
     ownerUin: '',
     repository: 'https://github.com/sakurawwwxh/qq-agent-plus.git',
     branch: 'main',
-    intervalHours: 6
+    intervalHours: 6,
+    // 协议端（SnowLuma）镜像的自动更新：默认关（它会重启协议端容器，虽然数据卷不动、
+    // 登录态保留，但仍应显式打开）。打开后控制台进程每 6 小时比一次镜像版本，
+    // 落后于项目基线就自动更新；失败会自动回滚到旧镜像。
+    // image 留空 = 用项目基线（并沿用当前镜像的国内镜像站前缀）。
+    snowluma: { enabled: false, image: '' }
   },
   // 群日报：每天定时把"昨天群里聊了啥"汇总成一条发到指定群。
   // 白名单制（chats 为空则不发任何群）；默认关。
   groupDigest: {
+    enabled: false,
+    time: '09:30',
+    chats: [],
+    maxChars: 300
+  },
+  // 管理员早报：每天定时把过去 24 小时群里的见闻私聊给全局管理员（admin.ownerUin）。
+  // chats 留空 = 所有当前可运行的白名单群；默认关。
+  adminBriefing: {
     enabled: false,
     time: '09:30',
     chats: [],
@@ -387,6 +517,10 @@ export const DEFAULT_CONFIG = {
   // 每日群聊记忆总结与 QQ 空间动态
   dailyMoments: {
     enabled: false,
+    // self=只写人设自己的观点/兴趣；group=从群聊候选瞬间取材；mixed=人设为主、群聊作灵感
+    source: 'self',
+    // false=定时只生成草稿，等管理员在控制台点发布；true=定时直接发空间
+    autoPublish: false,
     hour: 23,                    // 上海时间
     minute: 30,
     scheduleWindows: null,       // null 保留固定时刻；数组为 {start, end, count}
@@ -505,10 +639,153 @@ export const DEFAULT_CONFIG = {
     autoCollect: true,
     maxCollectPerHour: 10,
     maxCollectPerHourPerChat: 3,   // 每会话每小时收藏上限（#9 双闸；上一行是全局）
+    // 收藏判定的「判定标准」（可选）：只写"收什么 / 不收什么"，身份那句由代码补在前面。
+    // 留空 = 内置默认（行为与之前完全一致）；填了 = 用配置的，上限 2000 字。
+    collectCriteria: '',
     // 发表情包的积极程度（0=不鼓励 1=偶尔 2=较积极 3=很积极）。
     // 这是在提示词层面引导模型"更愿意用表情回应"，不是强制每次都发 ——
     // 强制会显得机械，引导才能让它在合适的时候自然用上。
     encourage: 1
+  },
+  // QQ 平台能力（协议端 SnowLuma ≥1.14.20 提供）：每个开关关掉后，对应工具会从模型工具表
+  // 里摘除、提示词也不再教用法（与"表情包/搜索/ASR"同一口径，避免模型调用必然失败的工具）。
+  // 2026-10-07 拆细：读与写分开（"只让它看、不让它动手"要能单独配）；映射表在
+  // core/platform-gates.js（控制台渲染、orchestrator 过滤、提示词共用同一份）。
+  // 默认值取向：读/轻互动默认开；会改变**账号级外观**或**往群里发布内容**的默认关
+  // （换头像、改昵称/个性说明、传相册）。拆细后的默认组合与拆分前逐项等价。
+  platform: {
+    reactions: true,        // 【读】看谁贴了什么表情（get_message_reactions；[贴表情] 记录一直会落存档）
+    reactionsWrite: true,   // 【写】给群里的消息贴表情（react_to_message）
+    qqVoice: true,          // QQ 原生 AI 语音（send_qq_voice）
+    // QQ 语音音色（协议端 character_id，如 lucy-voice-laibixiaoxin=小新）。
+    // 空 = 不固定：模型每次自己从协议端返回的角色目录里挑一个。
+    qqVoiceCharacter: '',
+    profileWrites: true,    // 【写】改签名 / 在线状态（账号侧可见，带 24h 闸门）
+    remarkWrites: true,     // 【写】给好友/群设备注（独立闸门）
+    // 换头像 / 改 QQ 昵称与个性说明（set_my_avatar / set_my_profile）——账号级外观，
+    // 所有人都看得到、且不像发言那样可以被上下文解释，默认关（与相册上传同一档）。
+    avatarWrites: false,
+    nicknameWrites: false,
+    groupTools: true,       // 【读】群资料/公告/荣誉（get_group_profile）
+    groupWrites: true,      // 【写】群签到 / 设群待办
+    ocr: true,              // 服务端 OCR（读图上的文字）
+    groupFiles: true,       // 【读】群文件：看目录 / 取下载链
+    groupFileSend: true,    // 【写】发文件到群
+    albumRead: true,        // 【读】群相册：看相册与照片
+    albumWrites: true,      // 【写】相册点赞 / 评论
+    albumUpload: false,     // 【写】把图传进相册（默认关：会往群里发布内容）
+    readReceipts: false,    // 处理完的消息在 QQ 里标已读（默认关：会改变你自己各端的未读观感）
+    forwardCards: true,     // 长内容（群日报）用「合并转发卡片」发送，而不是一大段文本
+    // 写入类动作的闸门上限（滑动窗口内的全局次数；0/非法 = 用内置默认，硬顶 200）。
+    // 语义与 PLATFORM_QUOTA_DEFAULTS 一一对应：这是防模型抽风的刹车，不是"限额玩法"。
+    quotas: {
+      reactionsPerHour: 10,   // 贴表情：每小时
+      profilePerDay: 1,       // 签名 + 在线状态（共享一个额度）
+      remarksPerDay: 1,       // 备注
+      avatarsPerWeek: 1,      // 换头像（窗口 7 天：真人按周/月换）
+      albumWritesPerHour: 5   // 相册点赞 / 评论（评论是公开内容，卡得比贴表情紧）
+    },
+    // 按群覆盖：{ "<群号>": { "<门控键>": true|false } }。只认显式布尔值，
+    // 其余键/坏值一律回落全局开关；键名合法性在控制台与 migrateConfig 两处校验。
+    perGroup: {}
+  },
+  // 消息类型：按类型决定机器人**读不读**这类内容（控制台「消息类型」页）。
+  // 只是不让内容进提示词、不进模型；消息本身照常进聊天记录，存档与检索不受影响。
+  // 图片与表情包在这里各有一个开关（默认开）；它们**叠加**在 api.vision 之上 ——
+  // 模型本身不能看图时这两个开关没有意义，相关工具同样会被摘掉。
+  messageTypes: {
+    // 入站自动展开「合并转发 / 聊天记录卡片」。关掉后正文只留一行占位符
+    // （[合并转发聊天记录] / [卡片聊天记录 …]），模型需要时自己调 read_forward 展开；
+    // **被 @ 的那条仍然自动展开** —— 用户点名要看的东西不该再多花一轮工具调用。
+    // 一条 20 条的记录展开后是几千字符，而且会跟着进存档与后续每一轮的上下文，省的是这块。
+    expandForward: true,
+    // 视频画面（get_message_images 抽 4 帧拼 2×2）。关掉后视频只剩声音（get_message_audio），
+    // 提示词同步改成"你只能拿到声音"，不再教它调一个对视频什么都不给的工具。
+    videoFrames: true,
+    // 消息里发来的图片与表情包：关掉后不再把 get_message_images 交给模型，提示词改成
+    // "看不到图片内容"。表情包的**自动收藏**由 sticker.collectEnabled 单独控制，
+    // 不受这里影响（那条链路在后台看图，不占对话上下文）。
+    images: true,
+    // 表情库里的图片（get_sticker_image）：关掉后模型不能查看库里没备注的图；
+    // 按备注名发送表情（send_sticker）不受影响。
+    stickers: true
+  },
+  // 插件（第三方扩展，默认全关；契约与信任声明见 docs/PLUGINS.md）
+  plugins: {
+    // 总开关。关着 = 一个插件都不加载（装了但不开也是这样，落地没有任何副作用）。
+    enabled: false,
+    // 允许运行的插件 id。**默认空 = 一个都不跑**：装上 ≠ 授权，授权是这份显式清单。
+    // 插件目录约定 $DATA_DIR/plugins/<id>/（数据目录不会被版本更新覆盖，见 deploy.sh 的保留清单）。
+    enabledIds: [],
+    // 本机 Node 不支持权限模型（--permission）时是否拒绝加载插件。默认 true = fail-closed：
+    // 没有隔离就不执行第三方代码 —— 至于"没有隔离"这件事本身会在控制台与巡检里说明白。
+    requireIsolation: true,
+    // 网络隔离：Linux 上把插件进程放进**没有网络接口**的命名空间（unshare --user --net），
+    // 插件连不出去，要联网只能走宿主的 cap.http.request（有内网拦截、体积上限、超时与审计）。
+    // 默认开（有就用）；Windows/macOS 与关了非特权 userns 的内核上做不到，控制台会如实标出来。
+    networkIsolation: true,
+    // 要求网络隔离（fail-closed）：本机做不到就**拒绝加载插件**。默认 false —— 打开它等于
+    // 在 Windows/macOS 上直接禁用整个插件生态，这个取舍交给用户自己拍。
+    requireNetworkIsolation: false,
+    // 懒启动：进程只在"第一次真的要用"时起（模型调它的工具、或有消息要观察），
+    // 空闲 idleMinutes 分钟后自动停掉（声明了 schedule 的插件不自动停 —— 它们要一直待命）。
+    // 装了十个插件也不会有十个常驻进程；代价是第一次调用多等一次进程启动（约 100ms）。
+    lazy: true,
+    idleMinutes: 15,
+    // 每个插件的资源上限（宿主强制，插件自己声明的不算）：
+    //   memoryMb      堆上限 + 常驻内存超过就重启（Linux 上采样 /proc/<pid>/statm）
+    //   callsPerMinute 工具调用每分钟上限（防模型连调打爆宿主；周期任务不受此限）
+    //   concurrency   单个插件同时在途的工具调用数
+    //   diskMb        单个插件 plugin-data 的磁盘上限
+    //   totalMemoryMb 所有运行中插件的 RSS 总和上限（0=不限；只在 Linux 有可靠读数）
+    limits: { memoryMb: 128, callsPerMinute: 120, concurrency: 4, diskMb: 256, totalMemoryMb: 0 },
+    // 插件工具怎么交给模型：'meta'（默认）只挂一个 `plugin_call`，里面列出可用的插件工具；
+    // 'direct' 是每个插件工具各挂一个（老行为）。工具定义每轮都占提示词，装多了差别很明显。
+    toolMounting: 'meta',
+    // 发布者公钥（Ed25519，base64/hex 都认）：索引条目里写了 publisher + signature 时，
+    // 安装前会用这里的公钥验签，验不过就拒绝安装。没登记公钥的发布者按其未签名处理（如实标注）。
+    publishers: {},
+    // 撤回名单：命中就不加载、也不给模型用（条目不消失，控制台标成"已撤回"）。两种写法：
+    //   "some-plugin"          撤回该插件所有版本
+    //   "some-plugin@1.2.3"    只撤回这一个版本（发新版修复后老版本仍不许跑）
+    revoked: [],
+    // 额外的索引来源（多条，**配置顺序即优先级**：同一个 id 只取最靠前那份，落选的在页面上列出来）。
+    // 不填也能用：下面 indexUrl 那一条就是官方索引。想加第三方索引就往这里追加；
+    // 想清空所有来源（完全离线）就把这里清掉、indexUrl 也留空。
+    indexUrls: [],
+    // 官方插件索引（一份 JSON）：控制台「插件」页据此列出可一键安装的插件。
+    // 索引住在独立仓库 `qq-agent-plugins`（包挂它的 Release；仓库内也提交一份供 CDN 走）。
+    // 自建索引改这里即可（拉取走 safe-fetch：内网被拦、有体积与超时上限；取不动时会自动换镜像）。
+    indexUrl: 'https://raw.githubusercontent.com/sakurawwwxh/qq-agent-plugins/main/plugins/index.json',
+    // 取索引与包时的镜像前缀（形如 `https://ghproxy.example/https://github.com/...`）。
+    // 默认用内置的几个；配成空数组＝只用原始地址（不绕第三方）；也可以写自己的代理。
+    mirrorPrefixes: null,
+    // 每个插件自己的配置段：{ "<插件id>": { … } }（插件通过 cap.config.get 只能读自己这段）
+    settings: {}
+  },
+  // MCP（Model Context Protocol）客户端：把外部 MCP Server 的工具接进模型。
+  // 默认关闭；每个 server 的 command 由管理员在配置里显式填写，等同于执行本机命令。
+  mcp: {
+    enabled: false,
+    servers: []
+    // 单个 server 形状：
+    // { id, enabled, transport: 'stdio', command, args: [], env: {}, cwd,
+    //   timeoutMs: 30000, maxCallsPerMinute: 30, toolMounting: 'direct' | 'meta' }
+  },
+  // 群管理动作（禁言/踢人/撤回/设管理员）：只对全局管理员开放。
+  moderation: {
+    enabled: true,
+    actions: { ban: true, kick: true, recall: true, admin: true },
+    groups: []
+  },
+  // 轻量知识库：读取 data/knowledge 下的 .md/.txt，按关键词/中文二元组检索。
+  // 默认关闭；不做向量库，只有明确语料时才开。
+  knowledge: {
+    enabled: false,
+    dir: '',
+    maxResults: 4,
+    chunkChars: 900,
+    overlapChars: 120
   },
   // 存储
   store: {
@@ -518,6 +795,9 @@ export const DEFAULT_CONFIG = {
     //   - store 的 #trim 在 maxPerChat<=0 时直接跳过
     // 注意：单群文件会随时间增长，磁盘占用请自行留意。
     maxMessagesPerChat: 0,
+    // 按天保留：0 = 不删。只由 `node src/ops.js prune --confirm` 显式执行，
+    // 不会在运行时自动删历史；只删 state='acked' 的行，未处理/held 永不删除。
+    retentionDays: 0,
     // ── 响应概率（滑条上的数字就是概率）──
     // 0 = 只回 @ 和关键词；100 = 任何消息都响应；中间值 = 普通消息按该概率响应。
     // 被 @ 或命中关键词一定响应，不受这个数字影响。
@@ -536,7 +816,13 @@ export const DEFAULT_CONFIG = {
     // ── 响应档位的作用范围 ──
     unifiedTier: true,          // true = 上方滑条对所有会话生效；false = 可按群单独设置
     groupSliderPos: {},         // { [群号]: 概率 0~100 } 仅 unifiedTier=false 时生效；未设置的群/私聊跟随全局
-    keepSessionFiles: 2000
+    keepSessionFiles: 2000,
+    // 运行中会话 JSON 的落盘间隔（毫秒）。会话文件含完整记录、越跑越大，2 秒一次会把
+    // 小云盘的 IOPS 打满（Issue #45）；10 秒一次最多丢 10 秒运行中进度，finish 仍立即落盘。
+    sessionPersistMs: 10000,
+    // messages.sqlite 的 synchronous：FULL（默认，最稳）/ NORMAL（WAL 下同样防损坏，
+    // 但掉电可能丢最近几条提交；磁盘 IOPS 紧张时可选）。见 Issue #45。
+    sqliteSynchronous: 'FULL'
   },
   // 屏蔽名单：{ [群号]: [QQ号, ...] }
   // 被屏蔽群员的消息在入口处直接丢弃——不存档、不触发会话、不作为提示词背景。
@@ -549,11 +835,36 @@ export const DEFAULT_CONFIG = {
     handoffEnabled: true,
     handoffTtlMinutes: 1440,
     handoffMaxChars: 4000,
+    // 每条人物印象最长 300 字；每人最多保留多少条、自动印象保留多少天。
+    // manual（控制台手写）永远不因这两项被删除；默认 0 天 = 不按时间过期（只受条数上限约束）。
+    // 不默认按时间删，是为了升级老库时不把几年前的历史印象当成“过期垃圾”直接清掉；
+    // 需要自动过期时由管理员显式设 1–3650 天。
+    maxImpressionsPerPerson: 50,
+    impressionRetentionDays: 0,
     useChatModel: true,                   // true = 整理模型跟随聊天模型；false = 使用下方专用模型
     provider: '',                         // 专用模型所属提供商 id（useChatModel=false 时生效）
     model: '',                            // 专用模型 id（useChatModel=false 时生效）
     // 记忆可见性（#13）：默认与历史行为逐字一致（global + 不隐藏），切换必须显式操作
-    visibility: { mode: 'global', hidePrivateInGroup: false }
+    visibility: { mode: 'global', hidePrivateInGroup: false },
+    // 私聊上下文共享（issue #14）：默认关，保持每个私聊各自的历史/交接。
+    // 打开后只在**读取**侧把最近私聊消息与交接合并；写入、发送目标、群聊都不变。
+    privateSharedContext: false,
+    // 群聊与私聊共用最近上下文（issue #14 第二项）：默认关。打开后只在读取侧把群聊/私聊
+    // 的最近消息与交接合并，消息标明来源；写入、发送目标、长记忆可见性都不变。
+    crossScopeSharedContext: false
+  },
+  // 长期语义记忆：独立服务 + 向量库，默认关闭且先走 shadow，不改变既有 MemoryStore 行为。
+  livingMemory: structuredClone(LIVING_MEMORY_DEFAULTS),
+  // 技能包（Skill Pack）：只读 Markdown 流程 + 工具白名单，不执行第三方代码。
+  // enabled=false 时不注册 skill_list / skill_use，也不读技能目录。
+  skills: {
+    enabled: false,
+    enabledIds: [],
+    perChat: {},
+    // 官方技能索引；留空 = 不显示市场。索引只提供元数据与文件哈希，安装时逐文件校验。
+    indexUrl: 'https://raw.githubusercontent.com/sakurawwwxh/qq-agent-skills/main/index.json',
+    // 自建/局域网索引只在管理员显式打开时允许；默认仍然只访问公网地址。
+    allowPrivateIndex: false
   },
   // 省 Token 模式：只给"可控项"夹上限（上下文档位条数、单次运行轮数与预算、
   // 交接/印象注入字符数、提示词里的表情清单条数），不改写上面那些用户填的值。
@@ -569,9 +880,39 @@ export const DEFAULT_CONFIG = {
     token: ''                 // 留空 = 只监听 127.0.0.1
   },
   ui: {
+    // ── 外观（2026-10-08 v3，七轴）────────────────────────────────────────────
     // 主题：'dark' | 'light' | 'system'（system = 跟随系统偏好）。
     // 前端以 localStorage 为准做到即时生效，这里只是跨设备/重装后保留用。
-    theme: 'dark',
+    // 默认浅色（2026-10-19：项目默认外观 = 浅色 + 液态玻璃）。
+    theme: 'light',
+    darkIntensity: 'soft',    // 深色强度：soft | oled（纯黑）
+    scheme: 'default',        // 表面色板：default | slate | nord | forest | rose
+    accentPreset: 'indigo',   // 强调色预设 id（见 ui/core/appearance.js 的 ACCENTS）
+    accent: '',               // 自定义强调色（#rrggbb）；非空时压过预设
+    accentScope: 'global',    // 强调色作用范围：global | sidebar
+    sidebarStyle: 'follow',   // 侧栏底色：follow | panel | accent
+    // 侧栏是不是"悬停展开的图标条"：false = 鼠标移开收成 64px 图标条、移上去自动展开（参照控制台的默认），
+    // true = 常驻展开。与参照实现同名同义（它的 appearance.sidebarPinned）。
+    sidebarPinned: false,
+    background: 'none',       // 整页背景：none | solid | gradient
+    // 材质：off | frost | liquid | acrylic | outline。默认液态玻璃（2026-10-19）；
+    // 与 ui/core/appearance.js 的 DEFAULTS.glass 同一口径，未存过的配置按这里走。
+    glass: 'liquid',
+    bgColor: '#0b1220',
+    bgFrom: '#4c8dff',
+    bgTo: '#a78bfa',
+    bgAngle: 135,
+    font: 'default',          // 界面字体：default | rounded | serif
+    radius: 1,                // 圆角倍率（0.6 / 1 / 1.2 / 1.45 四档）
+    zoom: 1,                  // 界面缩放 0.8~1.3
+    density: 'cozy',          // 显示密度：cozy | compact | roomy
+    tweaks: {},               // 主题微调：白名单 CSS 变量 → 颜色（未设的保持色板默认）
+    showBadges: true,         // 顶栏显示连接/用量徽章
+    showTopbarTheme: true,    // 顶栏显示主题切换按钮
+    reduceMotion: false,      // 减弱动效
+    noMotion: false,          // 关闭全部动效
+    contrast: 'normal',       // 对比度：normal | high
+    // ── 其它界面项 ─────────────────────────────────────────────────────────
     showVision: true,         // 模型目录显示图片输入能力徽标
     refreshMs: 15000          // 界面轮询间隔
   }
@@ -762,7 +1103,7 @@ export function asrCredentialSlot(provider, baseUrl) {
  */
 export function asrCredentialFor(asr, kind, provider, baseUrl) {
   const slot = asrCredentialSlot(provider, baseUrl);
-  const fromMap = String(asr?.keys?.[slot]?.[kind] || '').trim();
+  const fromMap = String(credentialSlotEntry(asr?.keys, slot)?.[kind] || '').trim();
   if (fromMap) return fromMap;
   const providerField = kind === 'apiKey' ? 'apiKeyProvider' : `${kind}Provider`;
   const hostField = kind === 'apiKey' ? 'apiKeyHost' : '';
@@ -790,7 +1131,7 @@ export function asrCredentialResolve(asr, kind, provider, baseUrl) {
   if (stored && pin && asrCredentialApplies({ ...(asr || {}), baseUrl }, provider, stored, providerField, hostField)) {
     return { value: stored, owned: true };
   }
-  const fromMap = String(asr?.keys?.[slot]?.[kind] || '').trim();
+  const fromMap = String(credentialSlotEntry(asr?.keys, slot)?.[kind] || '').trim();
   if (fromMap) return { value: fromMap, owned: true };
   if (stored && !pin) return { value: stored, owned: false };
   return { value: '', owned: false };
@@ -810,13 +1151,25 @@ export function asrCredentialForSlot(asr, kind, slot) {
   const baseUrl = host ? `https://${host}` : '';
   const providerField = kind === 'apiKey' ? 'apiKeyProvider' : `${kind}Provider`;
   const hostField = kind === 'apiKey' ? 'apiKeyHost' : '';
-  const fromMap = String(asr?.keys?.[s]?.[kind] || '').trim();
+  const fromMap = String(credentialSlotEntry(asr?.keys, s)?.[kind] || '').trim();
   if (fromMap) return { value: fromMap, owned: true };
   const stored = String(asr?.[kind] || '').trim();
   const pin = String(asr?.[providerField] || '').trim().toLowerCase();
   if (!stored || !pin) return { value: '', owned: false };
   return asrCredentialApplies({ ...(asr || {}), baseUrl }, provider, stored, providerField, hostField)
     ? { value: stored, owned: true } : { value: '', owned: false };
+}
+
+/**
+ * 按槽位名取条目，**只认自有属性**。槽位名来自 asr.provider / 地址主机，是外部可控的：
+ * `keys['constructor']` 会取到 Object.prototype.constructor（一个函数），`keys['__proto__']`
+ * 会取到原型对象 —— 既可能把函数源码当成"存过的凭据"，也可能让下游按数组处理时直接抛错
+ * （2026-10-04 复审 P2 实测）。与 ttsKeyFor / imageGenKeyResolveCore 同一口径。
+ */
+function credentialSlotEntry(keys, slot) {
+  if (!keys || typeof keys !== 'object' || !Object.hasOwn(keys, slot)) return null;
+  const entry = keys[slot];
+  return entry && typeof entry === 'object' && !Array.isArray(entry) ? entry : null;
 }
 
 /**
@@ -828,7 +1181,13 @@ export function asrKeySlots(asr) {
   const push = (slot, kind, value) => {
     const s = String(slot || '').trim().toLowerCase();
     if (!s || !String(value || '').trim()) return;
-    const list = out[s] || (out[s] = []);
+    // ⚠️ 必须用自有属性判定：`out` 是普通对象，`out['constructor']` 会取到
+    // Object.prototype.constructor（一个函数），接着 `list.includes` 报
+    // "list.includes is not a function"，整个 /api/config 500（2026-10-04 复审 P2 实测：
+    // 一次 POST 就能把坏值写进 config.json，之后每次读配置都 500，且没有任何 API 能删掉它）。
+    // 槽位名来自 asr.provider —— 客户端可控，所以这里按"不可信键名"处理（与 ttsKeyFor 同款）。
+    if (!Object.hasOwn(out, s)) out[s] = [];
+    const list = out[s];
     if (!list.includes(kind)) list.push(kind);
   };
   for (const [slot, entry] of Object.entries(asr?.keys || {})) {
@@ -845,12 +1204,143 @@ export function asrKeySlots(asr) {
   return out;
 }
 
+/** 外观 v2 的「主题配色」id → v3 的强调色 id（只用于迁移，别的地方不要用这张表）。 */
+const LEGACY_PRESET_TO_ACCENT = { snow: 'indigo', mint: 'emerald', amber: 'amber', violet: 'violet', rose: 'rose' };
+
+/**
+ * 插件官方索引搬过家：原来在宿主仓库（qq-agent-plus）里，现在住在独立仓库 qq-agent-plugins。
+ * 老实例的 config.json 里存着**旧地址**，而旧地址现在只剩一张"指路牌"（索引是空的）——
+ * 界面会显示「索引里暂时没有条目」，用户完全看不出是被搬走了。
+ *
+ * 所以这里做一次**精确**迁移：只有当值**正好等于我们出厂的那个旧默认值**时才改写；
+ * 用户自己填过的地址（哪怕是别的 fork）一律不碰 —— 迁移改的是"我们的旧默认值"，不是"用户的设置"。
+ */
+const LEGACY_PLUGIN_INDEX_URL = 'https://raw.githubusercontent.com/sakurawwwxh/qq-agent-plus/main/plugins/index.json';
+
+/**
+ * 上面那条迁移的**唯一实现**（导出出来给用例直测：config 是进程内缓存的，
+ * "换个文件再读一次"测不了，所以这条得能单独调）。
+ * 只改"正好等于出厂旧默认值"的那种，其它一律原样返回。
+ */
+export function migratePluginIndexUrl(plugins) {
+  if (!plugins || typeof plugins !== 'object') return plugins;
+  if (plugins.indexUrl !== LEGACY_PLUGIN_INDEX_URL) return plugins;
+  return { ...plugins, indexUrl: DEFAULT_CONFIG.plugins.indexUrl };
+}
+
+/**
+ * 秘塔搜索的地址搬家（issue #38）：出厂默认曾经写成 `/api/open/v1/search`（404），
+ * 而默认值**会被写进 config.json** —— 只改默认值救不了已经装过的实例，得在读盘时把那一条搬过来。
+ * 只搬"正好等于旧出厂值"的，用户自己填的代理/镜像地址一律不动。
+ */
+const LEGACY_METASO_BASE_URL = 'https://metaso.cn/api/open/v1/search';
+export function migrateMetasoBaseUrl(webSearch) {
+  if (!webSearch || typeof webSearch !== 'object') return webSearch;
+  const metaso = webSearch.metaso;
+  if (!metaso || typeof metaso !== 'object' || metaso.baseUrl !== LEGACY_METASO_BASE_URL) return webSearch;
+  return { ...webSearch, metaso: { ...metaso, baseUrl: DEFAULT_CONFIG.webSearch.metaso.baseUrl } };
+}
+
+const PERSONA_CHAT_KEY_RE = /^(?:group|private):\d+$/;
+const PERSONA_OVERRIDE_TEXT_CAP = 20000;
+const PERSONA_OVERRIDE_RULE_CAP = 4000;
+const PERSONA_OVERRIDE_NAME_CAP = 40;
+const PERSONA_OVERRIDE_CARD_CAP = 64;
+
+/**
+ * 按群人设的 fail-closed 归一化：只认规范 chatKey 与白名单字段。
+ * 不在这里填卡正文 —— 内置卡正文以 roles/*.md 为唯一来源，运行时按 templateId 解析
+ *（见 personas.resolvePersona）；自定义卡由控制台把正文写进 roleText。
+ */
+export function normalizePersonaPerChat(raw) {
+  if (!isPlainObject(raw)) return {};
+  const out = {};
+  // 字符串字段只认字符串：手改成对象/数组时 String() 会写出 "[object Object]" 进提示词，
+  // 与"坏值直接丢"的 fail-closed 约定相反（2026-10-19 发版前审查）。
+  const text = (value, cap) => (typeof value === 'string' ? value.trim().slice(0, cap) : '');
+  for (const [key, value] of Object.entries(raw)) {
+    if (!PERSONA_CHAT_KEY_RE.test(key) || !isPlainObject(value)) continue;
+    const entry = {};
+    const card = text(value.templateId, PERSONA_OVERRIDE_CARD_CAP);
+    if (card) entry.templateId = card;
+    const roleText = text(value.roleText, PERSONA_OVERRIDE_TEXT_CAP);
+    if (roleText) entry.roleText = roleText;
+    const botName = text(value.botName, PERSONA_OVERRIDE_NAME_CAP);
+    if (botName) entry.botName = botName;
+    const selfNickname = text(value.selfNickname, PERSONA_OVERRIDE_NAME_CAP);
+    if (selfNickname) entry.selfNickname = selfNickname;
+    if (['legacy', 'grounded', 'card'].includes(value.behaviorProfile)) entry.behaviorProfile = value.behaviorProfile;
+    if (['low', 'medium', 'high'].includes(value.participation)) entry.participation = value.participation;
+    const customRules = text(value.customRules, PERSONA_OVERRIDE_RULE_CAP);
+    if (customRules) entry.customRules = customRules;
+    // 内部字段：这张覆盖最后一次改变的时间（控制台保存时写，用于"刚换过人设"的提醒）
+    // 只接受过去的时间（客户端/手改塞一个未来值会让"刚换过人设"的提醒永远挂着）
+    const changedAt = Number(value.changedAt);
+    if (Number.isFinite(changedAt) && changedAt > 0) entry.changedAt = Math.min(Math.floor(changedAt), Date.now());
+    if (Object.keys(entry).length) out[key] = entry;
+  }
+  return out;
+}
+
 function migrateConfig(parsed) {
   // 顶层必须是对象：手改坏的 config.json 可能是 null / 5 / "x" / true（都是合法 JSON）。
   // 放它过去，下面 out.persona = … 那一步就会抛（Cannot create property 'persona' on number '5'），
   // 被 loadConfig 的 catch 吞掉后静默退回默认值、还会被持久化 —— 用户配置整份没了。
   if (!isPlainObject(parsed)) parsed = {};
   const out = structuredClone(parsed);
+  // 名单/数组段统一归一化：手改或 API 传成字符串/对象时，入站路径的 .map、
+  // 模型请求的 .find、设置页的 .join 会直接抛，机器人静默不回复。
+  // 这里按"空名单/空数组"恢复，而不是把类型错误带进运行期。
+  const listOf = (value) => (Array.isArray(value) ? value : []);
+  if (!isPlainObject(out.allow)) out.allow = {};
+  out.allow.groups = listOf(out.allow.groups);
+  out.allow.private = listOf(out.allow.private);
+  if (!isPlainObject(out.deny)) out.deny = {};
+  out.deny.groups = listOf(out.deny.groups);
+  out.deny.private = listOf(out.deny.private);
+  if (!isPlainObject(out.blocklist)) out.blocklist = {};
+  for (const key of Object.keys(out.blocklist)) {
+    out.blocklist[key] = listOf(out.blocklist[key]);
+  }
+  out.providers = listOf(out.providers);
+  out.customPersonas = listOf(out.customPersonas);
+  // 技能包：名单数组、按群覆盖键必须是规范 chatKey，值只收字符串 id。
+  if (!isPlainObject(out.skills)) out.skills = {};
+  out.skills.enabled = out.skills.enabled === true;
+  out.skills.enabledIds = listOf(out.skills.enabledIds)
+    .map((id) => String(id || '').trim())
+    .filter((id) => /^[a-z0-9][a-z0-9-]{1,63}$/.test(id));
+  const skillPerChat = {};
+  if (isPlainObject(out.skills.perChat)) {
+    for (const [key, ids] of Object.entries(out.skills.perChat)) {
+      if (!/^(group|private):\d+$/.test(key) || !Array.isArray(ids)) continue;
+      skillPerChat[key] = ids
+        .map((id) => String(id || '').trim())
+        .filter((id) => /^[a-z0-9][a-z0-9-]{1,63}$/.test(id));
+    }
+  }
+  out.skills.perChat = skillPerChat;
+  if (typeof out.skills.indexUrl === 'string') {
+    const url = out.skills.indexUrl.trim();
+    // 2026-10：官方索引从主仓库迁到 qq-agent-skills；只迁移出厂旧地址，
+    // 用户自己填的第三方索引保持原样。
+    const legacy = 'https://raw.githubusercontent.com/sakurawwwxh/qq-agent-plus/main/skills/market.json';
+    out.skills.indexUrl = url === legacy
+      ? DEFAULT_CONFIG.skills.indexUrl
+      : (/^https?:\/\//i.test(url) ? url.slice(0, 500) : '');
+  }
+  out.skills.allowPrivateIndex = out.skills.allowPrivateIndex === true;
+  // 记忆容量/保留期：夹在可解释范围内；手写条目不受影响。
+  if (isPlainObject(out.memory)) {
+    const max = Math.round(Number(out.memory.maxImpressionsPerPerson));
+    if (Number.isFinite(max)) out.memory.maxImpressionsPerPerson = Math.max(5, Math.min(200, max));
+    const days = Math.round(Number(out.memory.impressionRetentionDays));
+    if (Number.isFinite(days)) out.memory.impressionRetentionDays = Math.max(0, Math.min(3650, days));
+  }
+  // store 段缺失或形状坏掉时整段丢掉，交给默认值合并：补一个空对象会让后面的概率迁移
+  // 以为"用户明确写了 0%"，把默认的全响应改成不响应。
+  if (out.store !== undefined && !isPlainObject(out.store)) delete out.store;
+  if (isPlainObject(out.store)) out.store.keywords = listOf(out.store.keywords);
   // 人设段必须是对象：手改坏的 config.json 里可能是 "persona": "小鲸鱼" 这类标量或数组，
   // 放它过去会在保存时炸（Cannot create property 'behaviorProfile' on string），
   // 而控制台保存与 scripts/configure-linux.mjs 都要走这条路径 —— 恢复成默认人设对象。
@@ -863,7 +1353,71 @@ function migrateConfig(parsed) {
   // 必须在这里显式补空串（deepMerge 之前）：默认值里带的是 "xiaojingyu"，
   // 让默认值补上的话，老实例（例如选的是猫娘）载入后会被当成绑定了默认卡、正文被换掉。
   // 空串 = 未绑定（正文按自定义处理，不改动）；在控制台重选一次卡就会自动绑上。
-  if (out.persona.templateId === undefined) out.persona.templateId = '';
+  // null 也要补：deepMerge 把 null 当"没给"、会退回默认卡，随后默认卡正文会盖掉自定义正文。
+  if (out.persona.templateId === undefined || out.persona.templateId === null) out.persona.templateId = '';
+  // ── 按群人设（personaPerChat）──
+  // 键必须是规范 chatKey（group:<数字> / private:<数字>），值只收白名单字段。
+  // 手改坏、键写错、字段超长的条目一律丢掉 —— 宁可少一条覆盖，也不让坏配置进提示词。
+  out.personaPerChat = normalizePersonaPerChat(out.personaPerChat);
+  // 消息类型段必须是对象；四个开关统一收敛成布尔（缺键 = 开，保持既有行为）。
+  // 手改成 "messageTypes": null 时不能让整段丢掉 —— 那等于把四项一起打开，静默改变行为。
+  if (!isPlainObject(out.messageTypes)) {
+    out.messageTypes = { ...DEFAULT_CONFIG.messageTypes };
+  } else {
+    out.messageTypes = {
+      expandForward: out.messageTypes.expandForward !== false,
+      videoFrames: out.messageTypes.videoFrames !== false,
+      images: out.messageTypes.images !== false,
+      stickers: out.messageTypes.stickers !== false
+    };
+  }
+  // ── 平台能力（2026-10-07 键拆细：读/写分离）──
+  // 老配置里 avatarWrites 一个键同时管"换头像"和"改昵称/个性说明"。拆细后按老键回填：
+  // 显式开过 avatarWrites=true 的实例，昵称也保持开着 —— 否则用户"开过换头像/改资料"的
+  // 意图会被拆细静默收掉一半（保存一次控制台即固化）。
+  if (isPlainObject(out.platform)) {
+    if (out.platform.nicknameWrites === undefined && out.platform.avatarWrites === true) {
+      out.platform.nicknameWrites = true;
+    }
+    // 拆细后新增的"写侧兄弟键"：老配置里那个伞键**被显式关掉**时，兄弟键也要跟着关 ——
+    // 否则 deepMerge 会替老配置补上默认 true，等于"升级即悄悄扩权"（用户当初关掉
+    // reactions/profileWrites/groupTools/groupFiles/albumRead 的意图被撕掉一半）。
+    // 只在兄弟键**没存过**时回填：控制台保存过一次的 15 键配置永远不被改写
+    // （2026-10-07 独立审计 P1）。
+    for (const [oldKey, newKey] of [
+      ['reactions', 'reactionsWrite'],
+      ['profileWrites', 'remarkWrites'],
+      ['groupTools', 'groupWrites'],
+      ['groupFiles', 'groupFileSend'],
+      ['albumRead', 'albumWrites']
+    ]) {
+      if (out.platform[newKey] === undefined && out.platform[oldKey] === false) out.platform[newKey] = false;
+    }
+    // perGroup / quotas 的坏形状先归一化：手改坏一个字符不许把整份配置带崩
+    // （这两段是 2026-10-07 新增的嵌套结构，别的字段都没有这一层）。
+    if (out.platform.perGroup !== undefined && !isPlainObject(out.platform.perGroup)) out.platform.perGroup = {};
+    if (isPlainObject(out.platform.perGroup)) {
+      for (const [gid, node] of Object.entries(out.platform.perGroup)) {
+        if (!isPlainObject(node)) { delete out.platform.perGroup[gid]; continue; }
+        // 只留"合法门控键 + 显式布尔值"：字符串 'true'、未知键（如把 readReceipts 写进按群）
+        // 都在这里清掉，查找侧也就不必再兜第二遍。
+        for (const [key, value] of Object.entries(node)) {
+          if (typeof value !== 'boolean' || !PLATFORM_GATE_KEYS.includes(key)) delete node[key];
+        }
+      }
+    }
+    if (out.platform.quotas !== undefined && !isPlainObject(out.platform.quotas)) out.platform.quotas = {};
+    // 配额键改名：avatarsPerDay → avatarsPerWeek（2026-10-07：换头像的窗口从"每天"改成"每周" ——
+    // "每天最多 1 次"一周仍能换 7 次，不符合"按真人标准"）。老键的值搬过去再把老键删掉：
+    // 留着它，控制台"留空 = 用默认"那条兜底会读到它，等于改不动这项。
+    if (isPlainObject(out.platform.quotas)) {
+      const carried = Number(out.platform.quotas.avatarsPerDay);
+      if (out.platform.quotas.avatarsPerWeek === undefined && Number.isFinite(carried) && carried > 0) {
+        out.platform.quotas.avatarsPerWeek = Math.max(1, Math.min(200, Math.floor(carried)));
+      }
+      delete out.platform.quotas.avatarsPerDay;
+    }
+  }
   // ── 省 Token 模式：老配置没有这个键 ──
   // 缺键/坏值一律按 off 处理（默认关闭，行为与升级前完全一致）；坏值不许把整份配置带崩。
   if (!isPlainObject(out.tokenSaver)) out.tokenSaver = { mode: 'off' };
@@ -932,11 +1486,44 @@ function migrateConfig(parsed) {
   delete out.providersSourceYaml;
   delete out.providersImported;
   delete out.telemetry;
+  // 插件索引搬家（2026-10-16）：只改"等于出厂旧默认值"的那种，用户自填的地址不动（见上面的注释）
+  if (out.plugins) out.plugins = migratePluginIndexUrl(out.plugins);
+  // 秘塔搜索地址搬家（2026-10-17 issue #38）：旧出厂值是 /api/open/v1/search（404）
+  if (out.webSearch) out.webSearch = migrateMetasoBaseUrl(out.webSearch);
   if (out.server) {
     delete out.server.autoStart;
     delete out.server.closeToTray;
   }
   if (out.ui?.theme === '?') out.ui.theme = 'dark';
+  // 外观 v2 → v3（2026-10-08）：v2 只有"主题配色"（ui.preset）一个抽象，v3 把它拆成
+  // "表面色板"（scheme）与"强调色"（accentPreset）两条轴 —— 老值按同一份色相搬到 accentPreset，
+  // 然后把 preset 删掉。留着它就会出现两个真源：界面读 accentPreset，存档里还躺着一个 preset，
+  // 而保存路径（ui/core/appearance.js 的 appearancePatch）根本不写 preset，它只会变成一具干尸。
+  if (out.ui && typeof out.ui === 'object') {
+    if (out.ui.accentPreset == null && LEGACY_PRESET_TO_ACCENT[out.ui.preset]) {
+      out.ui.accentPreset = LEGACY_PRESET_TO_ACCENT[out.ui.preset];
+    }
+    delete out.ui.preset;
+    // v2 的 avatarsPerDay 式"越界历史值"不用在这里修：resolveAppearance 已经是那条唯一入口，
+    // 它会夹紧；这里只处理"字段改名/消失"，不做取值规整。
+  }
+  // ── 派生位 has* 的剥离要覆盖**每一段** ──
+  // sanitizeConfigSecrets 会给任何密钥类字段生成 hasXxx；GET /api/config 把它们一起下发，
+  // "整份配置展开回传"的客户端就会把它们送回来。不剥的话保存一次就落进 config.json，
+  // 往后每份配置都带着上个版本算出来的结论。原先只覆盖了 webSearch/tts/asr/imageGen，
+  // 漏了 api 与 providers[]（2026-10-04 复审 P3 实测：api.hasApiKey / api.hasKey /
+  // providers[].hasKey 全部落盘）。官方界面逐字段构造 patch，不会回传这些位，
+  // 但剥离规则按"所有段"统一，不留例外。
+  for (const sec of ['api', 'conversation', 'server', 'onebot', 'tts', 'asr', 'imageGen', 'webSearch', 'identityPilot', 'sticker']) {
+    if (isPlainObject(out[sec])) {
+      for (const key of Object.keys(out[sec])) if (/^has[A-Z]/.test(key)) delete out[sec][key];
+    }
+  }
+  if (Array.isArray(out.providers)) {
+    for (const item of out.providers) {
+      if (isPlainObject(item)) for (const key of Object.keys(item)) if (/^has[A-Z]/.test(key)) delete item[key];
+    }
+  }
   // ── 带凭据映射的三个段：手改坏成标量/数组时归一化成对象，段内的 keys 同理 ──
   // （`{ ...'sk-x' }` 会把字符串展开成字符索引的垃圾映射；与 persona/identityPilot 同款兜底。
   //   2026-10-02 全量审查：非对象形态的 keys 还会绕过控制台下发的"整包清空"——那条单独在
@@ -944,6 +1531,29 @@ function migrateConfig(parsed) {
   for (const sec of ['asr', 'tts', 'imageGen']) {
     if (out[sec] !== undefined && !isPlainObject(out[sec])) out[sec] = {};
     if (isPlainObject(out[sec]) && out[sec].keys !== undefined && !isPlainObject(out[sec].keys)) out[sec].keys = {};
+  }
+  // webSearch 同理：sanitize 生成的 hasApiKey 属于派生位，回传展开后会跟着落进 config.json
+  // （界面每次展开 { ...c.webSearch } 都会带上；2026-10-03 全量审查）
+  if (isPlainObject(out.webSearch)) {
+    for (const [key, value] of Object.entries(out.webSearch)) {
+      if (/^has[A-Z]/.test(key)) delete out.webSearch[key];
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          if (isPlainObject(item)) for (const sub of Object.keys(item)) if (/^has[A-Z]/.test(sub)) delete item[sub];
+        }
+      } else if (isPlainObject(value)) {
+        for (const sub of Object.keys(value)) if (/^has[A-Z]/.test(sub)) delete value[sub];
+      }
+    }
+  }
+  // ── 语音合成（tts）──
+  if (isPlainObject(out.tts)) {
+    // 派生位不落盘：hasApiKey 是 sanitize 生成的、keyServices/currentService 是 GET 下发的，
+    // 而 sanitize 生成的 hasApiKeyService 等一律用 has[A-Z] 通配兜住（与下面 asr/imageGen 两段同口径；
+    // 原来 tts 这一段整个缺，别处写入会把它们持久化）
+    for (const key of Object.keys(out.tts)) if (/^has[A-Z]/.test(key)) delete out.tts[key];
+    for (const key of ['keyServices', 'currentService']) delete out.tts[key];
+    if (out.tts.keys !== undefined && !isPlainObject(out.tts.keys)) out.tts.keys = {};
   }
   // ── 语音转写（asr）──
   if (isPlainObject(out.asr)) {
@@ -961,14 +1571,33 @@ function migrateConfig(parsed) {
     for (const key of Object.keys(out.imageGen)) {
       if (/^has[A-Z]/.test(key) || IMAGEGEN_DERIVED_KEYS.includes(key)) delete out.imageGen[key];
     }
-    // 有 Key 却没记归属的老配置：按当前地址补记（与 asr 的 pin 同款）。
-    // 不补的话升级后"换个预设"就会拿旧 Key 去撞新地址 —— 而那在升级前一直是好用的，
-    // 不补等于给升级中的实例制造"突然把 A 家 Key 发给 B 家"或"突然不生效"。
-    if (String(out.imageGen.apiKey || '').trim() && !String(out.imageGen.apiKeyHost || '').trim()) {
-      pinImageGenKeyHost(out.imageGen, out.api?.baseUrl);
+    // ⚠️ 这里**不**补归属钉（与上面 asr 同一条纪律，2026-10-04 复审 P2）：合并路径上补会把
+    // "归属未知的老凭据"绑到**这次 patch 之后**的地址上。路由层刻意不认领那把（resolved.owned
+    // 为 false 就只填值、不写钉），转到这里却被无条件认领 —— 用户把地址换成别家、没填新 Key
+    // 保存一次，旧 Key 就被静默绑到新主机，此后 resolveImageGenAuth 会把它发给新主机。
+    // 读盘那次该补的照旧补（见 loadConfig 里的 pinUnboundImageGenKey），那时地址没被这次改动带偏。
+  }
+  // 槽位条目被手改成标量（"keys":{"tencent":"SCALAR"}）时，各处 `{...entry}` 会摊成
+  // {0:'S',1:'C',…} 的字符索引垃圾。这里直接把非对象条目归一成 {}，读写两侧都干净
+  //（migrateConfig 是所有写入路径的必经口，读盘也走它；2026-10-04 复审 P2）。
+  if (isPlainObject(out.asr?.keys)) {
+    for (const [slot, entry] of Object.entries(out.asr.keys)) {
+      if (!isPlainObject(entry)) out.asr.keys[slot] = {};
     }
   }
   return out;
+}
+
+/**
+ * 读盘这一次给"有 Key 却没记归属"的老配置补记归属（与 pinStoredAsrCredentials 同款）。
+ * 只在读盘做、合并路径不做 —— 合并时地址可能刚被这次 patch 改过，补记等于把老凭据绑到新主机。
+ * 入口条件与 pinStoredAsrCredentials 同款：确实有 Key、确实没记归属。
+ */
+function pinUnboundImageGenKey(imageGen, apiBaseUrl) {
+  if (!isPlainObject(imageGen)) return '';
+  if (!String(imageGen.apiKey || '').trim()) return '';
+  if (String(imageGen.apiKeyHost || '').trim()) return String(imageGen.apiKeyHost);
+  return pinImageGenKeyHost(imageGen, apiBaseUrl);
 }
 
 /**
@@ -1067,10 +1696,6 @@ export function pinImageGenKeyHost(imageGen, apiBaseUrl) {
  * apiKey + apiKeyHost，"没记归属"的那把按"当前地址能用"算 —— 与 imageGenKeyApplies 一致）。
  * 运行时/判定端读它；"保存时该用哪把、能不能认领"用 imageGenKeyResolve（2026-10-02 全量审查拆开）。
  */
-export function imageGenKeyFor(imageGen, host) {
-  return imageGenKeyResolveCore(imageGen, host, { allowUnbound: true }).value;
-}
-
 /**
  * 保存时解析"目标主机该用哪把 Key"，返回 { value, owned }（与 asrCredentialResolve 同款）：
  *   owned=true  → 明确属于这个主机（活动槽的 apiKeyHost 就是它，或映射里这家存过的）→ 可写回钉；
@@ -1122,7 +1747,15 @@ function deepMerge(base, override) {
     // 整体替换约定：{ __replace__: X } → 该键直接用 X，不做递归合并。
     // 用于映射型字段（如 api.modelPrices）需要"删掉旧键"的场景 ——
     // 普通深合并传 {} 是删不掉已有键的。
+    // ⚠️ X 必须是**对象**。X 是 null / 标量 / 数组时，整键**忽略**（当作"这一项没给"）：
+    // 替换会把整个键变成那种值，凭据段于是被清成 null/""—— 一次 `{"asr":{"__replace__":null}}`
+    // 就静默清空整段（keys 映射 + 单槽 Key + 归属钉一起没了），而 HTTP 仍返回 200。
+    // 与其默默毁掉一整段凭据，不如什么都不做（2026-10-04 复审 P3）。
+    // ⚠️ 必须 continue 而不是落回下面的合并分支：落回去会把 `__replace__` 当普通键合进去，
+    // 于是 `{keys:{__replace__:'sk-leaked'}}` 变成 `{keys:{__replace__:'sk-leaked'}}` ——
+    // 那个密钥字符串反而**留在配置里**了（config.test.mjs 钉的就是这一条）。
     if (value && typeof value === 'object' && !Array.isArray(value) && '__replace__' in value) {
+      if (!isPlainObject(value.__replace__)) continue;
       out[key] = structuredClone(value.__replace__);
       continue;
     }
@@ -1173,7 +1806,11 @@ export function loadConfig() {
     // 升级后"换服务/换地址要重填"的防线立刻生效，而不是等用户碰一次设置才生效
     const asrProviderValue = String(merged.asr?.provider || '').trim().toLowerCase();
     if (asrProviderValue) pinStoredAsrCredentials(merged.asr, asrProviderValue);
-    applyPersonaTemplate(merged);   // 绑了内置卡就按 roles/*.md 刷新正文（卡文件是唯一来源）
+    // 图片生成同款：老配置只有单槽 apiKey、没有 apiKeyHost，不补记的话升级后"换个预设"就拿旧
+    // Key 去撞新地址 —— 而那在升级前一直是好用的。只在读盘补，合并路径不补（见 migrateConfig）
+    pinUnboundImageGenKey(merged.imageGen, merged.api?.baseUrl);
+    applyPersonaTemplate(merged);
+    applyPersonaPerChatTemplates(merged);   // 绑了内置卡就按 roles/*.md 刷新正文（卡文件是唯一来源）
     return merged;
   } catch (error) {
     // 读不动/解析不了就**先把原件留一份**再退回默认值：config.js 的 stabilize 会把结果持久化，
@@ -1184,6 +1821,7 @@ export function loadConfig() {
     }
     const fresh = structuredClone(DEFAULT_CONFIG);
     applyPersonaTemplate(fresh);
+    applyPersonaPerChatTemplates(fresh);
     return fresh;
   }
 }
@@ -1249,6 +1887,7 @@ const PERSONA_ROLE_TEXT_MAX = 20000;
 const PERSONA_CUSTOM_RULES_MAX = 4000;
 const MEMBER_NOTE_MAX = 200;
 const MEMBER_NOTES_MAX = 2000;
+const STICKER_COLLECT_CRITERIA_MAX = 2000;   // 与 src/onebot/sticker-manager.js 的判定期截断同口径
 
 /** 备注表归一化：值去空白并截断，丢空值，条目数设上限（防止备注表无限膨胀）。 */
 function clampMemberNotes(value) {
@@ -1272,7 +1911,28 @@ export function updateConfig(patch) {
   // 直接把这个键从 patch 里摘掉，免得它在合并/迁移里被当成"恢复默认人设"，甚至抛错。
   const safePatch = isPlainObject(patch) ? { ...patch } : {};
   if ('persona' in safePatch && !isPlainObject(safePatch.persona)) delete safePatch.persona;
+  // 按群人设同理：标量/数组/null 当"这次没改"处理，别让一次坏请求把所有群的覆盖清空
+  if ('personaPerChat' in safePatch && !isPlainObject(safePatch.personaPerChat)) delete safePatch.personaPerChat;
+  // 三个带凭据的段同理：它们被 migrateConfig 归一化成 {}，等于**整段清空**（连 keys 映射与
+  // 归属钉一起丢），而不是"这次没改"。坏输入最该被忽略，不该当成用户要求清空（2026-10-03 全量审查）。
+  for (const sec of ['asr', 'tts', 'imageGen']) {
+    if (sec in safePatch && !isPlainObject(safePatch[sec])) delete safePatch[sec];
+  }
+  // 下面这些段是直接写属性用的（next.api.maxRunTokens = …），客户端送来标量或数组时
+  // 会抛 TypeError（ESM 是严格模式）→ 整个 /api/config 返回 500。坏输入最该被忽略，
+  // 不该把整次保存带崩（2026-10-04 复审 P2）。
+  for (const sec of ['api', 'conversation', 'dailyMoments', 'qzoneInteractions']) {
+    if (sec in safePatch && !isPlainObject(safePatch[sec])) delete safePatch[sec];
+  }
   const next = migrateConfig(deepMerge(getConfig(), safePatch));
+  // 目录优先：当前选中的 provider 在 providerKeys 里有 Key 时，顶层 api.apiKey（手动模式遗留字段）
+  // 已经没有任何用处 —— 留着它就是"换过主模型 API，config.json 里却还躺着旧 Key"的来源
+  //（2026-10-13 用户反馈：换过 API 之后仍能读到那把没额度的旧 Key）。任何一次保存都会走这里，于是自愈。
+  // 只有当**没有**目录 Key 时才保留它（手动模式 / 老配置的真实凭据）。
+  const pidNow = String(next.api?.provider || '');
+  if (pidNow && String(next.providerKeys?.[pidNow] || '').trim() && String(next.api?.apiKey || '').trim()) {
+    next.api.apiKey = '';
+  }
   const oldTimeControl = JSON.stringify(getConfig().timeControl);
   // 人设绑定与正文的优先级，只在配置保存这一层定：
   //   1) patch 里写了 roleText 但没给 templateId = 手写正文 → 自动解绑，正文按你写的来；
@@ -1285,6 +1945,7 @@ export function updateConfig(patch) {
   next.persona.behaviorProfile = normalizeBehaviorProfile(next.persona.behaviorProfile);
   if (patchPersona?.templateId !== undefined || patchPersona?.roleText === undefined) {
     applyPersonaTemplate(next);
+    applyPersonaPerChatTemplates(next);
   }
   // 长文本字段在"写入这一侧"设上界（放在 applyPersonaTemplate 之后，保证最终值也被夹住）：
   // roleText / customRules 每次请求都会进系统提示词，memberNotes 会进控制台回包与 config.json，
@@ -1299,16 +1960,22 @@ export function updateConfig(patch) {
     next.persona.customRules = next.persona.customRules.slice(0, PERSONA_CUSTOM_RULES_MAX);
   }
   if ('memberNotes' in safePatch) next.memberNotes = clampMemberNotes(next.memberNotes);
+  // 表情判定标准（2026-10-10 补上控制台输入后同口径）：只在本次 patch 带了该字段时夹到 2000 字
+  // （与 src/onebot/sticker-manager.js 判定期的截断一致）；无关保存不改写存量值。
+  if (safePatch.sticker?.collectCriteria !== undefined && typeof next.sticker?.collectCriteria === 'string') {
+    next.sticker.collectCriteria = next.sticker.collectCriteria.slice(0, STICKER_COLLECT_CRITERIA_MAX);
+  }
   next.tokenSaver = { ...(next.tokenSaver || {}), mode: normalizeTokenSaverMode(next.tokenSaver?.mode) };
   next.timeControl = normalizeTimeControl(next.timeControl);
+  next.livingMemory = normalizeLivingMemoryConfig(next.livingMemory);
   next.dailyMoments.scheduleWindows = normalizeMomentWindows(next.dailyMoments.scheduleWindows);
-  if (!['observe', 'active'].includes(next.runtime?.mode)) throw new Error('Invalid runtime mode');
+  if (!['observe', 'active'].includes(next.runtime?.mode)) throw invalidConfig('Invalid runtime mode');
   if (!['legacy', 'threaded', 'lifecycle'].includes(next.conversation?.mode)) {
-    throw new Error('Invalid conversation mode');
+    throw invalidConfig('Invalid conversation mode');
   }
   for (const mode of Object.values(next.conversation?.groupModes || {})) {
     if (!['legacy', 'threaded', 'lifecycle'].includes(mode)) {
-      throw new Error('Invalid group conversation mode');
+      throw invalidConfig('Invalid group conversation mode');
     }
   }
   next.api.maxRunTokens = Math.min(
@@ -1388,7 +2055,7 @@ export function updateConfig(patch) {
     stability: clampInteger(rawWeights.stability, 0, 100, 10)
   };
   if (Object.values(weights).reduce((sum, value) => sum + value, 0) !== 100) {
-    throw new Error('主动好友评估权重合计必须为 100');
+    throw invalidConfig('主动好友评估权重合计必须为 100');
   }
   next.identityPilot = {
     ...identity,
@@ -1473,12 +2140,12 @@ export function updateConfig(patch) {
     )
   ) {
     const ownerUin = next.identityPilot.friendProposal.ownerUin;
-    if (!ownerUin) throw new Error('好友审批功能需要配置管理员 QQ');
+    if (!ownerUin) throw invalidConfig('好友审批功能需要配置管理员 QQ');
     if (
       next.allowAllWhenEmpty !== true
-      && !(next.allow?.private || []).map(String).includes(ownerUin)
+      && !idList(next.allow?.private).includes(ownerUin)
     ) {
-      throw new Error('审批管理员 QQ 必须同时加入私聊白名单');
+      throw invalidConfig('审批管理员 QQ 必须同时加入私聊白名单');
     }
   }
   const incidentPilot = next.incidentPilot || {};
@@ -1502,13 +2169,13 @@ export function updateConfig(patch) {
   };
   if (next.incidentPilot.enabled) {
     if (!next.incidentPilot.ownerUin) {
-      throw new Error('异常处理试点需要配置告警管理员 QQ');
+      throw invalidConfig('异常处理试点需要配置告警管理员 QQ');
     }
     if (
       next.allowAllWhenEmpty !== true
-      && !(next.allow?.private || []).map(String).includes(next.incidentPilot.ownerUin)
+      && !idList(next.allow?.private).includes(next.incidentPilot.ownerUin)
     ) {
-      throw new Error('异常告警管理员 QQ 必须同时加入私聊白名单');
+      throw invalidConfig('异常告警管理员 QQ 必须同时加入私聊白名单');
     }
   }
   const autoUpdate = next.autoUpdate || {};
@@ -1521,7 +2188,7 @@ export function updateConfig(patch) {
   if (!/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\.git)?$/.test(
     updateRepository
   )) {
-    throw new Error('自动更新仓库必须是 GitHub HTTPS 地址');
+    throw invalidConfig('自动更新仓库必须是 GitHub HTTPS 地址');
   }
   if (
     !/^[A-Za-z0-9._/-]{1,100}$/.test(updateBranch)
@@ -1529,7 +2196,7 @@ export function updateConfig(patch) {
     || updateBranch.includes('..')
     || updateBranch.endsWith('/')
   ) {
-    throw new Error('自动更新分支名称无效');
+    throw invalidConfig('自动更新分支名称无效');
   }
   next.autoUpdate = {
     ...autoUpdate,
@@ -1548,13 +2215,13 @@ export function updateConfig(patch) {
   };
   if (next.autoUpdate.enabled) {
     if (!next.autoUpdate.ownerUin) {
-      throw new Error('自动更新需要配置告警管理员 QQ');
+      throw invalidConfig('自动更新需要配置告警管理员 QQ');
     }
     if (
       next.allowAllWhenEmpty !== true
-      && !(next.allow?.private || []).map(String).includes(next.autoUpdate.ownerUin)
+      && !idList(next.allow?.private).includes(next.autoUpdate.ownerUin)
     ) {
-      throw new Error('自动更新管理员 QQ 必须同时加入私聊白名单');
+      throw invalidConfig('自动更新管理员 QQ 必须同时加入私聊白名单');
     }
   }
   const slangPilot = next.slangPilot || {};
@@ -1609,19 +2276,19 @@ export function updateConfig(patch) {
   };
   if (next.slangPilot.enabled) {
     const ownerUin = next.slangPilot.ownerUin;
-    if (!ownerUin) throw new Error('黑话语料库试点需要配置审批管理员 QQ');
+    if (!ownerUin) throw invalidConfig('黑话语料库试点需要配置审批管理员 QQ');
     if (
       next.allowAllWhenEmpty !== true
-      && !(next.allow?.private || []).map(String).includes(ownerUin)
+      && !idList(next.allow?.private).includes(ownerUin)
     ) {
-      throw new Error('黑话审批管理员 QQ 必须同时加入私聊白名单');
+      throw invalidConfig('黑话审批管理员 QQ 必须同时加入私聊白名单');
     }
   }
   if (!Number.isInteger(Number(next.server?.port)) || next.server.port < 1 || next.server.port > 65535) {
-    throw new Error('Invalid server port');
+    throw invalidConfig('Invalid server port');
   }
   if (!['127.0.0.1', 'localhost', '::1'].includes(next.server.host) && !String(next.server.token || '').trim()) {
-    throw new Error('A console token is required for LAN access');
+    throw invalidConfig('A console token is required for LAN access');
   }
   currentConfig = next;
 
@@ -1652,7 +2319,10 @@ export function updateConfig(patch) {
   };
 
   fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
-  const tmp = `${CONFIG_FILE}.tmp`;
+  // tmp 带 pid：与下面的防抖保存同口径 —— 两条路径可能同时触发保存，同名 tmp 会互相截断，
+  // 且对方先 rename 走之后本方 rename 会 ENOENT 把保存直接抛出去（控制台保存报 500）
+  //（2026-10-12 复审 P3：防抖那条加了 pid，这条主路径漏了）。
+  const tmp = `${CONFIG_FILE}.${process.pid}.tmp`;
   // flush：rename 之前先把数据落盘，否则断电后可能拿到"改名成功、内容为空"的 config.json
   // （进程被杀不受影响，只有真断电会中招；2026-09-29 审查 P2）
   fs.writeFileSync(tmp, JSON.stringify(currentConfig, null, 2), { mode: 0o600, flush: true });
@@ -1711,7 +2381,9 @@ export function scheduleConfigSave() {
   saveTimers.set('cfg', setTimeout(() => {
     try {
       fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
-      const tmp = `${CONFIG_FILE}.tmp`;
+      // tmp 带 pid：控制台与主进程可能同时触发保存，同名 tmp 会互相截断
+      //（另一处的用法是 rename 前被对方写坏；2026-10-12 审查）
+      const tmp = `${CONFIG_FILE}.${process.pid}.tmp`;
       // config.json 含模型 Key 与控制台 Token，防抖路径也必须锁 0600，
       // 否则 rename 会把 updateConfig 落好的 0600 打回 umask 默认（0664）
       fs.writeFileSync(tmp, JSON.stringify(getConfig(), null, 2), { mode: 0o600, flush: true });

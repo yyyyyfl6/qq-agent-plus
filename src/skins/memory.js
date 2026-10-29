@@ -4,7 +4,7 @@ import { MemoryStore } from '../memory/memory.js';
 import { bindGlobalMemoryStore } from '../memory/memory-runtime-integration.js';
 import { skinScope } from './context.js';
 
-const methods = ['getHandoff', 'setHandoff', 'clearHandoff', 'formatHandoffForPrompt', 'append', 'members', 'getMember', 'query', 'editMemberImpression', 'replaceMember', 'replaceMemberForConsolidation', 'adoptImpressions', 'removeMember', 'remove', 'clear', 'formatForPrompt', 'consolidationState', 'markConsolidated', 'replaceConsolidated'];
+const methods = ['search', 'privateHandoffs', 'sharedHandoffs', 'getHandoff', 'setHandoff', 'clearHandoff', 'formatHandoffForPrompt', 'append', 'members', 'getMember', 'query', 'editMemberImpression', 'replaceMember', 'replaceMemberForConsolidation', 'adoptImpressions', 'removeMember', 'remove', 'clear', 'formatForPrompt', 'consolidationState', 'markConsolidated', 'replaceConsolidated'];
 
 /** 记忆工具、Identity 注入、手工编辑和后台整合共用这一个路由入口。 */
 export class SkinMemoryStore {
@@ -78,6 +78,18 @@ export class SkinMemoryStore {
       }
     }
     fs.writeFileSync(path.join(root, '_skin_migrated.json'), JSON.stringify({ version: 1, chatKey, skinId, at: Date.now(), originalPreserved: true }), { mode: 0o600, flush: true });
+  }
+  stats() {
+    const key = skinScope()?.chatKey;
+    return (key ? this.forChat(key) : this.legacy).stats();
+  }
+  maybePrune(now) {
+    this.legacy.maybePrune(now);
+    for (const store of this.stores.values()) store.maybePrune(now);
+  }
+  close() {
+    this.legacy.close();
+    for (const store of this.stores.values()) store.close();
   }
   listChats() {
     if (!this.skins.enabled) return this.legacy.listChats();

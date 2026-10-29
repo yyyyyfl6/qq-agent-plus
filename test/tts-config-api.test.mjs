@@ -79,4 +79,136 @@ test('自建网关的 Key 存进 keys.custom，运行时也按 custom 取；/api
   });
   assert.match(calls[0].url, /^https:\/\/my-gw\.example\/v1\/audio\/speech$/);
   assert.equal(calls[0].auth, 'Bearer sk-selfhosted');
+
+  // 4) 切到自定义且地址为空：不能把这次保存归到上一家（voice/Key 都会存错）
+  const emptyCustom = await request('/api/config', {
+    method: 'POST',
+    body: {
+      tts: {
+        enabled: true, service: 'custom', provider: 'openai', baseUrl: '',
+        model: 'custom-model', voice: 'custom-voice', apiKeyInput: 'sk-custom-empty'
+      }
+    }
+  });
+  assert.equal(emptyCustom.status, 200, JSON.stringify(emptyCustom.body));
+  assert.equal(getConfig().tts.voices.custom, 'custom-voice');
+  assert.equal(getConfig().tts.keys.custom, 'sk-custom-empty');
+});
+
+test('TTS 单槽 Key 的归属：切到没存过 Key 的服务会清掉它，切回来能用自己那把（2026-10-03）', async (t) => {
+  const port = await freePort();
+  const cfg = structuredClone(DEFAULT_CONFIG);
+  cfg.server = { ...cfg.server, host: '127.0.0.1', port, token: '' };
+  cfg.runtime.mode = 'observe';
+  cfg.onebot.wsUrl = 'ws://127.0.0.1:1';
+  cfg.onebot.httpUrl = 'ws://127.0.0.1:1';
+  // 老配置形态：单槽 apiKey（归当前这家），keys 映射为空
+  cfg.tts = { ...cfg.tts, enabled: true, provider: 'openai', baseUrl: 'https://api.siliconflow.cn/v1', apiKey: 'SK-SILICON' };
+  updateConfig(cfg);
+  const app = createApp({ log: () => {} });
+  t.after(async () => { await app.stop(); fs.rmSync(root, { recursive: true, force: true }); });
+  await app.start();
+  const request = async (route, { method = 'GET', body } = {}) => {
+    const response = await fetch(`http://127.0.0.1:${port}${route}`, {
+      method, headers: { 'content-type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body)
+    });
+    return { status: response.status, body: await response.json() };
+  };
+  const { ttsKeyFor, ttsServiceOf } = await import('../src/llm/tts-presets.js');
+  const { getConfig: live } = await import('../src/core/config.js');
+
+  // 切到豆包（这家的 keys 里没有记录）、Key 框留空 → 单槽那把必须被清掉（不能发给豆包）
+  let res = await request('/api/config', {
+    method: 'POST',
+    body: { tts: { enabled: true, provider: 'doubao', baseUrl: 'https://openspeech.bytedance.com/api/v3/tts/unidirectional', apiKeyInput: '' } }
+  });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  let now = live().tts;
+  assert.equal(String(now.apiKey || ''), '', '不沿用上一家的单槽 Key（宁可显示未填）');
+  assert.equal(ttsKeyFor(now, 'doubao'), '', '豆包拿不到硅基流动那把');
+  assert.equal(String(now.apiKeyService || ''), '', '活动槽的归属一并清掉');
+  // ⚠️ 但那把 Key 不能凭空消失（2026-10-03 复审）：存量实例的 Key 只存在于 tts.apiKey 一个字段里
+  //（keys 映射是控制台从 2026-09-29 起才写的），直接清空 = 永久丢失、控制台也找不回来。
+  assert.equal(now.keys?.siliconflow, 'SK-SILICON', '切走前要归档进原归属的槽位（切回去能自动填回）');
+
+  // 切回硅基流动并填上 → 归属记住；之后"什么都不填"地保存也不能丢
+  res = await request('/api/config', {
+    method: 'POST',
+    body: { tts: { enabled: true, provider: 'openai', baseUrl: 'https://api.siliconflow.cn/v1', model: 'FunAudioLLM/CosyVoice2-0.5B', apiKeyInput: 'SK-NEW-SILICON' } }
+  });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  now = live().tts;
+  assert.equal(now.apiKeyService, 'siliconflow', '新填的 Key 归属记在这一家');
+  assert.equal(ttsKeyFor(now, 'siliconflow'), 'SK-NEW-SILICON');
+  assert.equal(ttsKeyFor(now, 'doubao'), '', '别家仍然拿不到');
+
+  // 无关的一次保存（没碰 Key）不能把归属或 Key 弄丢
+  res = await request('/api/config', { method: 'POST', body: { tts: { enabled: true, voice: 'claude' } } });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  now = live().tts;
+  assert.equal(ttsKeyFor(now, 'siliconflow'), 'SK-NEW-SILICON', '空/掩码 = 保持原值');
+  assert.ok(ttsServiceOf(now), '服务识别不受影响');
+  // 不重新填 Key、直接切回硅基流动 → 归档的那把自动回来了（这一段是"不丢数据"的正面断言）
+  res = await request('/api/config', {
+    method: 'POST',
+    body: { tts: { enabled: true, provider: 'openai', baseUrl: 'https://api.siliconflow.cn/v1', model: 'FunAudioLLM/CosyVoice2-0.5B' } }
+  });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(ttsKeyFor(live().tts, 'siliconflow'), 'SK-NEW-SILICON', '切回原服务不用重填（用的是映射里那把）');
+
+  // ② 客户端直接送归属钉 → 被忽略（归属只由服务端按本次提交算）
+  res = await request('/api/config', {
+    method: 'POST',
+    body: { tts: { enabled: true, provider: 'doubao', baseUrl: 'https://openspeech.bytedance.com/api/v3/tts/unidirectional', apiKeyService: 'doubao' } }
+  });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.notEqual(String(live().tts.apiKeyService || ''), 'doubao',
+    '客户端送的归属钉不能生效（否则能把别家的旧 Key 改绑给当前这家）');
+
+  // ③ 音色按服务记住：切到另一家再切回来，原音色不能被上一家的覆盖
+  res = await request('/api/config', {
+    method: 'POST',
+    body: {
+      tts: {
+        enabled: true, provider: 'doubao',
+        baseUrl: 'https://openspeech.bytedance.com/api/v3/tts/unidirectional',
+        voice: 'ICL_TEST_DOUBAO'
+      }
+    }
+  });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(live().tts.voices.doubao, 'ICL_TEST_DOUBAO');
+
+  res = await request('/api/config', {
+    method: 'POST',
+    body: {
+      tts: {
+        enabled: true, provider: 'mimo',
+        baseUrl: 'https://token-plan-cn.xiaomimimo.com/v1',
+        model: 'mimo-v2.5-tts', voice: 'Chloe'
+      }
+    }
+  });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(live().tts.voices.doubao, 'ICL_TEST_DOUBAO', '切到 MiMo 不能冲掉豆包的音色记忆');
+  assert.equal(live().tts.voices.mimo, 'Chloe');
+
+  res = await request('/api/config', {
+    method: 'POST',
+    body: {
+      tts: {
+        enabled: true, provider: 'doubao',
+        baseUrl: 'https://openspeech.bytedance.com/api/v3/tts/unidirectional',
+        voice: live().tts.voices.doubao
+      }
+    }
+  });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(live().tts.voice, 'ICL_TEST_DOUBAO', '切回豆包要恢复它自己的音色，不是 MiMo 的 Chloe');
+  assert.equal(live().tts.voices.doubao, 'ICL_TEST_DOUBAO');
+  assert.equal(live().tts.voices.mimo, 'Chloe');
+  const view = await request('/api/config');
+  assert.equal(view.body.tts.voices.doubao, 'ICL_TEST_DOUBAO', 'voices 要下发给控制台用于切换恢复');
+  assert.equal(view.body.tts.voices.mimo, 'Chloe');
 });

@@ -15,6 +15,10 @@ try {
 const snowlumaWebuiUrl = String(
   process.env.QQ_SNOWLUMA_WEBUI_URL || previous.snowlumaWebuiUrl || ''
 ).trim();
+// 协议端更新器据此探测宿主端口；自定义 --snowluma-port 时必须写进 unit。
+const webuiPort = String(
+  process.env.QQ_AGENT_WEBUI_PORT || previous.webuiPort || ''
+).trim();
 // 记下监听地址：deploy.sh 在未显式传 --host/--port 时用它沿用以外的值，避免更新把控制台
 // 改成只监听本机。
 const host = String(process.env.QQ_HOST || previous.host || '').trim();
@@ -49,7 +53,7 @@ Type=simple
 WorkingDirectory=${root}
 Environment=${quote(`QQ_AGENT_DATA_DIR=${data}`)}
 Environment=NODE_ENV=production
-${snowlumaWebuiUrl ? `Environment=${quote(`SNOWLUMA_WEBUI_URL=${snowlumaWebuiUrl}`)}\n` : ''}ExecStart=${quote(node)} ${quote(path.join(root, 'src/server.js'))}
+${snowlumaWebuiUrl ? `Environment=${quote(`SNOWLUMA_WEBUI_URL=${snowlumaWebuiUrl}`)}\n` : ''}${webuiPort ? `Environment=${quote(`QQ_AGENT_WEBUI_PORT=${webuiPort}`)}\n` : ''}ExecStart=${quote(node)} ${quote(path.join(root, 'src/server.js'))}
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
@@ -70,8 +74,8 @@ Type=oneshot
 WorkingDirectory=${root}
 Environment=${quote(`QQ_AGENT_DATA_DIR=${data}`)}
 Environment=NODE_ENV=production
-ExecStart=${quote(node)} ${quote(path.join(root, 'scripts/auto-update.mjs'))} --app-dir ${quote(root)} --data-dir ${quote(data)} --service ${quote(service)}
-TimeoutStartSec=75min
+${webuiPort ? `Environment=${quote(`QQ_AGENT_WEBUI_PORT=${webuiPort}`)}\n` : ''}ExecStart=${quote(node)} ${quote(path.join(root, 'scripts/auto-update.mjs'))} --app-dir ${quote(root)} --data-dir ${quote(data)} --service ${quote(service)}
+TimeoutStartSec=240min
 TimeoutStopSec=10min
 UMask=0077
 NoNewPrivileges=true
@@ -104,7 +108,8 @@ fs.writeFileSync(deploymentFile, JSON.stringify({
   updateService,
   repository,
   branch,
-  ...(snowlumaWebuiUrl ? { snowlumaWebuiUrl } : {})
+  ...(snowlumaWebuiUrl ? { snowlumaWebuiUrl } : {}),
+  ...(webuiPort ? { webuiPort } : {})
 }), { mode: 0o600 });
 fs.writeFileSync(path.join(root, '.deployment-node'), `${node}\n`, { mode: 0o600 });
 console.log(`Installed ${service}.service and ${updateService}.timer`);

@@ -8,6 +8,7 @@ import { normalizeSkins } from '../skins/skins.js';
 // automated slang research is retired, and admin.ownerUin is the sole
 // administrator configuration source.
 import * as legacy from './config-legacy.js';
+import { idList } from './list.js';
 import {
   ASR_DEFAULT_PROVIDER, ASR_PROVIDERS,
   asrLocalModel, findWhisperBinSync
@@ -71,7 +72,7 @@ function ensureAdminPrivateAccess(patch, current, ownerUin) {
 
   const requestedAllow = Array.isArray(patch.allow?.private)
     ? patch.allow.private.map(String)
-    : (current.allow?.private || []).map(String);
+    : idList(current.allow?.private);
   patch.allow = {
     ...(patch.allow || {}),
     private: [...new Set([...requestedAllow, ownerUin])]
@@ -79,7 +80,7 @@ function ensureAdminPrivateAccess(patch, current, ownerUin) {
 
   const requestedDeny = Array.isArray(patch.deny?.private)
     ? patch.deny.private.map(String)
-    : (current.deny?.private || []).map(String);
+    : idList(current.deny?.private);
   patch.deny = {
     ...(patch.deny || {}),
     private: requestedDeny.filter((uin) => uin !== ownerUin)

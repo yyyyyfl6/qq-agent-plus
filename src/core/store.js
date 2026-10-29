@@ -8,12 +8,15 @@ import { safeSlice } from './util.js';
 
 function entry(row) {
   if (!row) return null;
+  let reply = null;
+  // reply 是历史里写入的 JSON 文本：一行坏数据不应该让整个会话读取抛错（threadEntry 同款护栏）
+  if (row.reply) { try { reply = JSON.parse(row.reply); } catch { reply = null; } }
   const { skin_id: _skinId, ...legacyRow } = row;
-  legacyRow.chat_key = logicalChatKey(legacyRow.chat_key);
+  legacyRow.chat_key = logicalChatKey(row.chat_key);
   return {
-    ...legacyRow, senderId: row.sender_id, senderName: row.sender_name,
+    ...legacyRow, chatKey: logicalChatKey(row.chat_key), senderId: row.sender_id, senderName: row.sender_name,
     self: !!row.self, read: row.state === 'acked',
-    reply: row.reply ? JSON.parse(row.reply) : null,
+    reply,
     media: JSON.parse(row.media || '[]'),
     mentionsSelf: Boolean(row.mentions_self),
     targetUserId: String(row.target_user_id || ''),
@@ -64,8 +67,14 @@ function normalizeMid(value) {
   return String(value ?? '').trim().replace(/^(?:#+|collected_)+/, '').trim();
 }
 
+// WAL 下 synchronous=NORMAL 仍然保证崩溃一致性，只是掉电可能丢最近几条提交；
+// 默认 FULL 保持原口径，磁盘 IOPS 紧张时由 store.sqliteSynchronous 切到 NORMAL（Issue #45）。
+function normalizeSynchronous(value) {
+  return String(value || '').toUpperCase() === 'NORMAL' ? 'NORMAL' : 'FULL';
+}
+
 export class ChatStore {
-  constructor(maxPerChat = 0, { dataDir = DATA_DIR, filename } = {}) {
+  constructor(maxPerChat = 0, { dataDir = DATA_DIR, filename, synchronous = 'FULL' } = {}) {
     this.maxPerChat = Math.max(0, Number(maxPerChat) || 0);
     this.transactionDepth = 0;
     fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
@@ -80,7 +89,7 @@ export class ChatStore {
     // 对本库走一致性快照）；busy_timeout/foreign_keys 由 core/sqlite.js 统一设置
     this.db.exec(`
       PRAGMA journal_mode=WAL;
-      PRAGMA synchronous=FULL;
+      PRAGMA synchronous=${normalizeSynchronous(synchronous)};
       CREATE TABLE IF NOT EXISTS chats (chat_key TEXT PRIMARY KEY, next_id INTEGER NOT NULL DEFAULT 1);
       CREATE TABLE IF NOT EXISTS messages (
         chat_key TEXT NOT NULL, id INTEGER NOT NULL, mid TEXT, ts INTEGER NOT NULL,
@@ -94,15 +103,30 @@ export class ChatStore {
         PRIMARY KEY (chat_key, id), UNIQUE (chat_key, mid)
       );
       CREATE INDEX IF NOT EXISTS messages_pending ON messages(chat_key, state, available_at, id);
+      -- getChatMeta 在每条入站消息和 5 秒 tick 上都会跑；failed/held 用更窄的 partial
+      -- 索引，避免每次计数都扫整段会话历史。
+      CREATE INDEX IF NOT EXISTS messages_failed ON messages(chat_key) WHERE state='failed';
+      CREATE INDEX IF NOT EXISTS messages_held ON messages(chat_key) WHERE state='held';
+      -- getChatMeta 取"最新一条"按 ts 排序（历史导入的 ts 可能乱序）；没有这个索引
+      -- 时 SQLite 要对整个会话做临时排序。
+      CREATE INDEX IF NOT EXISTS messages_chat_ts ON messages(chat_key, ts DESC, id DESC);
+      -- 群聊/私聊共用上下文按 ts 跨会话取最新 N 条；不加这条会每次唤醒全表扫描 + 排序
+      -- （messages_chat_ts 以 chat_key 开头，跨会话的 ORDER BY ts 用不上）。
+      CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts DESC, id DESC);
       CREATE TABLE IF NOT EXISTS runs (
         id TEXT PRIMARY KEY, chat_key TEXT NOT NULL, state TEXT NOT NULL,
         expires_at INTEGER NOT NULL, error TEXT
       );
       CREATE UNIQUE INDEX IF NOT EXISTS one_lease_per_chat ON runs(chat_key) WHERE state='leased';
+      -- 5 秒一次的 recoverExpired 全表扫（state='leased' AND expires_at<=?）：没有这个索引
+      -- 时随 runs 行数线性变慢，而 runs 是全仓唯一没有回收纪律的账本（2026-10-07 复审）。
+      CREATE INDEX IF NOT EXISTS runs_leased_expiry ON runs(state, expires_at);
       CREATE TABLE IF NOT EXISTS outbox (
         id TEXT PRIMARY KEY, run_id TEXT, chat_key TEXT NOT NULL,
         state TEXT NOT NULL, payload TEXT NOT NULL, message_id TEXT, error TEXT
       );
+      -- getChatMeta 每 5 秒扫 outbox(chat_key,state)；没有索引会随历史行线性变慢。
+      CREATE INDEX IF NOT EXISTS outbox_chat_state ON outbox(chat_key, state);
       CREATE TABLE IF NOT EXISTS conversation_threads (
         chat_key TEXT PRIMARY KEY, thread_id TEXT NOT NULL,
         mode TEXT NOT NULL DEFAULT 'threaded', state TEXT NOT NULL,
@@ -149,6 +173,32 @@ export class ChatStore {
     ensureColumn(this.db, 'messages', 'mentions_self', 'INTEGER NOT NULL DEFAULT 0');
     ensureColumn(this.db, 'messages', 'target_user_id', "TEXT NOT NULL DEFAULT ''");
     ensureColumn(this.db, 'messages', 'event_kind', "TEXT NOT NULL DEFAULT 'message'");
+    // getChatMeta 的 total 不能再用 COUNT(*) 扫全历史（每条入站消息 + 5 秒 tick 都调），
+    // 但也不能用 next_id-1：保留期清理会删掉旧行，那样会虚报"还有 N 条没加载"。
+    // 维护一个随插入/清理增减的计数，老库首次启动按现有行数回填一次。
+    // 两进程同时首启时 ALTER/标记都可能撞车：ALTER 的 duplicate column 视为已加，
+    // 标记与回填放进同一个 BEGIN IMMEDIATE，避免一个进程先写标记、另一个读到 0。
+    try {
+      ensureColumn(this.db, 'chats', 'message_count', 'INTEGER NOT NULL DEFAULT 0');
+    } catch (error) {
+      if (!/duplicate column name/i.test(String(error?.message || ''))) throw error;
+    }
+    this.#transaction(() => {
+      const claimed = this.db.prepare(
+        "INSERT OR IGNORE INTO migrations(name) VALUES ('chats_message_count')"
+      ).run();
+      if (!Number(claimed?.changes)) return;
+      this.db.exec(`UPDATE chats SET message_count=(
+        SELECT COUNT(*) FROM messages WHERE messages.chat_key=chats.chat_key)`);
+    });
+    // runs 是全仓唯一没有回收纪律的账本（每次带租约的运行 +1，常驻不删，5 秒全表扫）：
+    // 进程启动时清掉终态且早已过期的行。expires_at 记的是"租约到期时刻"，用它当近似创建时间，
+    // 90 天前的终态行已无诊断价值（2026-10-07 复审 P3）。
+    // ⚠️ 2026-10-09 审查：原先只有这一次启动清理 —— 服务连跑数月不重启就等于永不清理
+    //（与三个台账踩过同一个坑，a465539 修了它们却漏了本表）。清理由 pruneRuns() 承担，
+    // 常驻期间由 console 的每日保留期调度复用同一方法（retentionPruneTargets）。
+    this.pruneRuns();
+    this.pruneOutbox();
     this.#importJson(dataDir);
   }
 
@@ -166,15 +216,21 @@ export class ChatStore {
     if (this.transactionDepth > 0) return fn();
     this.db.exec('BEGIN IMMEDIATE');
     this.transactionDepth += 1;
+    let committed = false;
     try {
       const result = fn();
       this.db.exec('COMMIT');
+      committed = true;
       return result;
     } catch (error) {
-      this.db.exec('ROLLBACK');
+      // 回滚失败（COMMIT 已抛出 / 连接坏了）不能把原始错误吞掉：附在 cause 上再抛原错误
+      //（2026-10-12 审查：原先裸 ROLLBACK 抛出会顶替掉真正的失败原因）。
+      if (!committed) {
+        try { this.db.exec('ROLLBACK'); } catch (rollbackError) { error.cause ??= rollbackError; }
+      }
       throw error;
     } finally {
-      this.transactionDepth = 0;
+      this.transactionDepth -= 1;
     }
   }
 
@@ -238,12 +294,16 @@ export class ChatStore {
       const skinId = chatKey.match(/\/skin\/([^/]+)$/)?.[1] || this.skinManager.legacySkin;
       this.db.prepare('UPDATE messages SET skin_id=? WHERE chat_key=? AND id=?').run(skinId, chatKey, id);
     }
-    this.db.prepare('UPDATE chats SET next_id=next_id+1 WHERE chat_key=?').run(chatKey);
+    this.db.prepare('UPDATE chats SET next_id=next_id+1, message_count=message_count+1 WHERE chat_key=?').run(chatKey);
     if (this.maxPerChat > 0) {
       // Retention must never evict unprocessed or uncertain messages.
-      this.db.prepare(`DELETE FROM messages WHERE chat_key=? AND state='acked' AND id <
+      const removed = this.db.prepare(`DELETE FROM messages WHERE chat_key=? AND state='acked' AND id <
         COALESCE((SELECT id FROM messages WHERE chat_key=? ORDER BY id DESC LIMIT 1 OFFSET ?),0)`)
         .run(chatKey, chatKey, this.maxPerChat - 1);
+      if (removed.changes) {
+        this.db.prepare('UPDATE chats SET message_count=MAX(0, message_count-?) WHERE chat_key=?')
+          .run(Number(removed.changes), chatKey);
+      }
     }
     return entry(this.db.prepare('SELECT * FROM messages WHERE chat_key=? AND id=?').get(chatKey, id));
   }
@@ -263,6 +323,45 @@ export class ChatStore {
   }
 
   setMaxPerChat(cap) { this.maxPerChat = Math.max(0, Number(cap) || 0); }
+
+  /** 控制台保存后即时生效；正在进行的写入不受影响（PRAGMA 对后续事务生效）。 */
+  setSynchronous(mode) {
+    this.db.exec(`PRAGMA synchronous=${normalizeSynchronous(mode)}`);
+  }
+
+
+  /** 发送 outbox 的各状态计数（低基数，控制台 /api/metrics 用）。 */
+  outboxStats() {
+    const rows = this.db.prepare('SELECT state, COUNT(*) AS n FROM outbox GROUP BY state').all();
+    const byState = {};
+    let total = 0;
+    for (const row of rows) {
+      const state = String(row?.state || 'unknown');
+      const count = Number(row.n) || 0;
+      byState[state] = count;
+      total += count;
+    }
+    return { total, byState };
+  }
+
+  /** 入站处理队列的低基数计数与最老一条的年龄（控制台 /api/metrics 用）。 */
+  queueStats() {
+    const rows = this.db.prepare(`SELECT state, COUNT(*) AS n, MIN(ts) AS oldest
+      FROM messages WHERE state IN ('pending','leased','held') GROUP BY state`).all();
+    const byState = { pending: 0, leased: 0, held: 0 };
+    let oldestAt = 0;
+    for (const row of rows) {
+      const state = String(row?.state || '');
+      if (Object.hasOwn(byState, state)) byState[state] = Number(row.n) || 0;
+      const oldest = Number(row?.oldest) || 0;
+      if (oldest && (!oldestAt || oldest < oldestAt)) oldestAt = oldest;
+    }
+    return {
+      byState,
+      oldestAt,
+      oldestAgeMs: oldestAt ? Math.max(0, Date.now() - oldestAt) : 0
+    };
+  }
   listChats() {
     const keys = this.db.prepare('SELECT chat_key FROM chats ORDER BY chat_key').all().map((r) => r.chat_key);
     return [...new Set(keys.filter((key) => this.skinManager?.enabled || !key.includes('/skin/')).map(logicalChatKey))];
@@ -271,17 +370,19 @@ export class ChatStore {
 
   getChatMeta(chatKey) {
     chatKey = this.resolveChatKey(chatKey);
-    const counts = this.db.prepare(`SELECT COUNT(*) AS total,
-      COALESCE(SUM(state IN ('pending','leased')),0) AS unread,
-      COALESCE(SUM(state='failed'),0) AS failed,
-      COALESCE(SUM(state='held'),0) AS heldMessages FROM messages WHERE chat_key=?`).get(chatKey);
+    // total 走 chats 上维护的计数（插入/保留期清理同步增减），不再对整段历史做 COUNT(*)；
+    // 其余状态各走自己的窄索引。这个函数在每条入站消息和 5 秒 tick 上都会调用。
+    const total = Number(this.db.prepare('SELECT message_count FROM chats WHERE chat_key=?').get(chatKey)?.message_count) || 0;
+    const unread = Number(this.db.prepare("SELECT COUNT(*) AS n FROM messages WHERE chat_key=? AND state IN ('pending','leased')").get(chatKey)?.n) || 0;
+    const failed = Number(this.db.prepare("SELECT COUNT(*) AS n FROM messages WHERE chat_key=? AND state='failed'").get(chatKey)?.n) || 0;
+    const heldMessages = Number(this.db.prepare("SELECT COUNT(*) AS n FROM messages WHERE chat_key=? AND state='held'").get(chatKey)?.n) || 0;
+    const counts = { total, unread, failed };
     const uncertain = this.db.prepare(`SELECT COUNT(DISTINCT COALESCE(run_id,id)) AS held
       FROM outbox WHERE chat_key=? AND state IN ('sending','unknown')`).get(chatKey).held;
-    const last = this.db.prepare('SELECT ts,text FROM messages WHERE chat_key=? ORDER BY id DESC LIMIT 1').get(chatKey);
+    const last = this.db.prepare('SELECT ts,text FROM messages WHERE chat_key=? ORDER BY ts DESC, id DESC LIMIT 1').get(chatKey);
     const thread = this.getConversationThread(chatKey);
-    const { heldMessages, ...rest } = counts;
     return {
-      chatKey: logicalChatKey(chatKey), ...rest, held: Math.max(Number(heldMessages) || 0, Number(uncertain) || 0),
+      chatKey: logicalChatKey(chatKey), ...counts, held: Math.max(Number(heldMessages) || 0, Number(uncertain) || 0),
       lastTs: last?.ts || 0, lastText: last?.text || '',
       thread: thread ? {
         threadId: thread.threadId,
@@ -429,10 +530,71 @@ export class ChatStore {
     });
   }
 
-  recoverExpired(now = Date.now()) {
+  /**
+   * 回收「过期且没交回」的租约：硬崩溃/SIGKILL 留下的残行，以及执行真的卡死超过租约的情况。
+   *
+   * `live`＝本进程此刻仍在执行的那些租约 id，**必须排除**。理由：租约是 runTimeoutMs+60s，
+   * 而那句 `setTimeout(() => controller.abort(...))` 只有在下一个 `signal.throwIfAborted()`
+   * 检查点才生效 —— 执行卡在一个不响应 abort 的 await 里（工具内没有 signal 的长网络/转码）时，
+   * 租约会先到期。此时回收会以 hasEffects()==false 把消息放回 pending、把 run 置 failed，
+   * 可那个执行还活着：它稍后照样把消息发出去，收尾的 ackLease/failLease 因为 state 已不是
+   * 'leased' 而 0 行生效 —— 同一个批次于是留在 pending，被下一个 drain 再处理一遍（重复回复）。
+   * 把「还在跑的」留给它自己的收尾路径处理，才不会有这个窗口（2026-10-09 全面审查）。
+   */
+  recoverExpired(now = Date.now(), { live = null } = {}) {
     const runs = this.db.prepare("SELECT id FROM runs WHERE state='leased' AND expires_at<=?").all(now);
-    for (const run of runs) this.failLease(run.id, 'Lease expired or process interrupted', { delayMs: 0 });
-    return runs.length;
+    let recovered = 0;
+    for (const run of runs) {
+      if (live && live.has(run.id)) continue;
+      this.failLease(run.id, 'Lease expired or process interrupted', { delayMs: 0 });
+      recovered += 1;
+    }
+    return recovered;
+  }
+
+  /**
+   * 清掉终态且早已过期的运行行（expires_at 当创建时间的近似；leased 行不归保留期管）。
+   * 启动时清一次，之后由每日保留期调度复用（console/app.js 的 retentionPruneTargets）——
+   * 只清一次等于永不清理（2026-10-09 审查，与三个台账同一教训）。
+   * 清理失败不影响调用方（启动路径与每日调度都不该被它拖住）。
+   * @param {number} retentionDays 保留天数（默认 90，与启动清理的旧口径一致）
+   * @returns {number} 实际删除的行数
+   */
+  pruneRuns(retentionDays = 90) {
+    const days = Math.max(1, Number(retentionDays) || 90);
+    try {
+      const result = this.db.prepare("DELETE FROM runs WHERE state != 'leased' AND expires_at <= ?")
+        .run(Date.now() - days * 24 * 3600 * 1000);
+      return Number(result?.changes) || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * 清掉无 runId 的终态 outbox 行（插件 send、群游戏、日报、额度提示都不带 runId）。
+   * 这些行没有"运行收尾按 run_id 删"的回收路径；不设上限会无界增长（含消息正文）。
+   * 保留最近 keep 条，按 rowid 倒序；启动与每日保留期调度都会调用。
+   * @returns {number} 实际删除的行数
+   */
+  pruneOutbox({ keep = 2000 } = {}) {
+    const limit = Math.max(1, Number(keep) || 2000);
+    const terminal = "state IN ('sent','failed','reconciled_sent','reconciled_failed')";
+    try {
+      const result = this.db.prepare(`DELETE FROM outbox
+        WHERE (run_id IS NULL OR run_id='') AND ${terminal}
+          AND rowid NOT IN (
+            SELECT rowid FROM outbox WHERE (run_id IS NULL OR run_id='') AND ${terminal}
+            ORDER BY rowid DESC LIMIT ?
+          )`).run(limit);
+      // runs 保留期清理后，带 run_id 的终态 outbox 行会变成孤儿；它们没有别的回收路径。
+      const orphan = this.db.prepare(`DELETE FROM outbox
+        WHERE run_id IS NOT NULL AND run_id != '' AND ${terminal}
+          AND run_id NOT IN (SELECT id FROM runs)`).run();
+      return (Number(result?.changes) || 0) + (Number(orphan?.changes) || 0);
+    } catch {
+      return 0;
+    }
   }
 
   retryFailed(chatKey) {
@@ -446,13 +608,28 @@ export class ChatStore {
     chatKey = this.resolveChatKey(chatKey);
     return this.#transaction(() => {
       const messages = this.db.prepare("UPDATE messages SET state='acked' WHERE chat_key=? AND state='held'").run(chatKey).changes;
-      const outbox = this.db.prepare(`DELETE FROM outbox
-        WHERE chat_key=? AND state IN ('sending','unknown')`).run(chatKey).changes;
-      // 已核对过的终态行不在上面那条里，一并清掉（不然它们永久留在库里）。
-      this.db.prepare(`DELETE FROM outbox
-        WHERE chat_key=? AND state IN ('reconciled_sent','reconciled_failed')`).run(chatKey);
+      // ⚠️ 'sending'/'unknown'/'sent' 都是 failLease 里 hasEffects 的判据：按 chat_key
+      // 无差别删，正在运行租约的在途证据也被清掉，该运行随后可重试收尾时
+      // hasEffects=false → 整批消息回 pending 重跑，群里重复发言（2026-10-04 复审 P1/P2）。
+      // ⚠️ 但只按 `runs` 里的终态行取交集也不行：**主动唤醒没有 runs 行**（#wake 里
+      // proactive → lease=null，runId 是合成值），它的 unknown 残骸 run_id 在 runs 里
+      // 根本不存在，永远清不掉、控制台一直显示"待核对"
+      //（delivery-integration「无输入租约的主动发送」用例钉的就是这个）。
+      // 口径：按 chat_key 清残骸（含 never-acked 的 'sent'/'failed' —— 正常收尾由 ackLease
+      // 删它们，租约从未 ack 的那些只剩这一条清理路径，不清就永久累积成残骸，复审 P3），
+      // 但**排除仍在途的租约**（runs 里非终态的行）；run_id 为空的（从未绑过租约）
+      // 没有可保护的在途证据，一并清。
+      const outbox = this.db.prepare(`DELETE FROM outbox WHERE chat_key=?
+        AND state IN ('sending','unknown','sent','failed','reconciled_sent','reconciled_failed')
+        AND (run_id IS NULL OR run_id NOT IN (
+          SELECT id FROM runs WHERE chat_key=? AND state NOT IN ('held','failed','acked')))`)
+        .run(String(chatKey || ''), String(chatKey || '')).changes;
       this.db.prepare("UPDATE runs SET state='acked' WHERE chat_key=? AND state='held'").run(chatKey);
-      return Math.max(messages, outbox);
+      // 「核对 N 条」的 N：held 消息是主项；终态残骸只在**没有** held 消息时才作为计数
+      //（求和会把"1 条消息 + 它自己的 outbox 记账行"算成 2，store.test.mjs 钉的就是这个）。
+      // 只用 Math.max(messages, outbox) 的旧行为在"只剩 sent/reconciled 残骸"时报 0，
+      // 控制台显示"核对 0 条"（2026-10-04 复审 P3）。
+      return messages > 0 ? messages : outbox;
     });
   }
 
@@ -949,15 +1126,56 @@ export class ChatStore {
     };
   }
 
-  recent(chatKey, { limit = 80, offset = 0, includeSelf = true, readOnly = false, afterId = 0 } = {}) {
+  recent(chatKey, { limit = 80, offset = 0, includeSelf = true, readOnly = false, afterId = 0, beforeId = 0, scope = 'chat' } = {}) {
     chatKey = this.resolveChatKey(chatKey);
-    // afterId：只取 id 更大的消息（增量消费）。固定"最新 N 条"的窗口在积压超过 N 时
-    // 会静默丢掉最老的那些——游戏 tick 丢的就是票（2026-09-29 审查 P2）
-    return this.db.prepare(`SELECT * FROM messages WHERE chat_key=? ${includeSelf ? '' : 'AND self=0'}
-      ${readOnly ? "AND state='acked'" : ''}
-      ${Number(afterId) > 0 ? 'AND id > ?' : ''}
+    // afterId：增量消费按 id **升序**取"游标之后最早的一批"；积压超过 limit 时下一轮继续，
+    // 不能按 DESC 取最新 N 条再 reverse —— 那会把落在窗口外的最老消息静默跳过（游戏丢票）。
+    // beforeId：控制台向上翻页，取"比这个 id 更老的最新 N 条"，仍按时间正序返回。
+    // 非增量调用仍保持"最新 N 条、按时间正序返回"的既有语义。
+    // scope='private'：只给"私聊共享上下文"用，读所有 private:*，按 ts 排序（跨会话没有可比 id）。
+    // scope='all'：群聊与私聊共用上下文（issue #14 第二项），读所有会话，同样按 ts 排序。
+    const after = Number(afterId) > 0 ? Number(afterId) : 0;
+    const before = !after && Number(beforeId) > 0 ? Number(beforeId) : 0;
+    const skinId = this.skinManager?.enabled ? this.skinManager.current(logicalChatKey(chatKey)).id : '';
+    const skinFilter = skinId ? `AND skin_id='${skinId}'` : "AND chat_key NOT LIKE '%/skin/%'";
+    const filters = `${includeSelf ? '' : 'AND self=0'} ${readOnly ? "AND state='acked'" : ''}`;
+    if (scope === 'private' && String(chatKey || '').startsWith('private:')) {
+      const rows = this.db.prepare(`SELECT * FROM messages WHERE chat_key LIKE 'private:%' ${filters} ${skinFilter}
+        ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?`)
+        .all(Math.max(1, Number(limit) || 1), Math.max(0, Number(offset) || 0));
+      return rows.reverse().map(entry);
+    }
+    if (scope === 'all') {
+      const rows = this.db.prepare(`SELECT * FROM messages WHERE 1=1 ${filters} ${skinFilter}
+        ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?`)
+        .all(Math.max(1, Number(limit) || 1), Math.max(0, Number(offset) || 0));
+      return rows.reverse().map(entry);
+    }
+    if (after) {
+      const rows = this.db.prepare(`SELECT * FROM messages WHERE chat_key=? ${filters}
+        AND id > ? ORDER BY id ASC LIMIT ?`)
+        .all(chatKey, after, Math.max(1, Number(limit) || 1));
+      return rows.map(entry);
+    }
+    if (before) {
+      const rows = this.db.prepare(`SELECT * FROM messages WHERE chat_key=? ${filters}
+        AND id < ? ORDER BY id DESC LIMIT ?`)
+        .all(chatKey, before, Math.max(1, Number(limit) || 1));
+      return rows.reverse().map(entry);
+    }
+    const rows = this.db.prepare(`SELECT * FROM messages WHERE chat_key=? ${filters}
       ORDER BY id DESC LIMIT ? OFFSET ?`)
-      .all(chatKey, ...(Number(afterId) > 0 ? [Number(afterId)] : []), Math.max(1, Number(limit) || 1), Math.max(0, Number(offset) || 0)).reverse().map(entry);
+      .all(chatKey, Math.max(1, Number(limit) || 1), Math.max(0, Number(offset) || 0));
+    return rows.reverse().map(entry);
+  }
+
+  /**
+   * 该会话在 ts 之后有没有自己的消息落库。
+   * 提醒确认用它而不是"最新 N 条里翻"：唤醒期间涌入的消息可以把刚发出的自述挤出窗口。
+   */
+  hasSelfSince(chatKey, ts) {
+    return !!this.db.prepare('SELECT 1 FROM messages WHERE chat_key=? AND self=1 AND ts>=? LIMIT 1')
+      .get(String(chatKey), Number(ts) || 0);
   }
 
   findByMid(chatKey, mid) {

@@ -66,7 +66,8 @@ const USAGE_RANGES = [
      2. 后端 config.ui.theme —— 跨设备/重装后保留（尽力而为，失败不阻塞）
    首屏防闪由 index.html 的内联脚本负责（读 localStorage 直接设 data-theme）。
 */
-const THEME_ICON = { dark: '🌙', light: '☀️', system: '🖥️' };
+// 图标名（ui/icons.js 的 SVG 集）：不再用 emoji —— 各系统渲染形状不一致，也不跟文字颜色
+const THEME_ICON = { dark: 'moon', light: 'sun', system: 'monitor' };
 
 const THEME_LABEL = { dark: '暗色', light: '亮色', system: '跟随系统' };
 
@@ -239,7 +240,7 @@ const TIME_DAYS = ['周一', '周二', '周三', '周四', '周五', '周六', '
 const MOMENT_STATUS_LABELS = {
   running: '生成中', preview: '草稿', skipped: '决定不发布',
   publishing: '发布中', published: '已发布', 'publish-unknown': '发布结果待核对',
-  'publish-missed': '已核对·确认未发出',
+  'publish-missed': '已核对 · 确认未发出',
   failed: '生成失败', interrupted: '生成已中断', deferred: '等待活跃时间',
   missed: '已错过窗口', cancelled: '已取消', pending: '待执行'
 };
@@ -299,10 +300,10 @@ const MODEL_SERVICES_UI = [
     note: '表外渠道：填你的服务地址；档位可在「自定义档位映射」里自定义（填了就会出档位条），其余参数用「额外请求参数」。' }
 ];
 
-/** 按任务分设的四条：聊天 / 判断·总结 / 写作 / 其他；每条都含「默认」。 */
+/** 按任务分设的四条：聊天 / 判断 · 总结 / 写作 / 其他；每条都含「默认」。 */
 const THINKING_PURPOSES = [
   { key: 'chat', label: '聊天' },
-  { key: 'judge', label: '判断·总结' },
+  { key: 'judge', label: '判断 · 总结' },
   { key: 'write', label: '写作' },
   { key: 'default', label: '其他任务' }
 ];

@@ -34,17 +34,30 @@ mode and its resolution are recorded in [CHANGES](docs/CHANGES.md).
   replying, keep the sticker catalogue in the system prompt, self-check before finishing.
 - **Send path** — retry transient network failures, QQ system faces, message-id normalisation,
   fallback parsing for inline tool calls.
+- **Network fetch** — all host-side fetches go through `safe-fetch`. HTTPS GETs and media downloads
+  prefer HTTP/2 (ALPN), falling back to HTTP/1.1 when the server or connection cannot use it. DNS
+  pinning, private-address blocking, per-hop redirect validation, cross-origin credential stripping,
+  body/decompression caps and timeouts remain in force. POST stays on HTTP/1.1 to avoid duplicate
+  writes. Cloudflare sites that challenge HTTP/1.1 (e926/e621) now work.
 - **Sticker system** — auto-collect with QQ favourites first, fuzzy lookup fallback, sync guard so
   an API failure cannot wipe the local library.
 - **Games & reminders** — hosts mini-games: stateless ones run straight from the prompt (word chain,
   guess-the-number, 20 questions, truth-or-dare), with `dice` plus the group member list for rolls, draws
   and random picks; a **state-machine host** covers turn-based multiplayer games (number bomb,
-  who-is-the-spy — turns, vote counting and verdicts live in code, the spy's word travels by private
-  message only and never enters the model context; experimental, off by default). "Remind me at X"
-  becomes a **persistent reminder** (survives restarts) delivered in its own voice when the time comes.
+  who-is-the-spy, werewolf — turns, vote counting and verdicts live in code, identities and night
+  actions travel by private message only and never enter the model context; experimental, off by
+  default, werewolf additionally needs to be whitelisted in the console). "Remind me at X"
+  becomes a **persistent reminder** (survives restarts); it supports daily / weekly / 5-field cron
+  schedules with an IANA timezone, a quiet-hours window and jitter, and only the most recent
+  missed occurrence is caught up. It is delivered in its own voice when the time comes.
 - **Proactive talk** — three independently switchable links (cold-topic opener / follow-up
-  nudge when nobody answers / model-scheduled wake-up), multiple active windows, interval
-  guard, skip-reason logging, catch-up for messages missed during restarts.
+  nudge when nobody answers / model-scheduled wake-up), multiple active windows. Group and
+  private proactive loops keep separate timers, rolls and last-attempt state, so one scope
+  cannot consume the other's chance. Interval guard, skip-reason logging, catch-up for messages
+  missed during restarts.
+- **Life feed** — optionally forages Bilibili's public API, ranks candidates by the persona's
+  interests and recent group topics, and lets the bot choose what to share. Off by default; it
+  reuses the existing proactive quiet hours, budget and send queue. See [LIFE-FEED](docs/LIFE-FEED.md).
 - **Model access** — thinking levels translated per channel preset, settable per provider and per
   task (Settings -> Model API -> "Advanced: thinking"), retry on provider moderation refusals,
   automatic fallback model.
@@ -55,7 +68,8 @@ mode and its resolution are recorded in [CHANGES](docs/CHANGES.md).
   **keyless local whisper.cpp** (offline, free, one click to install or fully remove in the
   console, or `node scripts/install-asr-local.mjs`). QQ voice (SILK) is decoded locally — no
   protocol-side transcoding; videos also get a 2x2 frame strip for the vision model plus separate
-  soundtrack transcription, so it sees and hears. With an OpenAI-compatible TTS endpoint configured (off by default) it can also reply by voice.
+  soundtrack transcription, so it sees and hears. With a TTS endpoint configured (off by default)
+  it can also reply by voice — OpenAI-compatible endpoints plus Volcano (v1) / Doubao 2.0 / MiniMax presets.
   ASR keys are configured separately from search;
   an hourly quota gate applies, and muted-group pre-checks report the reason instead of sending
   blindly.
@@ -65,9 +79,64 @@ mode and its resolution are recorded in [CHANGES](docs/CHANGES.md).
   voice page, and one preset (Pollinations) needs no key at all for a zero-setup try. Billed per
   image, gated by an hourly cap. A stored key never follows you to a different host (same
   credential-binding guard as ASR).
+- **Plugins** — third-party capabilities (model tools, message observers, scheduled jobs). Each
+  plugin runs in its **own child process**; it only receives the capabilities it declared, and every
+  capability is implemented host-side — a plugin cannot read your config file or bypass the send
+  queue's mute pre-check and rate limits. Since apiVersion 2 a plugin can declare a **settings
+  panel** in its manifest (text / number / boolean / select / secret; the console renders it, and
+  secrets are stored with AES-256-GCM and never echoed). Tools that change external account data go
+  through a **write trust model**: per-action switches default off, every call needs the owner's
+  approval for that exact target, daily quotas apply, two writes from the same plugin are at least
+  60 seconds apart, failures and idempotent skips refund their approval and quota, and every write is
+  audited host-side. Upgrades diff the manifest first; any permission-surface change must be
+  confirmed, grants are bound to the manifest hash, and approvals/switches are reset by scope after
+  an upgrade. The console's Plugins page installs from the official index (13 plugins, all
+  zero-dependency, including Bilibili: search / understand a video / download and merge into the
+  chat / interactions with per-call approval), from a local package, or from your own index.
+  **Writing one** is documented in [docs/PLUGINS.md](docs/PLUGINS.md) (scaffold → debug against the
+  real runtime → pack and self-test, three commands); submitting to the official index goes through
+  the [index repository](https://github.com/sakurawwwxh/qq-agent-plugins) PR flow. The console's
+  Plugins → Publish pane lists both, with the commands. Plugins are third-party code — read the
+  declared capabilities on the detail page before installing.
+- **Skill packs** — read-only Markdown workflows plus a tool allowlist; no third-party code is executed.
+  When asked to follow a method, the model calls `skill_list` and then `skill_use`; only the tools allowed
+  by that skill remain available for the turn. Off by default, enable per chat. Built-ins: chat summary,
+  video digest, comment analysis. The Skills page also has a Market sub-tab: it previews a skill's
+  SKILL.md, tool allowlist and per-file sha256, installs into `data/skills/`, and can uninstall user
+  skills (built-ins are protected). See [SKILLS](docs/SKILLS.md).
+- **Long-term semantic memory (experimental, off by default)** — per-scope memory cards plus local
+  vectors in SQLite; shadow mode audits keyword recall without touching replies, and active mode injects
+  scope-filtered memories as untrusted background. Source turns are kept 7 days and deleted with the
+  memory. See [LIVING-MEMORY](docs/LIVING-MEMORY.md).
+- **Long-term memory & retrieval** — beyond people impressions and session handoffs, `memory_query`
+  searches keywords and short phrases with SQLite FTS5 and Chinese bigrams. Defaults: 50 impressions per person, manual
+  entries never pruned, no time-based expiry by default (0–3650 days configurable). See [MEMORY](docs/MEMORY.md).
+- **Operations & observability** — backups are AES-256-GCM encrypted by default, with restore and
+  drill support; message APIs use cursor pagination and support JSONL/CSV export plus `ops prune`;
+  `/api/metrics` returns JSON or Prometheus text, and logs can be emitted as structured JSON.
+- **Qzone moments** — source can be the persona's own interests (default; no group-log collection),
+  group observations, or persona-first with a light group touch. Scheduled runs only produce a
+  draft by default; you review or edit it in the console before publishing.
+- **MCP read-only resources** — `node src/mcp/resource-server.js` exposes global people memory, the
+  group meme library and pending reminders to any MCP client. Output is sanitised, and there is no
+  access to conversations, config or credentials, and no write path.
 
 Configuration examples are in [docs/CONFIG-EXAMPLES.md](docs/CONFIG-EXAMPLES.md). Operations
 commands are collected in [src/ops.js](src/ops.js) and documented in [docs/OPS.md](docs/OPS.md).
+
+## Screenshots
+
+The screenshots below use the current default light + liquid-glass theme and anonymised demo data,
+and show the overview, message archive, voice-reply settings and plugin page:
+
+<p align="center">
+  <img src="docs/assets/console-overview.png" alt="Overview: bot, protocol side and host status" width="49%">
+  <img src="docs/assets/console-demo.png" alt="Message archive: per-chat long-term history" width="49%">
+</p>
+<p align="center">
+  <img src="docs/assets/console-voice.png" alt="Voice replies: MiMo voice and director instruction" width="49%">
+  <img src="docs/assets/console-plugins.png" alt="Plugins: runtime state, permissions and source" width="49%">
+</p>
 
 ## Demo
 
@@ -122,6 +191,10 @@ OneBot WebSocket
   -> OneBot HTTP
 ```
 
+Host-side outbound fetches all go through `src/llm/safe-fetch.js`: HTTPS GETs and media downloads
+prefer HTTP/2 and fall back to HTTP/1.1; SSRF/DNS pinning, per-hop redirects, credential stripping,
+body caps and timeouts are enforced there.
+
 A message is acknowledged only after the turn was handled successfully. When a model call fails or
 the process restarts, the unsent batch remains pending and is retried automatically. When a send
 result cannot be confirmed, the row enters `held` and requires manual review, which prevents
@@ -129,19 +202,84 @@ duplicate replies.
 
 ## Deployment
 
+### Docker
+
+For container-only deployments:
+
+```bash
+# GHCR
+docker pull ghcr.io/sakurawwwxh/qq-agent-plus:0.9.12
+# China (Aliyun ACR, public, amd64/arm64)
+docker pull crpi-xejkraqtqkngfp11.cn-guangzhou.personal.cr.aliyuncs.com/wangxinhong/qq-agent-plus:0.9.12
+
+git clone https://github.com/sakurawwwxh/qq-agent-plus.git
+cd qq-agent-plus
+docker compose up -d
+```
+
+The console access token is written to `/data/console-access.txt` on first start.
+The image is about 1.2GB on disk / ~310MB compressed; most of it is ffmpeg and its
+dependencies. Only the full image is published (no slim variant), so audio, video, GIF and
+large-image handling match a bare-metal install.
+See [docs/DOCKER.md](docs/DOCKER.md) for the full stack, China mirrors and migration.
+
 ### Full-stack installation
 
-A fresh Linux machine should use the interactive installer `deploy-all.sh`. The installer asks for
-the deployment directory and ports, installs Docker (with sudo confirmation), downloads SnowLuma,
-configures OneBot, deploys QQ Agent and generates or synchronises all service credentials.
-SnowLuma already contains OneBot; NapCat and Lagrange must not be installed on top of it.
+A fresh Linux machine should use the one-command installer `install.sh`: it runs with no questions,
+installs Docker (with sudo), downloads SnowLuma, configures OneBot, deploys QQ Agent and generates
+or synchronises all service credentials; on completion it prints a three-step checklist — a console
+link with the login token embedded, the QQ login page, and where to set the chat allowlist. The
+model key and group IDs are filled in later in the web console. SnowLuma already contains OneBot;
+NapCat and Lagrange must not be installed on top of it.
 
-Installation and runtime must not use root: `deploy-all.sh` refuses to run as root, so use a regular
-user (the script calls `sudo` only when installing Docker or enabling linger).
+The installer may be started as root. It creates or reuses a dedicated non-root service account
+(default `qqagent`, or `SUDO_USER`), installs Docker, adds that account to the `docker` group,
+enables linger, and then re-runs the installer as that user. The bot process itself never runs as
+root. `deploy-all.sh` still requires a regular user.
+
+The service account is added to the `docker` group, which is required by the console protocol-update
+button. On Linux the `docker` group is equivalent to host root (members can mount host paths); this
+drops the application process identity, not the Docker privilege. Remove the account from that group
+and manage SnowLuma manually if you do not need the update button.
 
 ```bash
 git clone https://github.com/sakurawwwxh/qq-agent-plus.git
 cd qq-agent-plus
+sudo bash install.sh    # root or sudo; the service is dropped to a non-root user
+# or, as a regular user:
+bash install.sh
+```
+
+If cloning from GitHub is slow or blocked, download the source archive from the Release page (or a
+trusted mirror), extract it and run the same commands. `install.sh` needs the full repository, not
+a single copied script.
+
+Recommended host: 2 CPU cores, 2GB RAM and 10GB free local disk. A 1GB host can run out of memory
+while SnowLuma/Chromium starts; SQLite must not live on NFS or SMB.
+
+Distribution support is split into three tiers:
+
+- **Tested**: Ubuntu 22.04/24.04 (current production host).
+- **Expected to work**: Debian 12/13, Ubuntu 26.04, Rocky Linux 9, AlmaLinux 9, Fedora, CentOS Stream,
+  RHEL, Oracle Linux, Amazon Linux, Arch/Manjaro, openSUSE Leap/Tumbleweed, SLES,
+  openEuler, Anolis, Kylin/UOS (attempted through dnf/yum/zypper/pacman). Debian 12
+  official repositories only ship Compose v1; configure Docker's apt repository first
+  to get Compose v2.
+- **Unsupported**: Alpine (musl), NixOS, Gentoo, Void, WSL1, and containers without systemd.
+
+Run the read-only check before installing:
+
+```bash
+sh scripts/check-platform.sh
+```
+
+
+
+When you prefer to answer the questions (deployment directory, ports, credentials, model), use the
+interactive installer instead — it is the same installer with the questions asked instead of
+defaulted:
+
+```bash
 bash deploy-all.sh
 ```
 
@@ -158,11 +296,13 @@ The script does not modify UFW, firewalld or cloud security groups. For cross-ho
 three entries above should be opened to a trusted LAN or VPN; noVNC and OneBot must never be
 exposed to the internet.
 
-The first installation also asks for the model base URL, API key, model name and the QQ allowlist.
-Once the infrastructure is running, open the printed noVNC address and scan the QQ login QR code,
-then return to the terminal and press Enter; the installer verifies the OneBot login and offers to
-activate. After confirming that the previous bot has stopped or excludes the same chats, the
-following command performs the same step manually:
+The interactive installer asks for the model base URL, model name, API key and the QQ allowlist.
+**Leaving the API key blank skips model configuration** — finish it later under Settings → Model API
+in the web console; this is what the one-command install does. Once the infrastructure is running,
+open the printed noVNC address and scan the QQ login QR code, then return to the terminal and press
+Enter; the installer verifies the OneBot login and offers to activate. After confirming that the
+previous bot has stopped or excludes the same chats, the following command performs the same step
+manually:
 
 ```bash
 /mnt/data/qq-agent/app/manage.sh activate --confirm-exclusive
@@ -215,7 +355,7 @@ Use `deploy.sh` when a compatible OneBot v11 service already exists, or when onl
 installed or updated. Requirements:
 
 - Linux with systemd user services;
-- `curl`, `tar`, `sha256sum`, `rsync` (if no suitable Node.js is found, the script downloads and
+- `curl`, `tar`, `sha256sum`, `rsync`, `xz`, `git` (if no suitable Node.js is found, the script downloads and
   verifies Node 22 into `INSTALL_DIR/.runtime`);
 - a non-root user (the service is registered as that user's systemd user service);
 - a running OneBot v11 HTTP and forward WebSocket service;
@@ -285,8 +425,10 @@ bash deploy.sh \
 ```
 
 Updates do not reset the run mode, and the rest of the configuration is preserved. `--install-dir`
-and `--data-dir` must match the existing installation: a wrong directory is not rejected, it points
-the service at a new, empty data directory. `--host` and `--port` may be omitted — the script then
+and `--data-dir` must match the existing installation: a wrong directory is rejected before any
+change (service still running, code untouched); it does not create a new empty data directory.
+Moving the data directory requires both `--allow-path-change` and
+`QQ_AGENT_ALLOW_PATH_CHANGE=1`; old data is not copied automatically. `--host` and `--port` may be omitted — the script then
 reuses the values recorded in `config.json` and prints a note; when given explicitly they must match
 the first installation (a full-stack install uses `0.0.0.0`), otherwise the console becomes
 unreachable from outside. The current listen address is on the URL line of `DATA_DIR/console-access.txt`.
@@ -299,9 +441,11 @@ The installer also installs a separate GitHub update service and timer. Automati
 disabled by default and can be enabled from the “控制 -> 更新部署” page after an administrator is
 configured. Hints and deployments follow **published Releases** only (drafts, pre-releases and
 ordinary commits on `main` do not count) and target the commit of that tag: unit tests run first,
-then deployment is delegated to `deploy.sh`. A deployment that already contains the latest Release
-is not rolled back, and an indeterminate comparison performs no action. On failure the update rolls
-back, disables automatic updates and notifies the administrator by private message.
+then deployment is delegated to `deploy.sh`. A deployment whose local version is not lower than the
+latest Release is considered current and is not rolled back (installations without a deployment
+baseline are excepted and install the latest Release directly); commit comparison is used only when
+the local version cannot be parsed, and an indeterminate comparison performs no action. On failure
+the update rolls back, disables automatic updates and notifies the administrator by private message.
 See [docs/AUTO_UPDATE.md](docs/AUTO_UPDATE.md).
 
 ## Operations
@@ -334,20 +478,25 @@ node src/ops.js help                     # all subcommands
 node src/ops.js audit                    # service + code + data health check (read-only)
 node src/ops.js audit-host               # host health check (read-only)
 node src/ops.js scan                     # undefined-call scan
-node src/ops.js backup --confirm         # stop/start the service, archive data, keep the last 4
+node src/ops.js backup --confirm         # stop/start the service, encrypt the archive, keep the last 4
+node src/ops.js restore --from ~/qq-agent/backups/qq-agent-data-XXXX.tar.gz.enc --dry-run
+node src/ops.js prune --days=90 --dry-run # only acked messages; preview first
 node src/ops.js install-timers --print   # show the four systemd user timers (backup / process-guard / health / audit-prune)
 node src/ops.js console --open           # open an SSH tunnel and the console
 ```
 
-Every subcommand accepts `--help`. Destructive commands require `--confirm` and support `--dry-run`
+`/api/metrics` requires the console token (`manage.sh token`) and supports JSON or
+`?format=prometheus`. Every subcommand accepts `--help`. Destructive commands require `--confirm` and support `--dry-run`
 and `--print` previews. Paths and credentials are read from environment variables (`QQ_AGENT_*`,
 `SSH*`); no real addresses or secrets are stored in the repository. Environment variables, common
 examples and remote execution are documented in [docs/OPS.md](docs/OPS.md).
 
 ### OneBot connection troubleshooting
 
-The console only reports connected or not connected. The actual reason is in the `onebot.error`
-field of `/api/status`, which the health check prints:
+The console's Settings → OneBot page spells out the failure reason inline
+(port not listening / token mismatch / unresolvable address, with the raw
+error); the raw field remains `onebot.error` in `/api/status`, which the health
+check also prints:
 
 ```bash
 node src/ops.js audit --dir=/mnt/data/qq-agent     # the "OneBot: connected=false error=…" line
@@ -390,12 +539,21 @@ same procedure is documented in more detail in
 
 The console listens on `3210` by default. An agent-only installation (`deploy.sh`) binds `127.0.0.1`
 only, so local access requires no public port; the full-stack installer (`deploy-all.sh`) starts the
-console with `--host 0.0.0.0`, and cross-host access should be limited to a trusted LAN or VPN. On
-Windows, [`console-tunnel.bat`](console-tunnel.bat) in the repository root reads the console token
-from the server, opens an SSH tunnel and launches the browser without a login prompt; the host is
-entered once as `user@host` and remembered. It also forwards `5099` (SnowLuma WebUI) and `6081` (QQ
-login). On macOS, Linux or any machine with Node installed, `node src/ops.js console --open` has the
-same effect.
+console with `--host 0.0.0.0`, and cross-host access should be limited to a trusted LAN or VPN.
+No local project is required. Use Windows `console-tunnel.bat` or macOS/Linux
+`console-tunnel.sh`; both read the console token from the server, open an SSH tunnel and launch the
+browser without a login prompt. The host is entered once as `user@host` and remembered. They also
+forward `5099` (SnowLuma WebUI) and `6081` (QQ login). Download one file from the server:
+
+```bash
+# macOS / Linux
+scp user@server:/mnt/data/qq-agent/app/console-tunnel.sh .   # adjust for --root-dir
+bash console-tunnel.sh user@server
+```
+
+On Windows use the matching `.bat` file. With Node installed, `node src/ops.js console --open` has
+the same effect. A manual tunnel is also enough:
+`ssh -N -L 3210:127.0.0.1:3210 -L 5099:127.0.0.1:5099 -L 6081:127.0.0.1:6081 user@server`.
 
 The token can be rotated under “设置 -> 系统 -> 控制台安全”. Once the console is reachable from
 other hosts, the token is its only credential and must be kept private.
@@ -424,9 +582,11 @@ but not keywords, so an old `0-10` setting also answers keywords after the conve
 
 ## Personas
 
-“设置 -> 人设” (the persona card library) provides several built-in persona cards (the default
-小鲸鱼, a sarcastic friend, a warm companion, a homelab enthusiast and a catgirl), stored one markdown
-file per card under [`roles/`](roles); see [docs/PERSONAS.md](docs/PERSONAS.md). Clicking a card
+“设置 -> 人设” (the persona card library) provides seven built-in persona cards (the default
+小鲸鱼, a sarcastic friend, a warm companion, a homelab enthusiast, a catgirl, a meme-loving
+trickster and a study buddy), stored one markdown file per card under [`roles/`](roles); see
+[docs/PERSONAS.md](docs/PERSONAS.md). Each card also has a voice profile (single-bubble length,
+bubble count, gap) and a short few-shot dialogue file under `roles/dialogs/`. Clicking a card
 fills the draft; it takes effect after clicking the always-visible “保存设置” at the bottom. The body
 is shown section by section (signature traits, AI-flavour blacklist and examples each rendered as
 tags or chat bubbles) and every section can be edited on its own, reverted on its own, or the whole
@@ -477,6 +637,9 @@ according to the configured mode, and archived messages remain available as hist
 requests, tool rounds, retries, memory work and sending are all gated. Daily summaries and the
 console model test follow the global schedule, and the daily summary excludes chats that are
 currently inactive; scheduled posts blocked by the schedule are postponed to the next active window.
+Persistent reminders and model-scheduled wake-ups due in a quiet window are likewise postponed (not
+voided, however long the quiet period lasts); in observe mode reminders keep deferring while
+scheduled wake-ups are voided and logged.
 
 Rule changes take effect immediately. In-flight requests that cross into an inactive window are
 aborted and subsequent requests and sends are blocked; a provider may still bill a request it
@@ -489,7 +652,8 @@ Data is stored in the `data` directory passed to the deploy scripts:
 
 - `config.json` — configuration and credentials, mode `0600`;
 - `messages.sqlite` — messages, leases and outbound state;
-- `sessions/` — one record per Agent run;
+- `sessions/` — one record per Agent run (default keep-2000 cap, plus a daily sweep that prunes
+  archives older than 90 days);
 - `memory/` — long-term impressions and cross-session handoff state;
 - `identity-pilot.sqlite` — unified QQ identity index and friend-request approval ledger;
 - `slang-pilot.sqlite` — the slang pilot is retired and will never be created;
@@ -508,11 +672,11 @@ npm run test:unit     # unit tests
 npm run test:local    # local regression (temporary data directory, never production data)
 node src/ops.js scan --strict
 npm audit --omit=dev
-bash -n deploy.sh manage.sh
+bash -n deploy.sh && bash -n deploy-all.sh && bash -n manage.sh
 ```
 
 CI (GitHub Actions) runs the syntax check, the strict undefined-call scan, unit tests, the local
-regression, and the prompt / render / scroll / usage end-to-end suites on every push and pull request. Two small confirmed issues are open on this baseline,
+regression, and the prompt / render / scroll / usage end-to-end suites on pushes to main and all pull requests. Two small confirmed issues are open on this baseline,
 neither on the main path; see [KNOWN-ISSUES](docs/KNOWN-ISSUES.md) for the current list and the
 history. The [Chinese README](README.md) carries the complete option lists and the per-page
 description of the console; the [documentation index](docs/README.md) lists all documents.

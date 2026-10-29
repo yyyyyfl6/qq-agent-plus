@@ -1,0 +1,56 @@
+# Example Docker Compose deployment for the embedded long-term memory runtime.
+#
+# It deliberately contains no Qdrant or living-memory sidecar: cards, turns and
+# Float32 vectors are stored below the Agent's /data bind mount. Pair this file
+# with scripts/migrate-living-memory.mjs when replacing the retired sidecar.
+
+version: "3.8"
+
+services:
+  agent:
+    image: ${QQ_AGENT_IMAGE:?set the built-in QQ Agent image tag}
+    container_name: ${QQ_AGENT_CONTAINER_NAME:-qq-agent-plus}
+    restart: unless-stopped
+    init: true
+    network_mode: host
+    dns:
+      - ${QQ_AGENT_DNS_PRIMARY:-223.5.5.5}
+      - ${QQ_AGENT_DNS_SECONDARY:-119.29.29.29}
+    read_only: true
+    tmpfs:
+      - /tmp:size=${QQ_AGENT_TMPFS_SIZE:-1g}
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      QQ_AGENT_DATA_DIR: /data
+      QQ_AGENT_RUNTIME: docker
+      QQ_AGENT_RUNTIME_MODE: ${QQ_AGENT_RUNTIME_MODE:-active}
+      QQ_AGENT_SERVER_HOST: ${QQ_AGENT_SERVER_HOST:-0.0.0.0}
+      QQ_AGENT_SERVER_PORT: ${QQ_AGENT_SERVER_PORT:-3210}
+      QQ_AGENT_ONEBOT_WS_URL: ${QQ_AGENT_ONEBOT_WS_URL:-ws://127.0.0.1:3002}
+      QQ_AGENT_ONEBOT_HTTP_URL: ${QQ_AGENT_ONEBOT_HTTP_URL:-http://127.0.0.1:3000}
+      QQ_AGENT_ONEBOT_ACCESS_TOKEN: ${QQ_AGENT_ONEBOT_ACCESS_TOKEN}
+      QQ_AGENT_ONEBOT_HTTP_TOKEN: ${QQ_AGENT_ONEBOT_HTTP_TOKEN}
+      QQ_AGENT_SNOWLUMA_CONFIG_WAIT_MS: ${QQ_AGENT_SNOWLUMA_CONFIG_WAIT_MS:-0}
+      QQ_AGENT_CONSOLE_TOKEN: ${QQ_AGENT_CONSOLE_TOKEN}
+      QQ_AGENT_TRUSTED_HOSTS: ${QQ_AGENT_TRUSTED_HOSTS:-127.0.0.1,localhost}
+      # Embedding credentials stay in the deployment environment; the Agent
+      # reads them directly and never writes them to config.json or the UI.
+      LIVING_MEMORY_EMBEDDING_BASE_URL: ${LIVING_MEMORY_EMBEDDING_BASE_URL:-}
+      LIVING_MEMORY_EMBEDDING_API_KEY: ${LIVING_MEMORY_EMBEDDING_API_KEY:-}
+      LIVING_MEMORY_EMBEDDING_MODEL: ${LIVING_MEMORY_EMBEDDING_MODEL:-}
+      LIVING_MEMORY_EMBEDDING_DIMENSIONS: ${LIVING_MEMORY_EMBEDDING_DIMENSIONS:-0}
+      LIVING_MEMORY_EMBEDDING_TIMEOUT_MS: ${LIVING_MEMORY_EMBEDDING_TIMEOUT_MS:-30000}
+      # This budget limits only the vector branch of a live recall. On expiry,
+      # local keyword results are preserved instead of skipping the whole recall.
+      LIVING_MEMORY_RECALL_VECTOR_TIMEOUT_MS: ${LIVING_MEMORY_RECALL_VECTOR_TIMEOUT_MS:-1200}
+      LIVING_MEMORY_VECTOR_SCAN_LIMIT: ${LIVING_MEMORY_VECTOR_SCAN_LIMIT:-20000}
+    volumes:
+      - ${QQ_AGENT_DATA_HOST_PATH:?set the Agent data directory}:/data

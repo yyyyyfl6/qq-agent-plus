@@ -19,8 +19,9 @@
   </script>
   <script>
     /* 主题预置：在样式生效前就定好 data-theme，避免首屏闪白/闪黑。
-       优先级：localStorage 里的显式选择 > 系统偏好 > 暗色。
-       这里只做"应用"，真正的切换逻辑与持久化在 app.js。 */
+       优先级：localStorage 里的显式选择 > 上次同步到的后端值 > 显式"跟随系统" > 默认浅色。
+       默认浅色是 2026-10-19 定的（项目默认外观 = 浅色 + 液态玻璃）；这里只做"应用"，
+       真正的切换逻辑与持久化在 app.js。 */
     (function () {
       try {
         var saved = localStorage.getItem('qqa-theme') || '';
@@ -28,15 +29,94 @@
         // 启动完成再被后端覆盖"——那一下整屏换色就是用户看到的"闪"。
         var server = localStorage.getItem('qqa-theme-server') || '';
         var sys = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-        // 优先级：本机显式选择 > 上次从后端同步到的值 > "跟随系统" > 系统实际取值
+        // 优先级：本机显式选择（浅/深）> 显式"跟随系统"取当前系统值 > 上次同步到的后端值
+        // （浅/深直接用；"跟随系统"同样取当前系统值）> 默认浅色。
+        // "跟随系统"必须排在缓存的后端值前面：否则用户明确选了跟随系统、而缓存里还是上次的
+        // 某个值，首屏会先画成缓存值、等模块按系统解析后再换一次（闪一下）。
         var theme = (saved === 'light' || saved === 'dark') ? saved
+          : (saved === 'system') ? sys
           : (server === 'light' || server === 'dark') ? server
-          : (saved === 'system' ? sys : (saved || sys));
-        if (theme !== 'light' && theme !== 'dark') theme = 'dark';
+          : (server === 'system') ? sys
+          : 'light';
+        if (theme !== 'light' && theme !== 'dark') theme = 'light';
         document.documentElement.setAttribute('data-theme', theme);
       } catch (e) {
-        document.documentElement.setAttribute('data-theme', 'dark');
+        document.documentElement.setAttribute('data-theme', 'light');
       }
+
+      /* 外观预置：把上次存的外观（形状 = ui/core/appearance.js 的 appearancePatch）在样式生效前
+         套一遍，免得"先按默认色画一版、启动完成再换"——那一下换色就是用户看到的"闪"。
+         这里刻意只做"抄值"：强调色的柔和底 / 描边 / 焦点环由 CSS 的 color-mix 从 --accent 现算，
+         字体栈与背景拼装也都在 CSS，这段只填少数几个值。
+         唯一要一小段逻辑的是 --accent-fg（压在强调色上的文字该黑还是白），它必须与
+         appearance.js 的 readableOn 给出同一答案 —— test/console-boot-appearance.test.mjs 逐色核对。
+         整段是锦上添花：任何异常都吞掉，页面照常按默认色起来。 */
+      try {
+        var root = document.documentElement;
+        var patch = JSON.parse(localStorage.getItem('qqa-appearance') || '{}') || {};
+        var DEFAULT_ACCENT = '#4c8dff';
+        var FG_THRESHOLD = 0.54;   // 与 appearance.js 的 readableOn 阈值一致
+        function lin(c) { return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); }
+        function accentFg(hex) {
+          var m = /^#?([0-9a-f]{6})$/i.exec(String(hex || ''));
+          if (!m) return '#ffffff';
+          var n = parseInt(m[1], 16);
+          var lum = 0.2126 * lin((n >> 16 & 255) / 255) + 0.7152 * lin((n >> 8 & 255) / 255) + 0.0722 * lin((n & 255) / 255);
+          return lum > FG_THRESHOLD ? '#0b1220' : '#ffffff';
+        }
+        // 选了预设色时 patch.accent 是空串（只有自定义色才存 hex，见 appearance.js 的 appearancePatch），
+        // 所以这里必须能按预设 id 查出颜色 —— 否则首屏一律先画成默认蓝，等模块跑起来才换成用户挑的
+        // 那一支，正是这段脚本存在的意义（防"先按默认色画一版、启动完成再换"的那一闪）。
+        // 这张表与 appearance.js 的 ACCENTS **必须逐色一致**：test/console-boot-appearance.test.mjs
+        // 会逐项核对，改了一边忘了另一边会直接红。
+        var PRESET_HEX = {
+          sky: '#38bdf8', indigo: '#4c8dff', violet: '#a78bfa', rose: '#f472b6',
+          emerald: '#2fd07a', amber: '#f7b955', sunset: '#f97316'
+        };
+        // 优先级与 appearance.js 的 resolveAppearance 逐字一致：自定义色 > 预设色 > 默认蓝。
+        // 不能拿"算出来等于默认蓝"当"没设自定义色"的判据 —— 用户自定义成 #4c8dff 时会被误判，
+        // 于是首屏先画成预设色、模块跑起来再跳回用户那个色（一次闪烁，且两处实现在这一点上不一致）。
+        var accent = (/^#?[0-9a-f]{6}$/i.test(String(patch.accent || '')) ? patch.accent : '')
+          || PRESET_HEX[patch.accentPreset] || DEFAULT_ACCENT;
+        var globalAccent = patch.accentScope === 'sidebar' ? DEFAULT_ACCENT : accent;
+        var st = root.style;
+        st.setProperty('--accent', globalAccent);
+        st.setProperty('--accent-side', accent);
+        st.setProperty('--accent-fg', accentFg(globalAccent));
+        st.setProperty('--r-scale', String(Number(patch.radius) || 1));
+        st.setProperty('--zoom', String(Number(patch.zoom) || 1));
+        if (typeof patch.bgColor === 'string') st.setProperty('--bg-solid', patch.bgColor);
+        if (typeof patch.bgFrom === 'string') st.setProperty('--bg-from', patch.bgFrom);
+        if (typeof patch.bgTo === 'string') st.setProperty('--bg-to', patch.bgTo);
+        st.setProperty('--bg-angle', (Number.isFinite(Number(patch.bgAngle)) ? Number(patch.bgAngle) : 135) + 'deg');
+        var tweaks = patch.tweaks && typeof patch.tweaks === 'object' ? patch.tweaks : {};
+        for (var tk in tweaks) {
+          // 白名单：localStorage 里的东西不可信，只认主题微调那六个变量
+          if (!/^--(bg|bg-2|bg-3|border|text|muted)$/.test(tk)) continue;
+          if (/^#[0-9a-f]{6}$/i.test(String(tweaks[tk]))) st.setProperty(tk, tweaks[tk]);
+        }
+        var attrs = {
+          scheme: patch.scheme,
+          'dark-intensity': patch.darkIntensity,
+          'accent-scope': patch.accentScope,
+          'sidebar-style': patch.sidebarStyle,
+          background: patch.background || 'none',
+          // 材质：项目默认液态玻璃（2026-10-19）；'off' 才不设属性，与 appearance.js 的
+          // appearanceAttrs 同口径。首屏就必须给上 —— 壁纸规则挂在 [data-glass='liquid'] 上。
+          glass: patch.glass === 'off' ? '' : (patch.glass || 'liquid'),
+          // 边缘折射：默认关；与 appearanceAttrs 同口径（'1' 才设）
+          refract: patch.refract === true ? '1' : '',
+          font: patch.font,
+          density: patch.density,
+          contrast: patch.contrast === 'high' ? 'high' : '',
+          motion: patch.noMotion === true ? 'off' : (patch.reduceMotion === true ? 'reduced' : ''),
+          'hide-badges': patch.showBadges === false ? '1' : '',
+          'hide-theme-btn': patch.showTopbarTheme === false ? '1' : '',
+          // 侧栏是不是"悬停展开的图标条"：没钉住就是图标条（与参照实现同一默认）
+          'side-rail': patch.sidebarPinned === true ? '' : '1'
+        };
+        for (var at in attrs) { if (attrs[at]) root.setAttribute('data-' + at, attrs[at]); }
+      } catch (e) { /* 外观预置失败就用默认色起来，不影响可用性 */ }
     })();
   </script>
 </head>
@@ -53,20 +133,27 @@
 
       <a class="btn btn-small" href="/skins.html">人格</a>
       <nav id="tabs" data-page-node-id="E9BCxQoSdlNgyXwJBELj6z">
-        <div class="nav-group-label">对话</div>
-        <button class="tab active" data-icon="💬" data-tab="sessions" data-page-node-id="QA2pcdHYdARJK2APBNKZmC">会话</button>
-        <button class="tab" data-icon="🗂" data-tab="chats" data-page-node-id="AdXD0D2NiWH5UBfpPQqzQ2">存档</button>
-        <button class="tab" data-icon="🎛" data-tab="control" data-page-node-id="qcontrolnav">控制</button>
-        <div class="nav-group-label">记忆</div>
-        <button class="tab" data-icon="🧠" data-tab="memory" data-page-node-id="vXS9OY6wG4MkJlzQ2aLADZ">会话记忆</button>
-        <button class="tab" data-icon="👥" data-tab="people-memory" data-page-node-id="qpeoplememorynav">人物记忆</button>
-        <button class="tab" data-icon="🪪" data-tab="identity" data-feature-nav="identity">人物印象</button>
-        <button class="tab" data-icon="🤝" data-tab="friends" data-feature-nav="auto-friend">好友管理</button>
-        <div class="nav-group-label">运行</div>
-        <button class="tab" data-icon="📈" data-tab="assets" data-page-node-id="qassetobserve">观测</button>
-        <button class="tab" data-icon="💰" data-tab="usage" data-page-node-id="hcZzcXuMojNoiE7UcRVYfR">用量</button>
-        <button class="tab" data-icon="🚨" data-tab="incidents" data-feature-nav="incidents">异常处理</button>
-        <button class="tab" data-icon="⚙️" data-tab="settings" data-page-node-id="4cXbRBtGmcpcL272eKvHPV">设置</button>
+        <!-- 每一项两行：主名 + 一行说明（对齐参照控制台的一级导航）。分组不用小标题，
+             靠 data-group-start 在组间留一道空白 —— 十三项各带一行说明，再加四个分组标题
+             就太吵了，而且分组标题的信息量已经被说明那行接住了。 -->
+        <button class="tab active" data-icon="gauge" data-tab="overview" data-page-node-id="qoverviewnav"><span class="tab-label"><b>总览</b><i>机器人与协议端</i></span></button>
+        <button class="tab" data-icon="chat" data-tab="sessions" data-group-start data-page-node-id="QA2pcdHYdARJK2APBNKZmC"><span class="tab-label"><b>会话</b><i>逐条对话记录</i></span></button>
+        <button class="tab" data-icon="archive" data-tab="chats" data-page-node-id="AdXD0D2NiWH5UBfpPQqzQ2"><span class="tab-label"><b>存档</b><i>分群聊天的长期归档</i></span></button>
+        <button class="tab" data-icon="sliders" data-tab="control" data-page-node-id="qcontrolnav"><span class="tab-label"><b>控制</b><i>更新与运行开关</i></span></button>
+        <button class="tab" data-icon="database" data-tab="memory" data-group-start data-page-node-id="vXS9OY6wG4MkJlzQ2aLADZ"><span class="tab-label"><b>会话记忆</b><i>每条会话记了什么</i></span></button>
+        <button class="tab" data-icon="users" data-tab="people-memory" data-page-node-id="qpeoplememorynav"><span class="tab-label"><b>人物记忆</b><i>群友的长期画像</i></span></button>
+        <button class="tab hidden" data-icon="brain" data-tab="living-memory" data-feature-nav="living-memory"><span class="tab-label"><b>长期记忆</b><i>语义检索与知识图谱</i></span></button>
+        <button class="tab" data-icon="idcard" data-tab="identity" data-feature-nav="identity"><span class="tab-label"><b>人物印象</b><i>印象与关系档案</i></span></button>
+        <button class="tab" data-icon="userplus" data-tab="friends" data-feature-nav="auto-friend"><span class="tab-label"><b>好友管理</b><i>好友申请与派发</i></span></button>
+        <button class="tab" data-icon="activity" data-tab="assets" data-group-start data-page-node-id="qassetobserve"><span class="tab-label"><b>观测</b><i>素材与实验状态</i></span></button>
+        <button class="tab" data-icon="coins" data-tab="usage" data-page-node-id="hcZzcXuMojNoiE7UcRVYfR"><span class="tab-label"><b>用量</b><i>花费与 token</i></span></button>
+        <button class="tab" data-icon="alert" data-tab="incidents" data-feature-nav="incidents"><span class="tab-label"><b>异常处理</b><i>告警与日志</i></span></button>
+        <!-- 插件：市场与已装的扩展（2026-10-16 从「设置 → 插件」搬出来）。它本来就不是配置表单：
+             动作点了就生效、没有"保存设置"这一步，藏在设置里会被强制加一条保存条，还得用文案解释
+             "不用点下面那个按钮" —— 那是布局错了的信号。位置放在「设置」之前（同为"管"的页面）。 -->
+        <button class="tab" data-icon="sparkles" data-tab="skills" title="技能 — 按流程做事" aria-label="技能"><span class="tab-label"><b>技能</b><i>按流程做事</i></span></button>
+        <button class="tab" data-icon="chip" data-tab="plugins"><span class="tab-label"><b>插件</b><i>市场与已装的扩展</i></span><em class="pending-badge" data-pending-badge style="display:none" aria-label="没有插件待批"></em></button>
+        <button class="tab" data-icon="gear" data-tab="settings" data-page-node-id="4cXbRBtGmcpcL272eKvHPV"><span class="tab-label"><b>设置</b><i>全部配置</i></span></button>
       </nav>
 
       <div class="side-foot">
@@ -78,6 +165,9 @@
           </select>
         </label>
         <button id="pause-btn" class="btn btn-small" data-page-node-id="plyqWsDjnlKP1Td6wSVJaD">暂停</button>
+        <!-- 固定侧栏：与外观面板里那个开关是同一个轴（ui.sidebarPinned）。图标条模式下也能点
+             （鼠标移上去侧栏就展开），不用先跑到设置里去找开关。 -->
+        <button id="side-pin-btn" class="icon-btn" type="button" data-icon="pin" title="固定侧栏" aria-label="固定侧栏" aria-pressed="false" data-page-node-id="qsidepinbtn"></button>
         <button id="theme-btn" class="icon-btn" title="切换主题（暗 → 亮 → 跟随系统）" aria-label="切换主题" data-page-node-id="v47iM0LsuM4VppZ5WLh7Qi"></button>
       </div>
     </aside>
@@ -98,12 +188,17 @@
 
   <main id="layout" data-page-node-id="hvuDZ0DOoYC7fFheJnpiGZ">
     <!-- 统一控制入口 -->
+    <!-- 总览（首页）：一屏看全局 -->
+    <section id="view-overview" class="view active" data-page-node-id="qoverviewview">
+      <div id="overview-page" class="overview-pane" data-page-node-id="qoverviewpage"></div>
+    </section>
+
     <section id="view-control" class="view" data-page-node-id="qcontrolview">
       <div id="control-page" class="control-pane" data-page-node-id="qcontrolpage"></div>
     </section>
 
     <!-- 会话视图 -->
-    <section id="view-sessions" class="view active" data-page-node-id="EfuI6TFTs4KY9veb0pkva1">
+    <section id="view-sessions" class="view" data-page-node-id="EfuI6TFTs4KY9veb0pkva1">
       <aside id="session-list" class="list-pane" data-page-node-id="NNTSUz4evxhvLGzuY26viB">
         <div class="list-head muted" data-page-node-id="aSFyF0LvBNUq4BH2sydWl0"><span id="session-count"></span></div>
         <select id="session-skin-filter" aria-label="按人格筛选运行记录" hidden></select>
@@ -120,7 +215,7 @@
       <aside id="chat-list" class="list-pane" data-page-node-id="oHomcx4PNl2n51xeHfeIXI">
         <div class="list-head muted" data-page-node-id="vlqc8FbmqzRhAk07MYf9xH">消息存档</div>
         <div class="archive-filter">
-          <input type="text" id="archive-search" placeholder="搜索会话名 / 最近消息" />
+          <input type="text" id="archive-search" placeholder="搜索会话名 / 最近消息" aria-label="搜索会话名或最近消息" />
           <select id="archive-filter-type" aria-label="筛选会话类型">
             <option value="all">全部</option>
             <option value="group">群聊</option>
@@ -154,15 +249,40 @@
           <strong>人物记忆</strong>
           <button class="btn btn-small" type="button" id="gm-refresh">刷新</button>
         </div>
+        <div class="gm-status" id="gm-memory-stats" style="padding:6px 12px 0"></div>
+        <div class="gm-search">
+          <input type="search" id="gm-search-query" placeholder="找记忆：面馆 / 周会 / 谁提过爬山…" />
+          <button class="btn btn-small" type="button" id="gm-search-btn">搜索</button>
+          <button class="btn btn-small" type="button" id="gm-search-clear">清除</button>
+        </div>
+        <div id="gm-search-results" class="gm-search-results"></div>
         <!-- 按 QQ 直接设备注：名单里只有"进过记忆库的人"（说过话的），
              没说过话的群友在这里补一个入口，否则备注就永远写不上。 -->
+        <!-- 新建印象：长期印象按 QQ 全局存，但每条都要挂在某个来源会话上 —— 没有来源会话就写不进去。
+             名单只列"有印象的人"，还没有印象的人在这里补；下一行的「设备注」只写称呼、不建印象。 -->
+        <details class="gm-anynote" id="gm-newimp">
+          <summary>新建人物印象（先选来源会话）</summary>
+          <div class="gm-note-field">
+            <input type="text" id="gm-newimp-qq" inputmode="numeric" placeholder="QQ 号" />
+            <select id="gm-newimp-chat" aria-label="来源会话"></select>
+          </div>
+          <div class="gm-note-field">
+            <textarea id="gm-newimp-text" rows="3" placeholder="一行一条印象（如：爱钓鱼，周末常不在）"></textarea>
+          </div>
+          <div class="gm-note-field">
+            <button class="btn btn-small" type="button" id="gm-newimp-save">保存</button>
+            <span class="gm-status" id="gm-newimp-status"></span>
+          </div>
+          <div class="gm-status">保存会「整体替换」这个 QQ 的长期印象 —— 写入前会先读一次服务端现值，机器人刚记下的印象不会被覆盖掉。每位默认最多 50 条、每条 300 字以内，超出的部分不会写进去（会提示你）。想让机器人自己从聊天记录补，可以把设置 → 记忆里「发现新人的最少发言条数」调小后再整理。</div>
+        </details>
         <details class="gm-anynote">
-          <summary>按 QQ 设备注</summary>
+          <summary>按 QQ 设备注（只改称呼，不会建印象）</summary>
           <div class="gm-note-field">
             <input type="text" id="gm-anynote-qq" inputmode="numeric" placeholder="QQ 号" />
-            <input type="text" id="gm-anynote-text" maxlength="200" placeholder="备注名（留空 = 删除）" />
+            <input type="text" id="gm-anynote-text" maxlength="200" placeholder="称呼/备注名（留空 = 删除）" />
             <button class="btn btn-small" type="button" id="gm-anynote-save">保存</button>
           </div>
+          <div class="gm-status">这里只保存“以后叫他什么”。要给他建印象（让他出现在上面的名单里）：用上面的「新建人物印象」。</div>
           <div class="gm-status" id="gm-anynote-status"></div>
         </details>
         <div id="global-memory-items"></div>
@@ -170,6 +290,10 @@
       <div id="global-memory-detail" class="detail-pane" data-page-node-id="qpeoplememorydetail">
         <div class="empty-hint">← 选择人物查看全局长期记忆</div>
       </div>
+    </section>
+
+    <section id="view-living-memory" class="view">
+      <div id="living-memory-page" class="living-memory-page"></div>
     </section>
 
     <!-- 正式功能：固定随服务启动，不再由实验功能开关控制 -->
@@ -193,6 +317,16 @@
     <!-- 用量视图 -->
     <section id="view-usage" class="view" data-page-node-id="At5AHGr3EpuOFlDyc7dES4">
       <div id="usage-page" class="usage-pane" data-page-node-id="1AXcokyh5yiXqQgwn6X2gu"></div>
+    </section>
+
+    <!-- 技能视图 -->
+    <section id="view-skills" class="view">
+      <div id="skills-page" class="plugins-pane"></div>
+    </section>
+
+    <!-- 插件视图 -->
+    <section id="view-plugins" class="view">
+      <div id="plugins-page" class="plugins-pane"></div>
     </section>
 
     <!-- 设置视图 -->
@@ -273,6 +407,14 @@
     </div>
   </dialog>
   <script type="module" src="/i18n/zh-CN.js"></script>
+  <script type="module" src="/core/icons.js"></script>
+  <script type="module" src="/core/select-menu.js"></script>
+  <script type="module" src="/core/appearance.js"></script>
+  <script type="module" src="/core/theme-transition.js"></script>
+  <script type="module" src="/core/glass-refract.js"></script>
+  <script type="module" src="/core/segment.js"></script>
+  <script type="module" src="/core/nav-pill.js"></script>
+  <script type="module" src="/core/side-nav.js"></script>
   <script type="module" src="/core/registry.js"></script>
   <script type="module" src="/core/dom.js"></script>
   <script type="module" src="/core/api.js"></script>
@@ -281,6 +423,7 @@
   <script type="module" src="/core/state.js"></script>
   <script type="module" src="/core/format.js"></script>
   <script type="module" src="/core/dom-util.js"></script>
+  <script type="module" src="/core/zip-images.js"></script>
   <script type="module" src="/core/lifecycle-labels.js"></script>
   <!-- 页面域（app.js 在**加载期**就 QARegistry.register 引用这些渲染入口，故必须排在 app.js 之前） -->
   <script type="module" src="/pages/status.js"></script>
@@ -288,13 +431,27 @@
   <script type="module" src="/pages/sessions.js"></script>
   <script type="module" src="/pages/chat.js"></script>
   <script type="module" src="/pages/memory.js"></script>
+  <script type="module" src="/pages/living-memory.js"></script>
+    <script type="module" src="/pages/plugin-settings.js"></script>
+  <script type="module" src="/pages/plugin-pending.js"></script>
+    <script type="module" src="/pages/plugin-pagination.js"></script>
+    <script type="module" src="/pages/plugins.js"></script>
+  <script type="module" src="/pages/persona-per-chat.js"></script>
   <script type="module" src="/pages/persona.js"></script>
   <script type="module" src="/pages/moments.js"></script>
   <script type="module" src="/pages/features.js"></script>
+  <script type="module" src="/pages/overview.js"></script>
+  <script type="module" src="/pages/platform.js"></script>
+  <script type="module" src="/pages/snowluma.js"></script>
   <!-- 设置域（第二轮拆出；app.js 的 loadSettings/bindSettingsEvents/saveConfig 链全靠它们） -->
+  <script type="module" src="/pages/settings-appearance.js"></script>
+  <script type="module" src="/pages/life-feed.js"></script>
+  <script type="module" src="/pages/skills.js"></script>
   <script type="module" src="/pages/settings.js"></script>
   <script type="module" src="/pages/settings-voice.js"></script>
+  <script type="module" src="/pages/settings-extensions.js"></script>
   <script type="module" src="/pages/key-toggles.js"></script>
+  <script type="module" src="/pages/search-test.js"></script>
   <script type="module" src="/pages/settings-bind.js"></script>
   <script type="module" src="/pages/settings-save.js"></script>
   <!-- 骨架：启动、路由分发与就绪度体检仍在这里 -->

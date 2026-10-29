@@ -207,6 +207,17 @@ export class RelationshipPilotManager {
     return this.start();
   }
 
+  /**
+   * 账本保留期清理的对外入口：原来只在 RelationshipPilotStore 构造函数里跑一次，
+   * 常驻进程不重启等于不执行（2026-10-09 复审）。这里给进程内每日调度一个稳定调用点，
+   * 签名与默认值保持不变（store.pruneHistory(retentionDays = 90)），只做转发。
+   * 试点未启用/已停止时 relationshipStore 为空，静默跳过。
+   */
+  pruneHistory(retentionDays = 90) {
+    try { this.relationshipStore?.pruneHistory(retentionDays); }
+    catch { /* 清理失败不影响评估 */ }
+  }
+
   status() {
     const settings = relationshipPilotConfig(this.config());
     return {
@@ -243,7 +254,7 @@ export class RelationshipPilotManager {
         this.lastFamiliarityRefresh.set(uin, now);
       } catch (error) {
         this.lastError = String(error?.message ?? error);
-        this.log(`[relationship-pilot] 熟悉度刷新失败：${this.lastError}`);
+        this.log(`[relationship-pilot] 熟悉度刷新失败：${this.lastError}`, error);
       }
     }
     return true;
@@ -313,7 +324,7 @@ export class RelationshipPilotManager {
         await this.#maybeEvaluate(uin, context);
       } catch (error) {
         this.lastError = String(error?.message ?? error);
-        this.log(`[relationship-pilot] ${uin} 影子评估失败：${this.lastError}`);
+        this.log(`[relationship-pilot] ${uin} 影子评估失败：${this.lastError}`, error);
       } finally {
         this.running = Math.max(0, this.running - 1);
         this.emit('relationship-pilot-update', this.status());

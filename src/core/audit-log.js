@@ -176,10 +176,12 @@ export function pruneAudit(options = {}) {
     const m = FILE_RE.exec(name);
     if (!m) continue;
     if (m[1] >= cutoffKey) { kept.push(name); continue; }
-    removed.push(name);
     if (!dryRun) {
-      try { fs.rmSync(path.join(dir, name), { force: true }); } catch { /* 忽略 */ }
+      // 删成功才计入 removed：删不掉（权限/占用）的文件不能报告成"已清理"，
+      // 下次 prune 还会再试一次（2026-10-12 审查）。
+      try { fs.rmSync(path.join(dir, name), { force: true }); } catch { continue; }
     }
+    removed.push(name);
   }
   return { dir, keepMonths, kept, removed, dryRun };
 }

@@ -2,6 +2,7 @@
 // 覆盖绝大多数托管服务（OpenAI / Groq / SiliconFlow / 自建 faster-whisper 网关…），
 // 所以用户换服务只需要改 baseUrl + model，不用等我们适配。
 import { asrApiKey, getConfig } from '../core/config.js';
+import { readTextBounded } from '../core/http-body.js';
 
 /** 16k 单声道 s16 PCM 套一个 WAV 头（托管服务普遍只吃带容器的文件，裸 PCM 不收）。 */
 export function pcmToWav(pcm, { sampleRate = 16000, channels = 1, bitsPerSample = 16 } = {}) {
@@ -57,7 +58,8 @@ export async function openAiCompatibleTranscribe(wavBuffer, {
       body: form,
       signal: controller.signal
     });
-    const body = await res.text();
+    // 有界读（1MB）：转写结果本应很小，超限视为上游异常并中断（2026-10-09 审查）
+    const body = await readTextBounded(res, 1024 * 1024);
     if (!res.ok) throw new Error(`语音识别服务返回 ${res.status}：${String(body).slice(0, 200)}`);
     let data = null;
     try { data = JSON.parse(body); } catch { /* 有的服务直接回纯文本 */ }

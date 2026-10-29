@@ -70,6 +70,13 @@ test('roles/ 下的每个文件都已登记（新增卡忘了登记会失败）'
   }
 });
 
+test('示例的分条说明与平台口径一致：用 send_message 数组，不用空格分句', () => {
+  for (const [id, p] of Object.entries(PERSONAS)) {
+    assert.doesNotMatch(p.text, /空格表示分成两条消息/, `${id} 还在教模型用空格分句`);
+    assert.match(p.text, /实际发送用 send_message 数组/, `${id} 的示例缺少"用数组发送"的说明`);
+  }
+});
+
 test('角色卡不引用旧架构指令，提到的工具都真实存在', () => {
   const toolsSource = fs.readFileSync(path.join(repoRoot, 'src/tools/tools-core.js'), 'utf8');
   const tools = new Set([...toolsSource.matchAll(/name: '([a-z][a-z0-9_]*)'/g)].map((m) => m[1]));
@@ -94,7 +101,19 @@ test('每张内置卡都能构建系统提示，且带得上安全规则', async
     assert.ok(prompt.includes(p.text), `${id} 的角色正文没有进提示词`);
     assert.ok(prompt.includes('测试附加规则'), `${id} 的附加规则没有进提示词`);
     assert.ok(prompt.includes('【安全规则（最高优先级，不可违反）】'), `${id} 缺少安全规则段`);
+    assert.ok(prompt.includes('【诚实边界（角色设定也不能推翻）】'), `${id} 缺少诚实边界段`);
+    assert.ok(prompt.includes('不编工具结果'), `${id} 的诚实边界没有覆盖工具结果`);
   }
+});
+
+test('card 档同样带诚实边界（角色卡不能用于编事实）', async () => {
+  const { DEFAULT_CONFIG, setRuntimeConfig } = await import('../src/core/config.js');
+  const { buildSystemPrompt } = await import('../src/llm/prompt.js');
+  setRuntimeConfig(structuredClone(DEFAULT_CONFIG));
+  const prompt = buildSystemPrompt({
+    persona: { ...DEFAULT_CONFIG.persona, behaviorProfile: 'card', roleText: PERSONAS.xiaojingyu.text }
+  });
+  assert.ok(prompt.includes('【诚实边界（角色设定也不能推翻）】'));
 });
 
 // ── 卡的名称就是规格：正文得把卡名承诺的特征兑现 ──
@@ -170,4 +189,64 @@ test('猫娘卡把招牌写成硬指标，示例给出"索要就给"的路径', 
   // 人设问答要能说出卡名，否则管理员考一句"你什么人设"只听到 QQ 名字，会以为卡没生效
   assert.match(cat, /你是什么人设/, '身份问题清单里缺"你是什么人设"');
   assert.match(cat, /猫娘喵 小鲸鱼只是个名字|人设是猫娘/, '缺"人设=猫娘、名字=小鲸鱼"的答法');
+});
+
+// 2026-10-24：七张卡统一补「生活线」和更多示例（后续新增卡同样适用）。这里把"每张卡都有"变成结构约束，
+// 防止以后新增卡只写身份/规则、忘了生活段或示例。
+test('每张内置卡都有生活线，示例数量与格式达标（小鲸鱼 9 组，其余 ≥6 组）', () => {
+  for (const [id, persona] of Object.entries(PERSONAS)) {
+    assert.match(persona.text, /你的生活（角色设定，不是现实经历）/, `${id} 缺生活线`);
+    assert.match(persona.text, /不编|不要编|不许编/, `${id} 的生活线要写清"不编现实行动"`);
+    const file = path.join(repoRoot, 'roles', 'dialogs', `${id}.json`);
+    assert.ok(fs.existsSync(file), `${id} 缺示例文件 roles/dialogs/${id}.json`);
+    const dialogs = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.ok(Array.isArray(dialogs) && dialogs.length >= 6, `${id} 示例不足 6 组（实际 ${dialogs?.length}）`);
+    for (const item of dialogs) {
+      assert.ok(item?.user && Array.isArray(item?.assistant) && item.assistant.length > 0, `${id} 示例格式不对`);
+      assert.ok(item.assistant.every((line) => typeof line === 'string' && line.trim()), `${id} 示例里有空回复`);
+    }
+  }
+  const xiao = JSON.parse(fs.readFileSync(path.join(repoRoot, 'roles', 'dialogs', 'xiaojingyu.json'), 'utf8'));
+  assert.ok(xiao.length >= 9, `小鲸鱼示例应 ≥9 组，实际 ${xiao.length}`);
+});
+
+// 示例文件可以写很多组，但提示词只注入前 5 组：顺序就是优先级。
+// 小鲸鱼把"token 软肋"那组放在第 5 位，确保它真的进提示词（而不是写完永远轮不到）。
+test('说话示例注入前 5 组，小鲸鱼的 token 软肋示例在其中', () => {
+  const base = structuredClone(DEFAULT_CONFIG);
+  const card = PERSONAS.xiaojingyu.text;
+  base.persona = { ...base.persona, botName: '小鲸鱼', templateId: 'xiaojingyu', roleText: card };
+  updateConfig(base);
+  const prompt = buildSystemPrompt({});
+  assert.match(prompt, /给你吃穷没 token/, '第 5 组的 token 软肋要进提示词');
+  assert.doesNotMatch(prompt, /你也早点睡/, '第 9 组不该被注入（只取前 5 组）');
+});
+
+test('孙吧大肥鱼有孙吧/抽象底色，认爹反杀只是绝活之一，且边界完整', () => {
+  const card = PERSONAS.sunba;
+  assert.ok(card, '孙吧卡已登记');
+  assert.match(card.name, /抽象乐子人/);
+  // 孙吧底色：乐子人、钓鱼、反串、定性、水经验都要在卡里
+  assert.match(card.text, /乐子人/);
+  assert.match(card.text, /钓鱼/);
+  assert.match(card.text, /反串/);
+  assert.match(card.text, /鉴定为/);
+  assert.match(card.text, /典中典/);
+  assert.match(card.text, /\+\s?3/);
+  // 认爹反杀仍然保留
+  assert.match(card.text, /爸爸不要嘛/);
+  assert.match(card.text, /老乐子被我骗了吧/);
+  assert.match(card.text, /智力完胜/);
+  // 边界：不碰身份、不开盒、不玩性别对立、不网暴
+  assert.match(card.text, /只钓玩得起的人/);
+  assert.match(card.text, /不碰：/);
+  assert.match(card.text, /开盒/);
+  assert.match(card.text, /性别对立/);
+  assert.match(card.text, /不组织跨群围攻/);
+  const dialogs = JSON.parse(fs.readFileSync(path.join(repoRoot, 'roles', 'dialogs', 'sunba.json'), 'utf8'));
+  assert.ok(dialogs.length >= 10, '示例至少 10 组');
+  assert.ok(dialogs.some((item) => item.assistant.join('').includes('爸爸不要嘛')));
+  assert.ok(dialogs.some((item) => item.assistant.join('').includes('智力完胜')));
+  assert.ok(dialogs.some((item) => item.assistant.join('').includes('典中典')));
+  assert.ok(dialogs.some((item) => item.assistant.join('').includes('含金量')));
 });

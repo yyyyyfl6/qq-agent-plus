@@ -2,9 +2,7 @@ name: Release
 
 on:
   push:
-    branches:
-      - dual-skin
-      - hajimi-and-fatfish
+    branches: [dual-skin, hajimi-and-fatfish]
     tags:
       - 'v*'
 
@@ -15,6 +13,10 @@ on:
 # 同理：移动 tag（v5）可以在上游被改写。
 permissions:
   contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   verify:
@@ -27,9 +29,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 22
+          node-version-file: .nvmrc
 
       # 发布前再跑一遍与 CI 相同的检查，任何一步失败都不会出 Release
       - run: npm ci
@@ -37,13 +39,15 @@ jobs:
       - run: npm run lint
       # 与 ci.yml 同步：runner 没有 ffmpeg，缺了会让 GIF 帧条与语音转码的用例静默跳过
       - name: 安装 ffmpeg（GIF 帧条 / 音频转码用例依赖）
-        # runner 仓库更新实际挂住十分钟；限时失败后才能拿到日志定位，不能无限挂住发版。
-        timeout-minutes: 3
         run: |
-          set -x
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg
-          ffmpeg -version | head -n 1
+          # 与 ci.yml 同口径：apt 源偶尔卡死，失败只警告并继续；依赖用例会显式 skip。
+          APT_OPTS=(-o Acquire::ForceIPv4=true -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+          if ! timeout 180 sudo apt-get install -y -qq "${APT_OPTS[@]}" ffmpeg; then
+            if ! timeout 240 sudo apt-get update -qq "${APT_OPTS[@]}" || ! timeout 180 sudo apt-get install -y -qq "${APT_OPTS[@]}" ffmpeg; then
+              echo "::warning::ffmpeg 安装失败（apt 源不可达），相关用例将跳过"
+            fi
+          fi
+          ffmpeg -version | head -n 1 || echo "ffmpeg unavailable; dependent tests will be skipped"
       - name: 语法检查（src / scripts / test / ui，递归）
         run: |
           set -e
@@ -55,12 +59,24 @@ jobs:
           for d in src scripts test ui; do
             [ -d "$d" ] || { echo "缺少目录：$d"; exit 1; }
           done
-          mapfile -t files < <(find src scripts test ui -type f \( -name '*.js' -o -name '*.mjs' \) | sort)
+          mapfile -t files < <(find src scripts test ui examples -type f \( -name '*.js' -o -name '*.mjs' \) | sort)
           [[ ${#files[@]} -gt 0 ]] || { echo "没有找到任何待检查文件"; exit 1; }
           for f in "${files[@]}"; do node --check "$f"; done
           echo "语法检查通过（${#files[@]} 个文件）"
       # 与 ci.yml 同口径：全仓库的 .sh 都检（原先写死三个文件名，
       # 新加脚本不会被检查 —— 当前恰好只有三个，属埋雷不是漏检）。
+      - name: Tag 与版本号一致
+        run: |
+          set -e
+          # 打错 tag 会让 Release 版本与产物长期不一致，而 src/auto-update.js 正是按 tag
+          # 判"有没有新版本"（2026-10-03 全量审查补）
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "tag $GITHUB_REF_NAME 与 package.json 版本 $PKG_VERSION 不一致"
+            exit 1
+          fi
+          echo "版本号一致：$TAG_VERSION"
       - name: Shell 脚本语法检查
         run: |
           set -e
@@ -69,21 +85,67 @@ jobs:
           for f in "${shells[@]}"; do bash -n "$f"; done
           echo "Shell 语法检查通过（${#shells[@]} 个）"
       - run: node src/ops.js scan --strict
-      - run: npm test
+      - name: 官方技能索引体检
+        run: npm run skill:check
+      - run: npm run test:unit
+      # 与 ci.yml 同一步：发布闸门也要按更新器 unit 的加固环境（NoNewPrivileges + umask 0077）
+      # 把门禁全清单复跑一遍 —— 门禁跑在加固 unit 里，2026-10-10 的事故（加固环境里两条
+      # sudo 回退用例必败、导致标准部署装不上新版）正是默认环境里看不见的那一类。
+      # 2026-10-10 同族第二个漏网：门禁单元的进程还可能没有 docker 组（用户管理器未继承），
+      # ops-health 里断言"全绿"的用例会因直连真实套接字失败而全红（issue #30 实测 3 条必挂）
+      # —— 这里同样把 DOCKER_HOST 指向 000 权限的假套接字，复刻"套接字不可访问"。
+      # 2026-10-13 审查：与 ci.yml 对齐第四条维度（无 devDeps）—— tag 可以打在任何提交上、
+      # 不必然经过 main 的 CI，缺这一维则发布闸门对"裸 import devDep"是空的（release.yml 的
+      # 注释此前自称"与 ci.yml 同一步"，事实不符）。
+      - name: 更新器门禁全清单（按 unit 的加固环境复跑：NoNewPrivileges + umask 0077 + 无 docker 访问 + 无 devDeps）
+        run: |
+          command -v setpriv >/dev/null || { echo "缺少 setpriv"; exit 1; }
+          umask 0077
+          NO_DOCKER_SOCK="${RUNNER_TEMP:-/tmp}/no-docker-access.sock"
+          : > "$NO_DOCKER_SOCK"
+          chmod 000 "$NO_DOCKER_SOCK"
+          export DOCKER_HOST="unix://$NO_DOCKER_SOCK"
+          npm prune --omit=dev --no-audit --no-fund
+          setpriv --no-new-privs npm run test:unit
+          setpriv --no-new-privs npm run test:local
+          setpriv --no-new-privs npm run test:regression
+          setpriv --no-new-privs node src/ops.js scan --strict
+      - name: 恢复开发依赖（上一步失败也要恢复：后面的回归步骤还要用）
+        if: always()
+        run: npm ci --no-audit --no-fund
       - run: npm run test:local
+      - name: 提示词 / 渲染 / 滚动 / 用量端到端回归
+        run: |
+          node test/test-prompt.mjs
+          node test/render-test.mjs
+          node test/scroll-test.mjs
+          node test/usage-e2e.mjs
+      # 与 ci.yml 的 browser job 同口径：发布前用真 Chromium 跑一遍控制台冒烟。
+      # 放在最后：它需要 devDeps（上一段已恢复），且不参与加固门禁的依赖裁剪。
+      - name: 安装 Chromium（浏览器冒烟）
+        run: npx playwright install --with-deps chromium
+      - name: 浏览器冒烟（真 Chromium）
+        run: npm run test:browser
 
   release:
-    if: startsWith(github.ref, 'refs/tags/')
     needs: verify
     runs-on: ubuntu-latest
     # 写权限只给这个 job：它只做"生成说明 + 建草稿 Release"，不跑 npm ci、不跑测试。
     permissions:
       contents: write
+      packages: read   # 只读 GHCR manifest，确认镜像已发布
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: 登录 GHCR（读私有包时也要有凭据）
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" \
+            | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
 
       - name: 生成发布说明草稿
         run: |
@@ -110,14 +172,44 @@ jobs:
           } > RELEASE_NOTES.md
           cat RELEASE_NOTES.md
 
-      - name: 创建 Release（草稿，确认后发布）
+      - name: 确认镜像已发布（避免发布一个拉不到镜像的版本）
+        run: |
+          set -e
+          VERSION="${GITHUB_REF_NAME#v}"
+          for _ in $(seq 1 120); do
+            if docker buildx imagetools inspect "ghcr.io/${{ github.repository }}:${VERSION}" >/dev/null 2>&1; then
+              echo "image ghcr.io/${{ github.repository }}:${VERSION} is available"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::20 分钟内未在 GHCR 看到 ${VERSION} 镜像；Release 不创建"
+          exit 1
+
+      - name: 创建 Release（草稿，确认后发布）并上传连接脚本
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            --draft \
-            --title "${GITHUB_REF_NAME}" \
-            --notes-file RELEASE_NOTES.md
+          set -e
+          PRERELEASE=()
+          # 与 update-notice 的口径一致：tag 含 -rc/-beta 等预发布标识时，
+          # GitHub Release 必须标 prerelease，否则 /releases/latest 会把它当正式版。
+          case "${GITHUB_REF_NAME}" in
+            *-*) PRERELEASE=(--prerelease) ;;
+          esac
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            # 重跑：只补资产，不重复创建（create 会因已存在直接失败）。
+            gh release upload "${GITHUB_REF_NAME}" \
+              console-tunnel.bat console-tunnel.sh --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --draft \
+              --verify-tag \
+              "${PRERELEASE[@]}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file RELEASE_NOTES.md \
+              console-tunnel.bat console-tunnel.sh
+          fi
 
   # 主人已授权 fork 发版；普通开发提交只验证，显式发布提交才走这一步。
   # 验证 job 没有写权限，不能由依赖安装或测试过程提前生成发布物。

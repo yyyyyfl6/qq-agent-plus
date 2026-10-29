@@ -14,6 +14,7 @@ import { DATA_DIR, getConfig, updateConfig } from '../core/config.js';
 import { setChannelPrices } from './model-prices.js';
 import { normalizePriceFeed } from './price-feed.js';
 import { probeChannelPrices } from './price-probe.js';
+import { readJsonBounded } from '../core/http-body.js';
 
 const FILE = path.join(DATA_DIR, 'channel-prices.json');
 const CACHE_VERSION = 1;
@@ -171,7 +172,13 @@ export async function refreshChannelFeed(vendor, url, options = {}) {
       signal: AbortSignal.timeout(timeoutMs)
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const payload = await res.json().catch(() => { throw new Error('返回的不是合法 JSON'); });
+    // 有界读（2MB）：价目文件不该无上限；超限与非法 JSON 分开报，别把"太大"说成"不合法"（2026-10-09 审查）
+    let payload;
+    try {
+      payload = await readJsonBounded(res, 2 * 1024 * 1024);
+    } catch (error) {
+      throw new Error(error?.code === 'BODY_TOO_LARGE' ? '价目文件过大（超过 2MB）' : '返回的不是合法 JSON');
+    }
     const norm = normalizePriceFeed(payload);
     if (!norm || !Object.keys(norm.prices).length) throw new Error('没有可用的价格条目（需要 in/out 价目或倍率表）');
     loaded = { prices: norm.prices, url: target, dropped: norm.dropped || 0 };

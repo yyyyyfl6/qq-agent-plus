@@ -136,7 +136,8 @@ async function runFfmpeg(ffmpegPath, buffer, vf, signal) {
  */
 export async function fetchOversizedImageAsJpeg(safeUrl, originalError, signal, {
   cap = 12 * 1024 * 1024,
-  largeCap = 96 * 1024 * 1024
+  // 与音频/视频通道同一个 64MB 上限：整包读内存 + 解压/抽帧的峰值已经够高。
+  largeCap = 64 * 1024 * 1024
 } = {}) {
   if (!OVERSIZE_LIMIT_RE.test(String(originalError?.message ?? ''))) throw originalError;
   const ffmpegPath = await resolveFfmpeg();
@@ -160,6 +161,16 @@ export async function fetchOversizedImageAsJpeg(safeUrl, originalError, signal, 
   }
   const jpeg = await runFfmpeg(ffmpegPath, buffer, vf, signal);
   return { buffer: jpeg, contentType: 'image/jpeg' };
+}
+
+/** 把视觉接口不认的静图格式（AVIF/HEIC/BMP…）转成 JPEG；ffmpeg 缺失时抛带指引的错误。 */
+export async function convertStillImageToJpeg(buffer, signal, { maxDimension = 2048 } = {}) {
+  signal?.throwIfAborted();
+  const ffmpegPath = await resolveFfmpeg();
+  if (!ffmpegPath) {
+    throw new Error('系统未安装 ffmpeg，无法把该图片转成视觉接口支持的 JPEG');
+  }
+  return runFfmpeg(ffmpegPath, buffer, `scale='min(${maxDimension},iw)':-2`, signal);
 }
 
 /** 数 GIF 总帧数：-f null 全量解一遍，取 stderr 末尾 progress 的 frame= N。

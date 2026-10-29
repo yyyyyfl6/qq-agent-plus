@@ -9,7 +9,7 @@ the authenticated console boundary.
 - Stickers: local cached QQ favorites and AI-collected images, including notes,
   tags, source and usage counts.
 - Slang: entries in `data/slang.json`, when that file exists.
-- People and memory APIs remain available to the dedicated `旧印象` page; they
+- People and memory APIs remain available to the dedicated `人物印象` page; they
   are not shown as generic Observatory tabs.
 
 Each asset tab provides create, edit, and delete controls:
@@ -23,7 +23,7 @@ Each asset tab provides create, edit, and delete controls:
   managed image file.
 - Slang entries support content, meaning, usage, example, risk, and review
   status. Writes are atomic and retain existing evidence fields.
-- The `旧印象` page supports an explicit display name, source chat, friend flag, and safe
+- The `人物印象` page supports an explicit display name, source chat, friend flag, and safe
   profile note. Manual overrides survive identity rebuilds. Deletion creates a
   tombstone so archived messages do not immediately recreate the identity;
   adding the same QQ number again explicitly restores it.

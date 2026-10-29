@@ -1,5 +1,6 @@
 import { parse } from 'node-html-parser';
 import { sanitizeUserText } from '../core/util.js';
+import { readTextBounded } from '../core/http-body.js';
 
 const DETAIL_URL =
   'https://h5.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msgdetail_v6';
@@ -218,7 +219,8 @@ export class QzoneWebClient {
         : AbortSignal.timeout(20000)
     });
     if (!response.ok) throw new Error(`Qzone HTTP ${response.status}`);
-    const data = parseJsonp(await response.text());
+    // 有界读（1MB）：JSONP 文本不该无上限（2026-10-09 审查）
+    const data = parseJsonp(await readTextBounded(response, 1024 * 1024));
     for (const key of ['subcode', 'code', 'ret']) {
       if (data[key] == null || Number(data[key]) === 0) continue;
       throw new Error(

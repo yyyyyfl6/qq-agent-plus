@@ -10,8 +10,17 @@ import {
   readAutoUpdateState,
   writeAutoUpdateRequest
 } from '../src/auto-update.js';
+import { skipOnWindows } from './helpers/platform.mjs';
+
+// 更新器的这些用例用 `#!/bin/sh` 假 git 桩驱动；Windows 无法执行无扩展名的 sh 脚本，
+// 表现为超时/探针失败（不是产品回归）。纯逻辑用例仍然照跑，不受影响。
+const fakeShellOnly = { skip: skipOnWindows('更新器用例依赖 /bin/sh 假 git 桩，Windows 无法执行') };
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+// 版本号主判定后，"没有可部署版本"的用例要给出与运行版本相同的假 Release tag，
+// 否则 0.9.1 < v9.9.9 会被判成"有更新"，用例测的就不是 no-update 了。
+const LOCAL_VERSION = JSON.parse(fs.readFileSync(path.join(repo, 'package.json'), 'utf8')).version;
+const LOCAL_TAG = `v${LOCAL_VERSION}`;
 
 test('Linux permission failure stops updater before network/deployment and leaves a pending notice', { skip: process.platform === 'win32' }, (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-updater-permission-'));
@@ -47,7 +56,7 @@ function runUpdater({ appDir, dataDir, binDir = '', env = {}, timeout = 15000 })
     cwd: repo,
     env: {
       ...process.env,
-      ...(binDir ? { PATH: `${binDir}:${process.env.PATH || ''}` } : {}),
+      ...(binDir ? { PATH: [binDir, process.env.PATH || ''].filter(Boolean).join(path.delimiter) } : {}),
       ...env
     },
     encoding: 'utf8',
@@ -172,7 +181,7 @@ async function startFakeGitHub(options = {}) {
   };
 }
 
-test('scheduled updater uses the persistent Git cache and records no-update', async (t) => {
+test('scheduled updater uses the persistent Git cache and records no-update', fakeShellOnly, async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-update-runner-'));
   const appDir = path.join(root, 'app');
   const dataDir = path.join(root, 'data');
@@ -195,11 +204,15 @@ test('scheduled updater uses the persistent Git cache and records no-update', as
     server: { host: '127.0.0.1', port: 3210, token: 'token' }
   }));
   fs.writeFileSync(path.join(dataDir, 'deployed-revision'), `${revision}\n`);
+  // 更新器读的是 --app-dir 这棵树的版本；给它一个 package.json，覆盖"显式传入"的路径
+  fs.writeFileSync(path.join(appDir, 'package.json'), JSON.stringify({ version: LOCAL_VERSION }));
   writeDeployment(appDir, dataDir);
 
+  const gitLog = path.join(root, 'git.log');
   const fakeGit = path.join(binDir, 'git');
   fs.writeFileSync(fakeGit, `#!/bin/sh
 args="$*"
+[ -n "$FAKE_GIT_LOG" ] && printf '%s\\n' "$args" >> "$FAKE_GIT_LOG"
 case "$args" in
   *" remote") printf '%s\\n' 'origin' ;;
   *"remote set-url origin"*) ;;
@@ -210,13 +223,13 @@ case "$args" in
 esac
 `, { mode: 0o700 });
 
-  const github = await startFakeGitHub({ status: 'identical' });
+  const github = await startFakeGitHub({ status: 'identical', tag: LOCAL_TAG });
   t.after(() => github.close());
   const result = runUpdater({
     appDir,
     dataDir,
     binDir,
-    env: { QQ_AGENT_GITHUB_API: github.base },
+    env: { FAKE_GIT_LOG: gitLog, QQ_AGENT_GITHUB_API: github.base },
     timeout: 10000
   });
   assert.equal(result.status, 0, result.stderr);
@@ -231,9 +244,12 @@ esac
   assert.ok(state.lastCheckAt > 0);
   assert.ok(state.completedAt >= state.lastCheckAt);
   assert.equal(fs.existsSync(autoUpdatePaths(dataDir).lock), false);
+  const gitCalls = fs.readFileSync(gitLog, 'utf8');
+  assert.doesNotMatch(gitCalls, /\bfetch\b/, '版本相同不解析目标：不 fetch');
+  assert.doesNotMatch(gitCalls, /rev-parse/, '版本相同不解析目标提交');
 });
 
-test('no published release means the updater never fetches or deploys', async (t) => {
+test('no published release means the updater never fetches or deploys', fakeShellOnly, async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-update-no-release-'));
   const appDir = path.join(root, 'app');
   const dataDir = path.join(root, 'data');
@@ -291,7 +307,7 @@ esac
   assert.equal(state.updateNotice.reason, 'no-release');
 });
 
-test('updater tests a checkout and delegates deployment with the exact revision', async (t) => {
+test('updater tests a checkout and delegates deployment with the exact revision', fakeShellOnly, async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-update-deploy-'));
   const appDir = path.join(root, 'app');
   const dataDir = path.join(root, 'data');
@@ -390,7 +406,7 @@ esac
   assert.equal(fs.existsSync(path.join(dataDir, 'candidate-test-marker')), false);
 });
 
-test('transient GitHub TLS failures are retried before fetch', async (t) => {
+test('transient GitHub TLS failures are retried before fetch', fakeShellOnly, async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-update-retry-'));
   const appDir = path.join(root, 'app');
   const dataDir = path.join(root, 'data');
@@ -436,7 +452,7 @@ case "$args" in
 esac
 `, { mode: 0o700 });
 
-  const github = await startFakeGitHub({ status: 'identical' });
+  const github = await startFakeGitHub({ status: 'identical', tag: LOCAL_TAG });
   t.after(() => github.close());
   const result = runUpdater({
     appDir,
@@ -454,7 +470,7 @@ esac
   assert.match(result.stderr, /retry 2\/4/);
 });
 
-test('probe request checks repository and branch without fetching or deploying', (t) => {
+test('probe request checks repository and branch without fetching or deploying', fakeShellOnly, (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-update-probe-'));
   const appDir = path.join(root, 'app');
   const dataDir = path.join(root, 'data');
@@ -971,7 +987,7 @@ test('auto-update：拿到接管互斥后再判一次锁的状态，判定逻辑
   assert.ok((source.match(/lockJudgement\(\)/g) || []).length >= 2, 'acquireLock 与互斥内都要调用它');
 });
 
-test('并发更新：抢锁失败的一方不碰胜出方的锁与源码包（2026-09-29 审查 P1）', async (t) => {
+test('并发更新：抢锁失败的一方不碰胜出方的锁与源码包（2026-09-29 审查 P1）', fakeShellOnly, async (t) => {
   // 背景：releaseLock() 里的 unlink/rmSync 原先写在 `if (lockHandle !== null)` 之外，
   // 于是抢锁失败的一方（UPDATE_BUSY 时 lockHandle 仍是 null）也会把**胜出方**的锁文件和
   // 它在用的源码包删掉。随后第三个进程能进、它调 deploy.sh 会被 .deploy.lock 挡住而判失败，
@@ -1042,7 +1058,7 @@ esac
   t.after(() => github.close());
   const env = {
     ...process.env,
-    PATH: `${binDir}:${process.env.PATH || ''}`,
+    PATH: [binDir, process.env.PATH || ''].filter(Boolean).join(path.delimiter),
     QQ_AGENT_UPDATE_NPM: fakeNpm,
     FAKE_CANDIDATE: candidate,
     FAKE_DEPLOY_MARKER: marker,
@@ -1141,7 +1157,7 @@ const posixOnly = { skip: process.platform === 'win32' ? '需要 POSIX 假 git �
 
 test('自动更新锁：读不出 pid 的锁在宽限期内不被抢，做旧后可以接管', posixOnly, async (t) => {
   const { appDir, dataDir, binDir } = seedIdleUpdater(t, 'qq-update-stale-');
-  const github = await startFakeGitHub({ status: 'identical' });
+  const github = await startFakeGitHub({ status: 'identical', tag: LOCAL_TAG });
   t.after(() => github.close());
   const env = { QQ_AGENT_GITHUB_API: github.base };
   const lockFile = autoUpdatePaths(dataDir).lock;
@@ -1166,7 +1182,7 @@ test('自动更新锁：读不出 pid 的锁在宽限期内不被抢，做旧后
 
 test('自动更新锁：接管先抢互斥文件；遗留互斥过 5 分钟可被清掉', posixOnly, async (t) => {
   const { appDir, dataDir, binDir } = seedIdleUpdater(t, 'qq-update-takeover-');
-  const github = await startFakeGitHub({ status: 'identical' });
+  const github = await startFakeGitHub({ status: 'identical', tag: LOCAL_TAG });
   t.after(() => github.close());
   const env = { QQ_AGENT_GITHUB_API: github.base };
   const lockFile = autoUpdatePaths(dataDir).lock;

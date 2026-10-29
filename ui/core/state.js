@@ -9,7 +9,7 @@ import { $, $$ } from './dom.js';
 import { lifecycleRemainingText } from './lifecycle-labels.js';
 import { renderMemoryList } from '../pages/memory.js';
 const state = {
-  tab: 'sessions',
+  tab: 'overview',   // 首屏落地页：与 index.html 里标了 active 的 tab 保持一致（2026-10-08 总览页）
   integrationStatus: null,
   autoUpdateStatus: null,
   sessions: [],          // 摘要列表
@@ -42,6 +42,8 @@ const state = {
   assetSlangResearchState: '',
   assetOverview: null,
   assetDetail: null,
+  assetStickerSelectMode: false,
+  assetStickerSelectedIds: [],
   assetLoadSeq: 0,
   groupMembers: [],
   groupMembersLoaded: false,
@@ -49,7 +51,26 @@ const state = {
   // 切页签会导致记忆页 DOM 重建，状态若只存在按钮/文本节点里就会丢失，
   // 用户切回来时看不出整理是在跑还是已经结束了。
   consolidating: {},      // chatKey -> { startedAt }
-  consolidateResult: {}   // chatKey -> { note, at, failed? }
+  consolidateResult: {},   // chatKey -> { note, at, failed? }
+  livingMemory: {
+    status: null,
+    chats: [],
+    tab: 'overview',
+    selectedScope: '',
+    query: '',
+    search: '',
+    view: 'list',
+    page: 1,
+    createOpen: false,
+    selectedMemoryId: '',
+    detail: null,
+    recallResult: null,
+    list: null,
+    overviewList: null,
+    graph: null,
+    statusFilter: '',
+    pageError: ''
+  }
 };
 
 // ── 跨文件共享的可变单元 ──
@@ -210,6 +231,12 @@ state.chatMsgSortCache = { src: null, newestFirst: [] };
  * 3. 竞态防护：请求期间用户可能切走或改了时间范围，回来时丢弃过期结果
  */
 state.usageLoadToken = 0;          // 每次加载递增，用于丢弃过期结果
+
+// 人物印象页 / 异常日志页的同类竞态防护（2026-10-04 复审 P3）：这两页的加载路径原先只有
+// `state.tab !== …` 判断，挡不住**同一个页签内**的乱序 —— 用户连点两次筛选项时，先发的
+// 请求后到，会把后发的结果盖回去，界面显示的是上一次筛选的数据。口径与 usageLoadToken 一致。
+state.identityLoadToken = 0;
+state.incidentLoadToken = 0;
 
 state.usageLastData = null;        // 上一次加载成功的数据：{ range, stats, st, prices }
 

@@ -6,6 +6,20 @@
 //   3. <tool_call> send_message \n {"messages":"..."} </tool_call>
 //   4. 整段就是一个带 name 的 JSON（没有 <tool_call> 包裹）
 
+/**
+ * `arguments` 经常是 **JSON 字符串**（OpenAI 的 function.arguments 就是这个形态）：
+ * 原来按「非对象 → {}」一判就整包丢掉，工具拿到空参数，消息根本没发出去
+ *（2026-10-04 全面复审 P3）。先试着解一次字符串，解不出再按空对象。
+ * ⚠️ 两个入口（<tool_call> 包裹 / 整段裸 JSON 的兜底）都要走这里：只修一处时另一种
+ * 形态照样整包丢（2026-10-05 全审：格式 4 的兜底还是旧判据，却已有注释声称支持）。
+ */
+function normalizeArgs(rawArgs) {
+  if (typeof rawArgs !== 'string') return rawArgs;
+  const text = rawArgs.trim();
+  if (!text) return {};
+  try { return JSON.parse(text); } catch { return {}; }
+}
+
 function parseInlineBlock(block) {
   // 1) 整个块是 JSON：{"name": "...", "arguments": {...}}（部分模型用 parameters/args）
   const jsonMatch = block.match(/\{[\s\S]*\}/);
@@ -13,7 +27,7 @@ function parseInlineBlock(block) {
     try {
       const obj = JSON.parse(jsonMatch[0]);
       const name = obj.name || obj.function || obj.tool;
-      const args = obj.arguments || obj.parameters || obj.args || obj.input || {};
+      const args = normalizeArgs(obj.arguments || obj.parameters || obj.args || obj.input || {});
       if (name) return { name: String(name), args: (args && typeof args === 'object' && !Array.isArray(args)) ? args : {} };
     } catch { /* 不是 JSON，继续按 XML 解析 */ }
   }
@@ -73,7 +87,10 @@ export function resolveToolCalls(message) {
       try {
         const obj = JSON.parse(jsonMatch[0]);
         const name = obj.name || obj.function || obj.tool;
-        const args = obj.arguments || obj.parameters || obj.args || obj.input;
+        // ⚠️ 这里同样要解字符串形态的 arguments（走 normalizeArgs）：裸 JSON 兜底原先按
+        // 「非对象 → 丢弃」，模型把 arguments 写成 JSON 字符串时整条调用被吞掉，
+        // qzone/说说这类判断方会一直收到"必须调用 submit…"直到轮次耗尽失败（2026-10-05 全审）。
+        const args = normalizeArgs(obj.arguments || obj.parameters || obj.args || obj.input);
         if (name && args && typeof args === 'object' && !Array.isArray(args)) {
           parsed = [{ name: String(name), args }];
         }

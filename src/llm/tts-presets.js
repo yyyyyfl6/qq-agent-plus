@@ -197,6 +197,36 @@ export const TTS_SERVICES = [
     note: '按官方文档实现、未实测：需要 API Key + GroupId；音频是 hex 编码（适配器已处理）。填好后点「试听」即可验证。'
   },
   {
+    id: 'mimo',
+    label: '小米 MiMo（token-plan，支持情绪/导演指令）',
+    provider: 'mimo',
+    creds: ['key'],
+    baseUrl: 'https://token-plan-cn.xiaomimimo.com/v1',
+    hosts: ['token-plan-cn.xiaomimimo.com'],
+    // token-plan 控制台没有可用的固定公开链接：keyUrl 留空，界面不硬编一个可能失效的地址
+    keyUrl: '',
+    models: [
+      {
+        id: 'mimo-v2.5-tts',
+        voices: [
+          { id: 'mimo_default', label: '默认音色', cat: 'MiMo' },
+          { id: '冰糖', label: '冰糖（甜、偏亮）', cat: 'MiMo' },
+          { id: '茉莉', label: '茉莉（柔和）', cat: 'MiMo' },
+          { id: '苏打', label: '苏打（清爽）', cat: 'MiMo' },
+          { id: '白桦', label: '白桦（偏低沉）', cat: 'MiMo' },
+          { id: 'Mia', label: 'Mia', cat: 'MiMo' },
+          { id: 'Chloe', label: 'Chloe（清亮，实测近似小鲸鱼）', cat: 'MiMo' },
+          { id: 'Milo', label: 'Milo', cat: 'MiMo' },
+          { id: 'Dean', label: 'Dean', cat: 'MiMo' }
+        ]
+      }
+    ],
+    note: 'token-plan 的语音合成走 /v1/chat/completions：Key 放在 api-key 头，不是 Bearer。'
+      + '「导演指令」可写角色/场景/语气（例如“你是小鲸鱼，声音软一点，像在群里随口聊天”）；'
+      + 'send_voice 的 emotion 参数会自动追加一行情绪。实测有导演指令时停顿和语气更自然。'
+      + '音色是内置候选，实际可用与否看账号开通情况；报错会带 HTTP 状态与上游原因。'
+  },
+  {
     id: 'custom',
     label: '自定义 / 自建（OpenAI 兼容 /audio/speech）',
     provider: 'openai',
@@ -251,11 +281,18 @@ export function ttsServiceOf(cfg) {
 export function ttsKeyFor(cfg, serviceId = '') {
   const current = ttsServiceOf(cfg)?.id || '';
   const id = serviceId || current;
-  const fromMap = String(cfg?.keys?.[id] || '').trim();
+  // 用**自有属性**读映射：serviceId 来自端点查询串（外部可控），`keys['constructor']` 会命中原型链，
+  // 把函数源码当成"这家存过的 Key"（与 config-legacy 的 imageGenKeyFor 同款，2026-10-03 全量审查）
+  const map = cfg?.keys;
+  const fromMap = map && typeof map === 'object' && Object.hasOwn(map, id) ? String(map[id] || '').trim() : '';
   if (fromMap) return fromMap;
-  // 旧配置只有一个 apiKey（没有 keys 映射）：只在问"当前这家"时兜底 —— 否则会把硅基流动的
-  // Key 拿去打火山的接口（2026-09-28：豆包那条路会因此报 45000010，报错还指向错误的 Key）
-  return id === current ? String(cfg?.apiKey || '').trim() : '';
+  // 旧配置只有一个 apiKey（没有 keys 映射）：**归属明确**（apiKeyService = 这把是给哪家存的，
+  // 提交时记）才用。没记归属的老配置按"当前这家"兜底 —— **升级不改变任何人在用/不在用**。
+  // ⚠️ 为什么不能继续只看"是不是当前这家"（2026-09-28 起一直是这么兜底的）：切换服务预设后
+  // current 会跟着变，上一家那把单槽 Key 就被当成新服务的那把发出去 —— 与 asr 侧 2026-09-26
+  // 修过的事故同型（把腾讯的 SecretKey 当讯飞 APISecret 发出去）。
+  const owner = String(cfg?.apiKeyService || '').trim() || current;
+  return id === owner ? String(cfg?.apiKey || '').trim() : '';
 }
 
 /** 哪几家已经存过 Key（给界面显示掩码用；不下发明文）。 */

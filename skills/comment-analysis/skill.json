@@ -1,0 +1,8 @@
+{
+  "id": "comment-analysis",
+  "name": "评论分析",
+  "version": "1.1.0",
+  "description": "优先用 B 站插件读评论，把公开评论归成几类观点；非 B 站页面才用 web_fetch。",
+  "allowedTools": ["bilibili__search", "bilibili__video", "bilibili__read", "web_fetch", "send_message"],
+  "triggers": ["分析一下评论", "评论怎么看", "大家怎么评价"]
+}

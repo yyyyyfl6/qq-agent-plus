@@ -1,11 +1,8 @@
 // 由 ui/app.js 机械拆出（2026-10-01，改进方案 §11「UI 结构治理」第二轮：设置域）。
-// 设置页事件绑定（bindSettingsEvents 及其专用小件）
-// 跨文件引用一律走 import（模块作用域，不往全局词法环境里放东西）；可变状态挂 state，见 AGENTS.md。
-// 搬运只切不改：每个声明的源码与拆分前逐字节一致（脚本内已核对，勿手改缩进）。
+// 设置页事件绑定；跨文件引用走 import，可变状态挂 state（见 AGENTS.md）。
 'use strict';
 
-
-import { applyTheme, currentThinkingRaw, loadSettings, refreshStatus, renderSettings } from '../app.js';
+import { currentThinkingRaw, loadSettings, refreshStatus, renderSettings, switchTab } from '../app.js';
 import { api } from '../core/api.js';
 import { ASR_SERVICES, MODEL_SERVICES_UI, QZONE_RUN_LABELS } from '../core/constants.js';
 import { askForConfirmation, bindPeekToggle, requestExperimentOwnerUin, syncClampedInputs } from '../core/dom-util.js';
@@ -16,17 +13,21 @@ import {
 } from '../core/format.js';
 import { state } from '../core/state.js';
 import { loadExperimentalFeatureStatuses } from './features.js';
+import { bindAdminBriefingRunButton } from './moments.js';
 import { openMemoryModelPicker } from './memory.js';
 import {
-  launchExperimentalFeature, loadDailyMomentsStatus, loadGroupGameView, loadQzoneInteractionStatus,
+  cancelLivingMemoryGraduation, launchExperimentalFeature, loadDailyMomentsStatus, loadGroupGameView, loadQzoneInteractionStatus,
   loadRemindersView, momentStatusLabel, renderGroupChecklist, renderMomentWindowRow
 } from './moments.js';
 import {
   applyPersonaDraft, currentPersonaId, defaultPersonaFold, openPersonaCreateModal, parsePersonaCard,
-  personaBaseCardId, personaSectionBody, syncPersonaButtons
+  personaBaseCardId, personaDraftDirty, personaSectionBody, savedPersonaId, syncPersonaButtons
 } from './persona.js';
 import { saveConfig } from './settings-save.js';
 import { bindImageGenPreset, bindTtsControls } from './settings-voice.js';
+import { bindHumanizePreset, bindHumanizeRecommend, bindProactiveWindowEditor, loadHumanizeState } from './chat.js';
+import { bindSearchTest } from './search-test.js';
+import { hydrateExtensionStatus } from './settings-extensions.js';
 import {
   openBlocklistModal, openModelAddModal, openModelDeleteModal, openModelPicker, openPriceDialog,
   openWhitelistPicker, renderTimeRuleEditor, startListPoller, syncThinkingUi
@@ -104,8 +105,10 @@ function bindCrossSectionControls() {
       } catch (e) { if (out) out.textContent = `失败：${e.message}`; }
     });
   }
+  bindAdminBriefingRunButton();
   renderGroupChecklist('cfg-game-chats-box', state.config?.groupGame?.chats || []);
   renderGroupChecklist('cfg-digest-chats-box', state.config?.groupDigest?.chats || []);
+  renderGroupChecklist('cfg-briefing-chats-box', state.config?.adminBriefing?.chats || []);
   // 定时提醒页：列表加载 + 取消按钮（事件挂在列表容器上做委托，行是动态渲染的）
   const pendBox = $('#reminders-pending');
   if (pendBox && !pendBox.dataset.bound) {
@@ -228,13 +231,14 @@ function sliderFillPos(ratio) {
   return `calc(${SLIDER_THUMB_PX / 2}px + ${Number(r.toFixed(4))} * (100% - ${SLIDER_THUMB_PX}px))`;
 }
 
-// 设置页事件绑定：原来是一个 1544 行的单函数，按**安全边界**（两侧无共享局部名）切成 4 段。
-// 只切不改 —— 每段的语句与切分前逐字节一致，顺序、条件、守卫都没动；这里按原顺序调用。
+// 设置页事件绑定：原先 1544 行的单函数按安全边界切成 4 段；顺序、条件、守卫未动。
 function bindSettingsEvents(c) {
   bindSettingsSaveAndSections();
   bindSettingsListsAndGroups(c);
   bindSettingsModelsAndKeys(c);
   bindSettingsPersonaAndVision();
+  bindProactiveWindowEditor();
+  bindHumanizePreset(); bindHumanizeRecommend(); if (state.settingsSection === 'chat') loadHumanizeState();
 }
 
 // ── 设置页绑定·第 1/4 段：保存按钮 + 实验/动态/语音三个分区块 ──
@@ -254,11 +258,15 @@ function bindSettingsSaveAndSections() {
       await saveConfig();
       const res = $('#cfg-save-result');
       res.textContent = '已保存 ✓';
+      res.title = res.textContent;   // 胶囊里的状态行会省略，完整文案挂在 title 上
       res.classList.remove('saved-flash');
       void res.offsetWidth;
       res.classList.add('saved-flash');
       // 回填被夹过的字段（服务端存下来的值可能与框里显示的不一样）
       syncClampedInputs();
+      // 回填会补发 input 事件，清"未保存"必须放在它之后。
+      state.settingsDirty = false;
+      const dirty = $('#cfg-dirty-note'); if (dirty) dirty.textContent = '';
       // 保存成功后，人设页那条"还没生效"的提示就没意义了，清掉它
       if (state.settingsSection === 'persona') {
         state.personaEditNote = '';
@@ -266,45 +274,39 @@ function bindSettingsSaveAndSections() {
         if (note) note.textContent = '';
       }
       refreshStatus().then(() => {
-        // 省 Token 的"实际生效值"表按 /api/status 渲染：保存完要等状态回来再重画一次，
-        // 否则切了档位、表格还显示上一档的数字（要刷新页面才对得上）。
+        // 省 Token 的"实际生效值"表按 /api/status 渲染：保存后要等状态回来再重画一次。
         if (state.settingsSection !== 'token-saver') return;
         const section = state.settingsSection;
         renderSettings();
-        // 重画会把上面写好的"已保存 ✓"连同节点一起换掉 —— 这里补写一次，
-        // 否则在省 Token 页点保存看不到任何成功反馈（数字本来就低于上限时尤其明显）。
+        // 重画会换掉"已保存 ✓"节点，这里补写一次。
         if (state.settingsSection !== section) return;
         const again = $('#cfg-save-result');
         if (again) {
           again.textContent = '已保存 ✓';
+          again.title = again.textContent;
           again.classList.remove('saved-flash');
           void again.offsetWidth;
           again.classList.add('saved-flash');
         }
       }).catch(() => {});
       startListPoller();   // 刷新间隔可能刚被改过，用新值重启轮询
+      if (['knowledge', 'memes'].includes(state.settingsSection)) void hydrateExtensionStatus();
     } catch (e) {
-      $('#cfg-save-result').textContent = `保存失败：${e.message}`;
+      const res = $('#cfg-save-result');
+      res.textContent = `保存失败：${e.message}`;
+      res.title = res.textContent;
     }
   });
 
   if ((state.settingsSection || 'api') === 'experiments') {
     loadExperimentalFeatureStatuses();
-    [
-      ['#launch-identity-feature', 'identity'],
-      ['#launch-auto-friend-feature', 'auto-friend'],
-      ['#launch-slang-feature', 'slang'],
-      ['#launch-incident-feature', 'incidents']
-    ].forEach(([selector, feature]) => {
+    $('#lm-open-console')?.addEventListener('click', () => switchTab('living-memory'));
+    $('#lm-ungraduate')?.addEventListener('click', () => cancelLivingMemoryGraduation().catch(() => {}));
+    Object.entries({ '#launch-identity-feature': 'identity', '#launch-auto-friend-feature': 'auto-friend', '#launch-slang-feature': 'slang', '#launch-incident-feature': 'incidents', '#launch-living-memory-feature': 'living-memory' }).forEach(([selector, feature]) => {
       $(selector)?.addEventListener('click', () =>
         launchExperimentalFeature(feature).catch(() => {}));
     });
-    [
-      '#cfg-identity-pilot-enabled',
-      '#cfg-auto-friend-enabled',
-      '#cfg-slang-pilot-enabled',
-      '#cfg-incident-pilot-enabled'
-    ].forEach((selector) => {
+    ['#cfg-identity-pilot-enabled', '#cfg-auto-friend-enabled', '#cfg-slang-pilot-enabled', '#cfg-incident-pilot-enabled', '#cfg-living-memory-enabled'].forEach((selector) => {
       const toggle = $(selector);
       toggle?.addEventListener('change', async () => {
         if (selector === '#cfg-auto-friend-enabled' && toggle.checked) {
@@ -331,14 +333,20 @@ function bindSettingsSaveAndSections() {
             };
           }
         }
+        if (selector === '#cfg-living-memory-enabled') state.config.livingMemory = { ...(state.config.livingMemory || {}), enabled: toggle.checked === true };
         toggle.disabled = true;
         const result = $('#experiment-launch-result');
         if (result) result.textContent = '保存中…';
         try {
           await saveConfig({ quiet: true });
+          if (selector === '#cfg-living-memory-enabled') { // 原地更新，避免整页重渲染让卡片闪一下
+            toggle.disabled = false; if (result) result.textContent = '已保存';
+            void loadExperimentalFeatureStatuses(); return;
+          }
           renderSettings();
         } catch (error) {
           toggle.checked = !toggle.checked;
+          if (selector === '#cfg-living-memory-enabled' && state.config?.livingMemory) state.config.livingMemory = { ...state.config.livingMemory, enabled: toggle.checked === true };
           toggle.disabled = false;
           if (result) result.textContent = `保存失败：${error.message}`;
         }
@@ -490,10 +498,26 @@ function bindSettingsSaveAndSections() {
         secretKeyUsable: serviceChanged ? slotKinds.includes('secretKey') : draft.asr?.secretKeyUsable
       };
       state.settingsSection = 'asr';
-      renderSettings();
+      // ⚠️ 这里**不能** renderSettings()（2026-10-03 全量审查）：那一整块重画会把同分区里其它
+      // 还没保存的输入（TTS 的音色/语速、图片生成的模型/尺寸…）统统退回后端上次保存的值 ——
+      // 与 2026-10-02「屏蔽名单搜索框只能输一个字」同族（那次是输入回调重画了含输入框自己的
+      // 整栏，这次是切下拉把整块重画了）。同页的 TTS / 图片生成切换都是**就地更新**，这里对齐。
+      const wants = (kind) => !item || (item.creds || []).includes(kind);
+      const setFieldVisibility = (id, kind) => {
+        const el = $(`#${id}`);
+        if (el) el.style.display = wants(kind) ? '' : 'none';
+      };
+      setFieldVisibility('asr-appid-field', 'appId');
+      setFieldVisibility('asr-key-field', 'key');
+      setFieldVisibility('asr-secretid-field', 'secretId');
+      setFieldVisibility('asr-secretkey-field', 'secretKey');
+      const serviceNote = $('#asr-service-note');
+      if (serviceNote) serviceNote.textContent = item?.note || '';
+      const baseUrlRow = $('#asr-openai-fields');
+      if (baseUrlRow) baseUrlRow.style.display = item && item.needsBaseUrl === false ? 'none' : '';
+      syncAsrFields();
     });
     syncAsrFields();
-
     bindTtsControls();
     bindImageGenPreset();
 
@@ -540,7 +564,7 @@ function bindSettingsSaveAndSections() {
         try {
           const r = await api('/api/imagegen/test', { method: 'POST', body: JSON.stringify({}) });
           if (r.ok && r.image) {
-            if (out) out.innerHTML = `画好了（${Math.round((r.bytes || 0) / 1024)} KB，按张计费）<br><img src="${r.image}" alt="试画结果" style="max-width:260px;margin-top:6px;border-radius:8px" />`;
+            if (out) out.innerHTML = `画好了（${Math.round((r.bytes || 0) / 1024)} KB，按张计费）<br><img src="${r.image}" alt="试画结果" style="max-width:260px;margin-top:6px;border-radius:var(--r-sm)" />`;
           } else if (out) {
             out.textContent = r.error || '画图失败';
           }
@@ -663,7 +687,7 @@ function bindSettingsSaveAndSections() {
       uninstallBtn.disabled = true;
       if (box) { box.style.display = ''; box.textContent = '正在删除…'; }
       try {
-        const res = await api('/api/asr/uninstall', { method: 'POST' });
+        const res = await api('/api/asr/uninstall', { method: 'POST', body: JSON.stringify({ confirm: true }) });
         const mb = res?.freedBytes ? `，释放 ${(res.freedBytes / 1048576).toFixed(0)}MB` : '';
         const kept = (res?.keptOutside || []).length
           ? `<br><span class="muted">这些不在托管目录里，没有删除：${esc((res.keptOutside || []).join(' / '))}</span>`
@@ -751,8 +775,7 @@ function bindSettingsListsAndGroups(c) {
   for (const field of ['current', 'new', 'confirm']) {
     bindPeekToggle(`cfg-console-token-${field}-peek`, `cfg-console-token-${field}`);
   }
-
-  // 搜索提供方切换
+  bindSearchTest();
   const searchProviderSel = $('#cfg-searchprovider');
   if (searchProviderSel) searchProviderSel.addEventListener('change', () => {
     const v = searchProviderSel.value;
@@ -951,6 +974,10 @@ function bindSettingsListsAndGroups(c) {
   });
   syncConversationMode(conversationModeInput?.value);
 
+  const ioProfile = $('#cfg-store-ioprofile'), ioCustom = $('#cfg-store-iocustom');
+  const syncIo = () => { if (ioCustom) ioCustom.style.display = ioProfile?.value === 'custom' ? '' : 'none'; };
+  ioProfile?.addEventListener('change', syncIo); syncIo();
+
   // ── 对话机制：全局默认 + 分群覆盖 ──
   const conversationUnified = $('#cfg-conversation-unified');
   if (conversationUnified) conversationUnified.addEventListener('change', () => {
@@ -1080,22 +1107,6 @@ function bindSettingsListsAndGroups(c) {
 
   // ── 屏蔽名单 ──
   $('#blocklist-btn')?.addEventListener('click', () => openBlocklistModal());
-
-  // ── 主题选择器（设置页「界面」区）──
-  const themePicker = $('#theme-picker');
-  if (themePicker) {
-    themePicker.querySelectorAll('[data-theme-opt]').forEach((el) => {
-      const pick = () => {
-        applyTheme(el.dataset.themeOpt);
-        themePicker.querySelectorAll('[data-theme-opt]').forEach((x) => x.classList.toggle('on', x === el));
-      };
-      el.addEventListener('click', pick);
-      // 键盘可达：Enter / Space 等价点击
-      el.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); }
-      });
-    });
-  }
 
   // ── 成本核算：价格卡片随模型/开关变化 ──
   const useOfficialBox = $('#cfg-useofficialprice');
@@ -1552,6 +1563,8 @@ function bindSettingsPersonaAndVision() {
     $(selector)?.addEventListener('input', syncPersonaButtons);
     $(selector)?.addEventListener('change', syncPersonaButtons);
   }
+  // 用户手动改交流策略后，点卡只换正文、不把刚选的档位吞掉（applyPersonaDraft 会消费并清掉）
+  $('#cfg-behavior-profile')?.addEventListener('change', () => { state.personaProfileTouched = true; });
   // 角色正文：整段正文每敲一键都要重画分节视图（约 10ms），打字时按 140ms 合并成一次；
   // 失焦/提交立刻同步，不会留下过期视图。
   $('#cfg-roletext')?.addEventListener('input', () => {
@@ -1702,6 +1715,19 @@ function bindSettingsPersonaAndVision() {
   // 换卡后"断奶"：清掉各群的会话交接与线程状态（不动聊天记录与记忆）
   const resetHandoffBtn = $('#persona-reset-handoff-btn');
   if (resetHandoffBtn) resetHandoffBtn.addEventListener('click', async () => {
+    // 分节编辑框里的字还没落回 #cfg-roletext，先冲一次 —— 逐节编辑是主路径，漏了它
+    // 下面这层判定读到的是旧正文，等于守卫白做（2026-10-12 独立审查）。
+    flushPersonaSectionEdit();
+    // 草稿还没保存就先拦：交接清了、人设没换，机器人还是原来的人设，看着像"清了个寂寞"
+    //（用户反馈的"清空之后还是之前的人设"多半就卡在这一步，2026-10-12）。
+    if (personaDraftDirty()) {
+      const text = '人设改动还没保存：先点页面最底下的「保存设置」，再点「换人设后清空交接」。'
+        + '现在清的话只会清掉它的工作备注，机器人还是原来的人设。';
+      const hint = $('#persona-reset-handoff-hint');
+      if (hint) hint.textContent = text;
+      alert(text);
+      return;
+    }
     const NL = String.fromCharCode(10);
     const confirmed = await askForConfirmation(
       '清空所有群的【上次会话交接】并关闭进行中的对话线程？' + NL + NL
@@ -1732,13 +1758,33 @@ function bindSettingsPersonaAndVision() {
     if (!id.startsWith('custom_')) return;
     const tpl = state.personaTemplates[id];
     if (!tpl) return;
-    if (!await askForConfirmation(`确定删除自定义人设「${tpl.name}」？`)) return;
+    // 正在用的正文是"拷进配置的快照"，删卡不会把它一起删掉 —— 用着这张卡时先把这层说破，
+    // 否则"删了卡以为就换人设了"（2026-10-12 用户反馈）。
+    const wasInUse = savedPersonaId() === id;
+    const NL = String.fromCharCode(10);
+    if (!await askForConfirmation(`确定删除自定义人设「${tpl.name}」？`
+      + (wasInUse
+        ? NL + NL + '注意：机器人正在用的就是这张卡 —— 删除只是把卡从库里移走，它还会继续用这份正文；要真正换掉，删完点最底下的「保存设置」。'
+        : ''))) return;
     try {
       await api(`/api/persona-templates/${id}`, { method: 'DELETE', body: '{}' });
-      await loadSettings();
-      applyPersonaDraft(state.personaTemplates.xiaojingyu, 'xiaojingyu');
     } catch (e) {
       $('#persona-pick-hint').textContent = `删除失败：${e.message}`;
+      return;
+    }
+    // 删除已经成功；后面的刷新/回填失败**不能**再报"删除失败"（2026-10-09 审查：
+    // loadSettings 失败时 personaTemplates 会是空对象，applyPersonaDraft(undefined) 抛
+    // TypeError 被同一个 catch 吞掉 → 界面弹"删除失败"，而库里其实已经删掉了）。
+    try {
+      await loadSettings();
+      const fallback = state.personaTemplates.xiaojingyu;
+      if (fallback) applyPersonaDraft(fallback, 'xiaojingyu');
+      if (wasInUse) {
+        $('#persona-pick-hint').textContent = '已删除。机器人仍在用被删卡的那份正文 —— 点最底下的「保存设置」'
+          + '换成默认卡（想用别的卡先在卡库点一张），换完建议再点一次「换人设后清空交接」。';
+      }
+    } catch (e) {
+      $('#persona-pick-hint').textContent = `已删除，但人设卡刷新失败：${e.message}`;
     }
   });
   syncPersonaButtons();
@@ -1749,6 +1795,4 @@ function bindSettingsPersonaAndVision() {
   const pickFriendsBtn = $('#pick-friends-btn');
   if (pickFriendsBtn) pickFriendsBtn.addEventListener('click', () => openWhitelistPicker('friends'));
 }
-
-
 export { bindCrossSectionControls, bindSettingsEvents, captureTimeControlRule, isSplitThinking };

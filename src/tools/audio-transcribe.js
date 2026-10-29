@@ -22,7 +22,9 @@ import { iflytekOptions, iflytekTranscribe } from '../llm/asr-iflytek.js';
 import { hasSilkMagic, looksLikeSilk, silkToPcm } from '../llm/silk.js';
 import { createQuota } from '../core/quota.js';
 
-const AUDIO_MAX_BYTES = 200 * 1024 * 1024; // 200MB：QQ 文件上限内
+// 群友可控的媒体会整包读进内存（readBytesBounded 还要 Buffer.concat 一次，峰值约 2 倍）。
+// 200MB 在双并发下接近 800MB，小内存机器会被打 OOM；64MB 足够覆盖语音与常见短视频。
+const AUDIO_MAX_BYTES = 64 * 1024 * 1024;
 // PCM 全量进内存：16kHz 单声道 s16 = 32KB/s，15 分钟约 28.8MB（上限按这个算）。
 // 更要防的是"群友连发长语音刷账单"，所以再加一道每小时次数闸门（asr.maxPerHour）。
 const ASR_MAX_PCM_SECONDS = 60 * 15;
@@ -33,8 +35,14 @@ const asrQuota = createQuota({ windowMs: 3600_000 });
 /** 取一次转写配额；返回 { ok, scope:'chat'|'global'|'', retryAfterMs }。导出仅供测试。 */
 export function consumeAsrQuota(now = Date.now(), cfg = getConfig(), chatKey = '') {
   asrQuota.configure({ globalMax: asrMaxPerHour(cfg), perChatMax: asrMaxPerHourPerChat(cfg) });
-  return asrQuota.tryConsume(chatKey, now);
+  return { ...asrQuota.tryConsume(chatKey, now), at: now };   // 带出消费时刻：失败可精确 refund
 }
+
+/** 还没向服务商发出请求就失败（下载/转码/本地超长）：把这次额度退回去，别让用户白扣。 */
+function refundAsrQuota(chatKey, at) {
+  if (Number.isFinite(at)) asrQuota.refund(chatKey, at);
+}
+
 /** 测试用：重置窗口。 */
 export function resetAsrQuota() { asrQuota.reset(); }
 
@@ -392,6 +400,23 @@ export async function audioBufferToPcm(buffer, { name = '', signal } = {}) {
 export async function transcribeMessageAudio(ctx, entry) {
   const target = await currentMessageAudioUrl(ctx, entry);
   if (!target) return { ok: false, error: '这条消息里没有可识别的音频/视频内容' };
+  // QQ 自带转写（协议端 fetch_ptt_text）：拿得到就直接用 —— 不用配外部 ASR、不占转写额度，
+  // 也没有下载/转码开销（没配 ASR 的部署第一次也能读语音）。拿不到（QQ 没转写这条/协议端
+  // 不支持/超时）再落回下面的老链路，行为不变。
+  // 只对"QQ 语音"试：实时段是 record/voice；从存档走的（target.segment 为空）看名字/地址
+  // 是否 .amr/.silk —— 视频（.mp4）没有服务端转写，别白等它一次超时。
+  const looksVoice = target.segment === 'record' || target.segment === 'voice'
+    || /\.(amr|silk|slk)(\?|$)/i.test(String(target.name || target.url || ''));
+  if (looksVoice && !target.fileSegId && entry?.mid != null) {
+    const mid = Number(String(entry.mid).replace(/^#+/, ''));
+    if (Number.isFinite(mid) && mid !== 0) {
+      try {
+        const res = await ctx.onebot?.call?.('fetch_ptt_text', { message_id: mid }, 10000, ctx.signal);
+        const qqText = String(res?.text ?? '').trim();
+        if (qqText) return { ok: true, text: qqText };
+      } catch { /* 没有现成转写：走外部识别 */ }
+    }
+  }
   {
     if (!target.url && !target.fileSegId && target.name
       && (target.segment === 'record' || target.segment === 'voice')) {
@@ -434,12 +459,14 @@ export async function transcribeMessageAudio(ctx, entry) {
     try {
       ({ buffer } = await safeFetchBinary(target.url, AUDIO_MAX_BYTES, ctx.signal));
     } catch (e) {
+      refundAsrQuota(ctx.chatKey, quota.at);
       return { ok: false, error: `音频下载失败：${String(e?.message ?? e)}` };
     }
     let pcm;
     try {
       pcm = await audioBufferToPcm(buffer, { name: target.name, signal: ctx.signal });
     } catch (e) {
+      refundAsrQuota(ctx.chatKey, quota.at);
       return { ok: false, error: String(e?.message ?? e) };
     }
     const cfg = getConfig();
@@ -450,6 +477,7 @@ export async function transcribeMessageAudio(ctx, entry) {
     const pacedLimit = pacedAudioLimitSeconds(cfg, asrProvider(cfg));
     if (pacedLimit > 0 && pcm.length > pacedLimit * 32000) {
       const seconds = Math.round(pcm.length / 32000);
+      refundAsrQuota(ctx.chatKey, quota.at);
       return { ok: false, error: `音频太长（${seconds} 秒）：当前这家的转写要按音频实际时长逐帧推流，`
         + `一次运行时限里大约只能转 ${pacedLimit} 秒，再长会中途超时。`
         + '可以换「火山 / 硅基流动」这类一次上传的服务，或把音频截短后再发' };

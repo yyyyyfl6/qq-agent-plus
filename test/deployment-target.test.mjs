@@ -211,3 +211,10 @@ test('非就地且目录里有非安装器产物 → 仍拒绝（source-root 指
   assert.equal(r.code, 2, r.out);
   assert.match(r.out, /不是本工具管理的安装/);
 });
+
+test('数据目录与安装目录相同 → 拒绝（rsync --delete 会删数据）', () => {
+  const dir = makeTree();
+  const r = run(dir, { dataDir: dir, meta: { ...RECORD, root: dir, data: dir } });
+  assert.equal(r.code, 2, r.out);
+  assert.match(r.out, /数据目录不能与安装目录相同/);
+});

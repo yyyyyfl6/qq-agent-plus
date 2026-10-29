@@ -8,6 +8,7 @@
 import { api } from '../core/api.js';
 import { ASR_SERVICES } from '../core/constants.js';
 import { esc } from '../core/dom.js';
+import { extraBodyText } from '../core/dom-util.js';
 import { asrServiceOf, asrServiceOptions, normalizeAsrMax } from '../core/format.js';
 import { state } from '../core/state.js';
 /**
@@ -19,6 +20,8 @@ function renderAsrSection(c) {
   // 不再硬编码「已知 provider」清单：加了新服务却忘了改这里，会把新服务当成"本机"
   // （2026-09-26 就踩过：十家预设里四家渲染成了 custom）。未知值一律按"API Key 那一支"显示。
   const provider = String(c.asr?.provider || '').trim().toLowerCase() || 'local';
+  // 容器里没有 git/cmake 等编译工具，不能在这里装本机 whisper.cpp。
+  const containerMode = c?.runtime?.container === true;
   // 用户要求：只给两个选项 —— 免费的本机 Whisper，或"用 API Key 的托管服务"（具体哪家由下面的服务预设决定）
   const mode = provider === 'local' ? 'local' : 'api';
   const hide = (want) => (mode === want ? '' : 'display:none');
@@ -109,13 +112,16 @@ function renderAsrSection(c) {
         当前会自动用：<code>${esc(c.asr?.localBinResolved || '（还没找到可执行文件）')}</code>
         ＋ <code>${esc(c.asr?.localModelResolved || '（还没找到模型文件）')}</code>
       </div>
-      <div class="field" id="asr-install-field">
+      <div class="field" id="asr-install-field" style="${containerMode ? 'display:none' : ''}">
         <button class="btn btn-primary btn-small" id="asr-install-btn" type="button">${localInstalled ? '重新安装 / 修复' : '安装本机转写（免费）'}</button>
         ${localRemovable ? '<button class="btn btn-small btn-danger" id="asr-uninstall-btn" type="button">完全卸载（删除模型与程序）</button>' : ''}
         <span id="asr-install-hint" class="muted">${localInstalled
           ? '已装好，无需再装。'
           : '约 466MB（small 模型）+ 几分钟构建；装完自动生效，不用重启。'}</span>
         <div id="asr-install-progress" class="hint" style="display:none"></div>
+      </div>
+      <div class="hint" id="asr-container-hint" style="${containerMode ? '' : 'display:none'}">
+        容器模式：镜像里没有编译工具，不能在这里安装本机转写。请改用上面的托管服务，或构建包含 whisper.cpp 的自定义镜像。
       </div>
     </div>
 
@@ -183,7 +189,7 @@ function renderAsrSection(c) {
     </div>
     <h3 id="settings-tts">语音回复（TTS）</h3>
     <div class="checkbox-row"><input type="checkbox" id="cfg-tts-enabled" ${c.tts?.enabled === true ? 'checked' : ''} />
-      <label for="cfg-tts-enabled">允许它发语音（send_voice 工具；默认关）</label></div>
+      <label for="cfg-tts-enabled">允许机器人发语音（send_voice 工具；默认关）</label></div>
     <div class="field"><label for="cfg-tts-service">服务预设</label>
       <select id="cfg-tts-service"><option value="">（加载中…）</option></select>
       <div class="hint" id="tts-preset-hint"></div></div>
@@ -203,6 +209,9 @@ function renderAsrSection(c) {
       </div>
       <select id="cfg-tts-voice-pick" style="display:none;margin-top:6px"></select>
       <div class="hint" id="tts-voice-hint" style="display:none"></div></div>
+    <div class="field" id="tts-director-field" style="display:none"><label for="cfg-tts-director">导演指令（MiMo 用，可选）</label>
+      <textarea id="cfg-tts-director" rows="3" placeholder="例如：你是小鲸鱼，声音软一点，像在群里随口聊天，不要播音腔。">${esc(c.tts?.director || '')}</textarea>
+      <div class="hint">MiMo 会把它当作导演提示；模型调用 send_voice 时选的 emotion 会自动追加一行情绪。其他供应商忽略这一栏。</div></div>
     <div class="field-row" id="tts-volc-fields" style="display:none">
       <div class="field"><label for="cfg-tts-appid" id="tts-appid-label">AppID（火山）</label>
         <input type="text" id="cfg-tts-appid" value="${esc(c.tts?.appId || '')}" placeholder="语音技术控制台的 AppID" />
@@ -242,22 +251,34 @@ function renderAsrSection(c) {
       <span id="tts-test-result" class="muted"></span></div>
     <h3 id="settings-imagegen">图片生成（按张计费）</h3>
     <div class="checkbox-row"><input type="checkbox" id="cfg-img-enabled" ${c.imageGen?.enabled === true ? 'checked' : ''} />
-      <label for="cfg-img-enabled">允许它画图（generate_image 工具；默认关）</label></div>
-    <div class="hint">开启后群友说「画一张」时它会调服务商的生图接口生成图片、存进表情库再发出来。
-      这是**按张计费**的：每小时上限是唯一的闸门，模型也不会主动画（只在你让它画时）。</div>
+      <label for="cfg-img-enabled">允许机器人画图（generate_image 工具；默认关）</label></div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-img-autosend" ${c.imageGen?.autoSend !== false ? 'checked' : ''} />
+      <label for="cfg-img-autosend">生成后直接发到当前会话（关掉则只存入表情库）</label></div>
+    <div class="hint">开启后群友说「画一张」时，机器人会调用服务商的生图接口生成图片。默认生成后直接发出；
+      关掉自动发送后，图片只进表情库，模型需要时再调 send_sticker。这是<strong>按张计费</strong>的，
+      每小时上限是唯一的闸门，模型不会主动生成，仅在收到请求时调用。</div>
+    <div class="field"><label for="cfg-img-send-as">生成后发送格式</label>
+      <select id="cfg-img-send-as">
+        <option value="sticker" ${c.imageGen?.sendAs === 'image' ? '' : 'selected'}>表情包（默认，与以前一致）</option>
+        <option value="image" ${c.imageGen?.sendAs === 'image' ? 'selected' : ''}>普通图片（群友可以直接保存）</option>
+      </select>
+      <div class="hint">只影响 generate_image 自动发送的图；表情库手动发表情不受影响。</div></div>
     <div class="field"><label for="cfg-img-service">服务预设</label>
       <select id="cfg-img-service"><option value="">（加载中…）</option></select>
       <div class="hint" id="img-preset-hint"></div></div>
-    <div class="field"><label for="cfg-img-baseurl">服务地址</label>
+    <div class="field"><label for="cfg-img-baseurl">服务地址（填到 /v1，不要带 /images/generations）</label>
       <input type="text" id="cfg-img-baseurl" value="${esc(c.imageGen?.baseUrl || '')}" placeholder="留空 = 与聊天模型同一家（同域时才复用它的 Key）" /></div>
     <div class="field-row">
       <div class="field"><label for="cfg-img-model">模型</label>
         <input type="text" id="cfg-img-model" value="${esc(c.imageGen?.model || '')}" placeholder="如 gpt-image-1 / seedream-3.0 / cogview-3" /></div>
-      <div class="field"><label for="cfg-img-size">尺寸（可选）</label>
-        <input type="text" id="cfg-img-size" value="${esc(c.imageGen?.size || '')}" placeholder="如 1024x1024；留空用服务商默认" /></div>
+    <div class="field"><label for="cfg-img-size">尺寸（可选）</label>
+      <input type="text" id="cfg-img-size" value="${esc(c.imageGen?.size || '')}" placeholder="如 1024x1024；留空用服务商默认" /></div>
     </div>
-    <div class="field-row">
-      <div class="field"><label for="cfg-img-max">每小时最多生成（张）</label>
+    <div class="field"><label for="cfg-img-extra-body">自定义请求参数（JSON，可选）</label>
+      <textarea id="cfg-img-extra-body" rows="3" style="width:100%" placeholder='例如 {"output_watermark": {"enabled": false}}。留空 = 不附加。'>${esc(extraBodyText(c.imageGen?.extraBody))}</textarea>
+      <div class="hint" id="cfg-img-extra-body-hint">会原样合并进生图请求体，适合服务商文档里的 output_watermark、quality 这类参数；同名键会覆盖上面的模型、尺寸和 n。只填 JSON 对象，留空 = 不附加。Moss 示例：{"output_watermark": {"enabled": false}}（官方是嵌套对象）</div>
+    </div>
+    <div class="field-row">      <div class="field"><label for="cfg-img-max">每小时最多生成（张）</label>
         <input type="number" id="cfg-img-max" min="1" max="100" value="${esc(c.imageGen?.maxPerHour ?? 6)}" />
         <div class="hint">按张计费服务的硬闸门（全局共享）。默认 6；不确定就填小一点。</div></div>
       <div class="field"><label for="cfg-img-key" id="cfg-img-key-label">API Key（留空/掩码 = 保持不变）</label>
@@ -304,7 +325,16 @@ async function bindImageGenPreset() {
     if (s.baseUrl) { if (baseInput) baseInput.value = s.baseUrl; }
     else if (baseInput && match(baseInput.value)) baseInput.value = '';
     const defModel = s.models?.[0]?.id || '';
-    if (modelInput && defModel && (resetModel || !String(modelInput.value || '').trim())) modelInput.value = defModel;
+    if (modelInput) {
+      const curModel = String(modelInput.value || '').trim();
+      if (defModel && (resetModel || !curModel)) {
+        modelInput.value = defModel;
+      } else if (resetModel && !defModel) {
+        // 魔搭/自定义这类没有内置模型的预设：必须清掉上一家的模型名，
+        // 否则会把「Qwen/...」原样发给只认自己模型 id 的下一家（与 TTS 音色串用同型）。
+        modelInput.value = '';
+      }
+    }
     if (hint) hint.textContent = s.note || '';
     const needsKey = Array.isArray(s.creds) && s.creds.length > 0;
     if (keyInput) {
@@ -380,6 +410,11 @@ async function bindTtsControls() {
     // 运行时 ttsServiceOf 是同一口径；不补这条的话，自建配置每次进设置页都被回显成
     // 硅基流动，Key 掩码按错家判断，再保存还会把 Key 存到 siliconflow 名下（2026-09-29 审查 P1）
     const prov = String(state.config?.tts?.provider || '').trim().toLowerCase();
+    if (prov === 'mimo') {
+      // MiMo 有内置官方地址：手写配置只填 provider 也能用，界面要认出它而不是落到「自定义」
+      const mimo = services.find((x) => x.id === 'mimo');
+      if (mimo) return mimo;
+    }
     if (prov === 'openai' || prov === 'custom') {
       const custom = services.find((x) => x.id === 'custom');
       if (custom) return custom;
@@ -478,6 +513,16 @@ async function bindTtsControls() {
     }
     const mmBox = q('#tts-minimax-fields');
     if (mmBox) mmBox.style.display = prov === 'minimax' ? '' : 'none';
+    const directorField = q('#tts-director-field');
+    if (directorField) directorField.style.display = prov === 'mimo' ? '' : 'none';
+    if (keyLabel && prov === 'mimo') {
+      keyLabel.textContent = 'API Key（MiMo token-plan；按供应商分别保存，留空/掩码 = 保持不变）';
+    }
+    if (keyHint && prov === 'mimo') {
+      keyHint.textContent = '填 token-plan 的 API Key（请求头是 api-key，不是 Bearer）。'
+        + '模型用 mimo-v2.5-tts，音色先在控制台确认已开通；服务地址填到 /v1 即可。';
+      keyHint.style.display = '';
+    }
     // 模型栏：这一家不要模型名就整栏藏掉（火山 v1 / 豆包）；「自定义/自建」虽然 models 为空
     // 但**必须填模型名**（note 里写了），也保留；有内置模型但不支持拉取的（MiniMax）
     // 留输入框 + 内置候选，只把「获取模型列表」按钮藏掉
@@ -510,15 +555,16 @@ async function bindTtsControls() {
       setWarn('#tts-appid-warn', 'AppID 已填：豆包将改走「AppID + Access Token」鉴权 —— 此时下面的 API Key 栏要填 Access Token，不是控制台密钥；留空 AppID 则走 X-Api-Key（控制台密钥）。');
     }
   };
-  const renderFor = (service, { resetModel = false } = {}) => {
+  const renderFor = (service, { resetModel = false, restoreVoice = false } = {}) => {
     if (!service) return;
     const models = service.models || [];
     fillModelPick(models.map((m) => m.id));
     if (resetModel || !String(modelInput?.value || '').trim()) {
       if (modelInput && models[0]?.id) modelInput.value = models[0].id;
       // 换家后别把上一家的模型名留在框里（火山/豆包不用模型名，留着会被当参数发出去）。
-      // 「自定义/自建」相反：模型名必填，清了它保存出去就是必报错（2026-09-29 审查 P1）
-      if (modelInput && !models.length && service?.id !== 'custom') modelInput.value = '';
+      // 「自定义/自建」也一样：MiMo 的模型名发给自建网关只会 404；清空后占位符会提示必填
+      //（2026-09-29 曾为了"必填"故意保留，结果就是跨服务串用，2026-10-26 复审改掉）。
+      if (modelInput && !models.length) modelInput.value = '';
     }
     if (modelInput) modelInput.placeholder = (models.length || service?.id === 'custom') ? 'FunAudioLLM/CosyVoice2-0.5B' : '（这家不需要模型名）';
     const model = String(modelInput?.value || '').trim();
@@ -529,7 +575,20 @@ async function bindTtsControls() {
     if (voiceInput) {
       const cur = String(voiceInput.value || '').trim();
       const values = entries.map((v) => voiceValueFor(service, model, v.id));
-      if (!cur && values.length) {
+      if (restoreVoice) {
+        // 切换服务预设时按"这家上次用的音色"恢复；没有记忆才退到第一个候选。
+        // 否则从 MiMo 切到豆包会把 Chloe 原样发过去（2026-10-26 用户反馈）。
+        const remembered = String((state.config?.tts?.voices || {})[service.id] || '').trim();
+        if (remembered) {
+          voiceInput.value = remembered;
+          if (remembered !== cur) voiceNote = `已恢复「${service.label}」上次保存的音色。`;
+        } else if (values.length && (!cur || !values.includes(cur))) {
+          voiceInput.value = values[0];
+          voiceNote = `「${service.label}」还没保存过音色，已先选第一个候选；确认后保存。`;
+        } else if (!cur && values.length) {
+          voiceInput.value = values[0];
+        }
+      } else if (!cur && values.length) {
         voiceInput.value = values[0];      // 空着就填一个默认，省得用户面对空框
       } else if (cur && values.length && !values.includes(cur)) {
         // 不在候选里：**任何时候都不擅自改值** —— 官方投放音色（ICL_uranus_*）与自己复刻的音色（S_ 开头）
@@ -571,7 +630,7 @@ async function bindTtsControls() {
       const appidNode = q('#cfg-tts-appid');
       if (appidNode && /^\d{5,15}$/.test(String(appidNode.value || '').trim())) appidNode.value = '';
     }
-    renderFor(picked, { resetModel: true });
+    renderFor(picked, { resetModel: true, restoreVoice: true });
   });
   modelInput?.addEventListener('input', () => fillVoicePick(currentService(), String(modelInput.value || '').trim()));
   modelPick?.addEventListener('change', () => {

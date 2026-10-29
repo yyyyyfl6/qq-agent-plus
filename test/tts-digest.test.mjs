@@ -72,6 +72,17 @@ test('GroupDigestManager：消息够时生成一条并发送；不够时跳过',
   const rows = store.recent('group:123', { limit: 400, includeSelf: true, readOnly: true });
   assert.equal(rows.length, 8, '已确认消息应能被日报读取');
 
+  // 群日报现在会在**读消息与调模型之前**过门禁（观察模式 / 白名单外的群不花钱，
+  // 2026-10-03 全量审查）→ 这条用例必须把配置摆成真实放行的样子，不能靠默认值恰好通过
+  // ⚠️ 必须动态 import：静态 import 会被 ESM 提前求值，那时 QQ_AGENT_DATA_DIR 还没设 →
+  // config 模块按默认数据目录加载，上面那份临时 config.json 根本不生效（本文件里其它 src 模块都是动态 import）
+  const { getConfig, setRuntimeConfig } = await import('../src/core/config.js');
+  const base = getConfig();
+  setRuntimeConfig({
+    ...base,
+    allow: { ...(base.allow || {}), groups: ['123'] },
+    deny: { ...(base.deny || {}), groups: [] }
+  });
   const sent = [];
   const sender = { sendTextBatch: async (chatKey, msgs) => { sent.push({ chatKey, msgs }); return { message_id: 1 }; } };
   const origFetch = globalThis.fetch;
@@ -96,6 +107,45 @@ test('GroupDigestManager：消息够时生成一条并发送；不够时跳过',
     assert.equal(r2.results[0].ok, false);
     assert.match(r2.results[0].error, /消息太少/);
     assert.equal(sent.length, 1);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('GroupDigestManager：日报材料用备注/代号，不再喊群名片（2026-10-11 反馈）', async () => {
+  const store = new ChatStore(0, { dataDir, filename: 'digest-alias.sqlite' });
+  const now = Date.now();
+  for (let i = 0; i < 8; i += 1) {
+    store.appendIncoming('group:123', {
+      mid: 700 + i, ts: now - (8 - i) * 60000,
+      senderId: 'u1', senderName: '张三本尊',
+      text: '第' + i + '条，讨论周末去哪玩'
+    }, { recordOnly: true });
+  }
+  const { getConfig, setRuntimeConfig } = await import('../src/core/config.js');
+  const base = getConfig();
+  setRuntimeConfig({
+    ...base,
+    allow: { ...(base.allow || {}), groups: ['123'] },
+    memberNotes: { u1: '老玩童' }
+  });
+  let promptText = '';
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, req) => {
+    const body = JSON.parse(req.body);
+    promptText = (body.messages || []).map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content))).join('\n');
+    return Response.json({
+      choices: [{ message: { content: '老玩童他们周末想出去玩。' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 }
+    });
+  };
+  try {
+    const sender = { sendTextBatch: async () => ({ message_id: 1 }) };
+    const mgr = new GroupDigestManager({ store, sender, log: () => {} });
+    const r = await mgr.runOnce();
+    assert.equal(r.ok, true, JSON.stringify(r.results[0]));
+    assert.ok(promptText.includes('老玩童'), '日报材料（参与活跃 + 样本行）要用备注/代号');
+    assert.equal(promptText.includes('张三本尊'), false, '不能再喊群名片');
   } finally {
     globalThis.fetch = origFetch;
   }

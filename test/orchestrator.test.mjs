@@ -10,17 +10,44 @@ const {
   Orchestrator,
   estimateNextPromptTokens,
   followUpPlan,
+  proactiveCandidates,
   proactiveProbability,
+  proactiveScopes,
+  proactiveWindows,
+  proactiveWindowState,
   randomWakeDelay,
-  triggerKindForTier
+  triggerKindForTier,
+  finishBarrierBlock
 } = await import('../src/core/orchestrator.js');
 const { ChatStore } = await import('../src/core/store.js');
 const { SessionRegistry } = await import('../src/core/sessions.js');
 const { setRuntimeConfig, getConfig, DEFAULT_CONFIG } = await import('../src/core/config.js');
 const { SkinManager } = await import('../src/skins/skins.js');
 const { ReminderStore } = await import('../src/core/reminders.js');
+const { timeControlState } = await import('../src/core/time-control.js');
+const { canRun } = await import('../src/core/access.js');
 const { todayKey } = await import('../src/core/util.js');
 const { currentTraceId, lastTraceId } = await import('../src/core/logger.js');
+
+/**
+ * 测试用的"远景时间窗"：放在"不是今天"的星期几、用**传进来那一刻的时钟分钟**做 1 分钟窗口。
+ * 任何时刻跑，下一个窗口都至少在 ~24 小时后，不会出现"窗口只剩一分钟就开"的临界态。
+ * 为什么不用写死的 '00:01'：固定凌晨窗口在每天 23:57–00:01 之间只剩不到 4 分钟就开，
+ * 顺延到"即将打开的窗口"本身是正确行为，但用例里"必须晚于 now+4min"的断言会误报
+ *（2026-10-13 凌晨实测踩中；边界时刻的回归见本文件末尾那条用例）。
+ */
+function farWindowFor(date = new Date()) {
+  const today = ((date.getDay() + 6) % 7) + 1;
+  const otherDay = today === 7 ? 1 : today + 1;
+  const pad = (n) => String(n).padStart(2, '0');
+  const startMin = date.getHours() * 60 + date.getMinutes();
+  const endMin = (startMin + 1) % (24 * 60);
+  return {
+    days: [otherDay],
+    start: `${pad(Math.floor(startMin / 60))}:${pad(startMin % 60)}`,
+    end: `${pad(Math.floor(endMin / 60))}:${pad(endMin % 60)}`
+  };
+}
 
 describe('Orchestrator', () => {
   it('draws the debounce delay inside the configured range', () => {
@@ -75,6 +102,9 @@ describe('Orchestrator', () => {
     cfg.api.baseUrl = 'https://model.invalid';
     cfg.sticker.enabled = false;
     cfg.memory.consolidateEnabled = false;
+    // 这组用例盯的是编排主流程本身：默认关掉「该回没发」的补救，避免它在只回正文的夹具上
+    // 多出一次模型调用（该行为由 test/reply-guard.test.mjs 单独覆盖）
+    cfg.conversation.replyGuardEnabled = false;
     cfg.wakeDelayMs = 30;
     cfg.wakeDelayMinMs = 30;
     cfg.wakeDelayMaxMs = 30;
@@ -298,7 +328,9 @@ describe('Orchestrator', () => {
       const timer = setInterval(() => runner.scheduleWake('group:1'), 10);
       t.after(() => clearInterval(timer));
     });
-    assert.ok(elapsed >= 100 && elapsed < 300, `elapsed=${elapsed}`);
+    // 上限放宽到 5s：部署机/满载 CI 上一次事件循环调度就可能超过 300ms；
+    // 这里要抓的是"防抖窗口被无限续期"，不是墙钟精度。
+    assert.ok(elapsed >= 100 && elapsed < 5000, `elapsed=${elapsed}`);
   });
 
   it('manual wake bypasses trigger rules and can run from read archive context', async (t) => {
@@ -415,6 +447,88 @@ describe('Orchestrator', () => {
     assert.deepEqual(handoffs[0].state.openQuestions, ['第二项是否正常']);
     assert.deepEqual(handoffs[0].meta.participantIds, ['42']);
     assert.ok(handoffs[0].meta.sourceSessionId);
+  });
+
+  it('finish 排在 send_message 前面时也要先发消息再收尾（issue #58 复审）', async (t) => {
+    const sent = [];
+    const sender = {
+      sendTextBatch: async (_chatKey, messages) => {
+        sent.push(...messages);
+        return { sent: messages.map((text, i) => ({ text, at: Date.now(), messageId: i + 1 })), failed: [] };
+      }
+    };
+    const { runner, handoffs, append } = fixture(t, { sender });
+    append(1);
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      return Response.json({
+        choices: [{
+          message: {
+            tool_calls: [
+              { id: 'f1', type: 'function', function: { name: 'finish', arguments: JSON.stringify({ summary: '收尾' }) } },
+              { id: 's1', type: 'function', function: { name: 'send_message', arguments: JSON.stringify({ messages: '你好' }) } }
+            ]
+          }
+        }],
+        usage: { total_tokens: 10 }
+      });
+    };
+
+    await runner.wake('group:1');
+    assert.deepEqual(sent, ['你好'], 'finish 必须被排到最后，前面的 send_message 不能丢');
+    assert.equal(calls, 1, '不需要为了补发再走一轮');
+    assert.equal(handoffs.length, 1);
+    assert.equal(handoffs[0].state.summary, '收尾');
+  });
+
+  it('部分发送失败时 finish 也必须被挡住（issue #58 复审）', async (t) => {
+    const sender = {
+      sendTextBatch: async (_chatKey, messages) => ({
+        sent: messages.map((text, i) => ({ text, at: Date.now(), messageId: i + 1 })),
+        failed: [{ index: messages.length, text: '失败的一条', error: '模拟失败' }]
+      })
+    };
+    const { runner, handoffs, append } = fixture(t, { sender });
+    append(1);
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      const toolCalls = calls === 1
+        ? [
+          { id: 's1', type: 'function', function: { name: 'send_message', arguments: JSON.stringify({ messages: '你好' }) } },
+          { id: 'f1', type: 'function', function: { name: 'finish', arguments: JSON.stringify({ summary: '第一条' }) } }
+        ]
+        : [{ id: 'f2', type: 'function', function: { name: 'finish', arguments: JSON.stringify({ summary: '第二条' }) } }];
+      return Response.json({ choices: [{ message: { tool_calls: toolCalls } }], usage: { total_tokens: 10 } });
+    };
+
+    await runner.wake('group:1');
+    assert.equal(calls, 2, '部分发送失败也要让模型再走一轮补发，finish 不能提前提交');
+    assert.equal(handoffs.length, 1);
+    assert.equal(handoffs[0].state.summary, '第二条');
+  });
+
+  it('同批前置发送失败时不允许 finish 提交（issue #58）', async (t) => {
+    const failingSender = { sendTextBatch: async () => { throw new Error('send failed'); } };
+    const { runner, handoffs, append } = fixture(t, { sender: failingSender });
+    append(1);
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      const toolCalls = calls === 1
+        ? [
+          { id: 's1', type: 'function', function: { name: 'send_message', arguments: JSON.stringify({ messages: '你好' }) } },
+          { id: 'f1', type: 'function', function: { name: 'finish', arguments: JSON.stringify({ summary: '第一条' }) } }
+        ]
+        : [{ id: 'f2', type: 'function', function: { name: 'finish', arguments: JSON.stringify({ summary: '第二条' }) } }];
+      return Response.json({ choices: [{ message: { tool_calls: toolCalls } }], usage: { total_tokens: 10 } });
+    };
+
+    await runner.wake('group:1');
+    assert.equal(calls, 2, '失败批次里的 finish 必须被挡住，让模型再走一轮');
+    assert.equal(handoffs.length, 1);
+    assert.equal(handoffs[0].state.summary, '第二条', '只有第二轮（没有前置失败）的 finish 能提交');
   });
 
   it('creates a conservative handoff when a successful reply ends without finish', async (t) => {
@@ -766,6 +880,93 @@ describe('Orchestrator', () => {
     }
   });
 
+  it('messageTypes.images 关闭时只摘 get_message_images（消息里的图片不看）', async (t) => {
+    // 与 videoFrames 同一口径：开关关掉，工具与提示词引导一起撤。
+    // 表情库的看图工具（get_sticker_image）不受影响 —— 那是另一个开关。
+    const { cfg, runner, append } = fixture(t);
+    cfg.sticker.enabled = true;
+    cfg.messageTypes = { ...cfg.messageTypes, images: false, stickers: true };
+    setRuntimeConfig(cfg);
+    const bodies = [];
+    globalThis.fetch = async (_url, options) => {
+      bodies.push(JSON.parse(options.body));
+      return Response.json({ choices: [{ message: { content: 'done' } }], usage: { total_tokens: 10 } });
+    };
+    append(1, '在吗', '42');
+    await runner.wake('group:1');
+    const names = bodies[0].tools.map((tool) => tool.function.name);
+    assert.ok(!names.includes('get_message_images'), '关掉图片查看后不应再注入 get_message_images');
+    assert.ok(names.includes('get_sticker_image'), '表情库的看图开关没关，get_sticker_image 应保留');
+  });
+
+  it('messageTypes.stickers 关闭时只摘 get_sticker_image（表情库的图不看）', async (t) => {
+    const { cfg, runner, append } = fixture(t);
+    cfg.sticker.enabled = true;
+    cfg.messageTypes = { ...cfg.messageTypes, images: true, stickers: false };
+    setRuntimeConfig(cfg);
+    const bodies = [];
+    globalThis.fetch = async (_url, options) => {
+      bodies.push(JSON.parse(options.body));
+      return Response.json({ choices: [{ message: { content: 'done' } }], usage: { total_tokens: 10 } });
+    };
+    append(1, '在吗', '42');
+    await runner.wake('group:1');
+    const names = bodies[0].tools.map((tool) => tool.function.name);
+    assert.ok(!names.includes('get_sticker_image'), '关掉表情查看后不应再注入 get_sticker_image');
+    assert.ok(names.includes('get_message_images'), '消息图片的开关没关，get_message_images 应保留');
+    assert.ok(names.includes('send_sticker'), '按备注名发送表情不受影响');
+  });
+
+  it('表情包关闭时不注入 generate_image（生图只能经 send_sticker 发出）', async (t) => {
+    // 生图工具的结果是"先存进表情库、再用 send_sticker 发"；表情包总开关关掉后那条发送路径
+    // 也没了，留着它会让模型真的花钱生成一张发不出去的图（2026-10-17 审查 P2）。
+    const { cfg, runner, append } = fixture(t);
+    cfg.sticker.enabled = false;
+    cfg.imageGen = { enabled: true, model: 'img-model', baseUrl: 'https://img.example/v1' };
+    setRuntimeConfig(cfg);
+    const bodies = [];
+    globalThis.fetch = async (_url, options) => {
+      bodies.push(JSON.parse(options.body));
+      return Response.json({ choices: [{ message: { content: 'done' } }], usage: { total_tokens: 10 } });
+    };
+    append(1, '在吗', '42');
+    await runner.wake('group:1');
+    assert.ok(!bodies[0].tools.some((tool) => tool.function.name === 'generate_image'),
+      '表情包关闭时不应再注入 generate_image');
+
+    // 对照组：表情包开着、生图配置齐全时它应该在
+    cfg.sticker.enabled = true;
+    setRuntimeConfig(cfg);
+    append(2, '再问一次', '42');
+    await runner.wake('group:1');
+    assert.ok(bodies[1].tools.some((tool) => tool.function.name === 'generate_image'),
+      '表情包开着时生图工具应保留');
+  });
+
+  it('工具描述按当轮配置重建：改「视频画面」开关后不重启也生效', async (t) => {
+    // 工具描述里有随配置变化的文案（"抽 4 帧" / "视频画面看不到"）。构造函数里建一次的话，
+    // 控制台改完设置后提示词已经变了、工具描述还是旧的，模型会收到互相矛盾的两段。
+    const { cfg, runner, append } = fixture(t);
+    cfg.messageTypes = { ...cfg.messageTypes, images: true, videoFrames: true };
+    setRuntimeConfig(cfg);
+    const bodies = [];
+    globalThis.fetch = async (_url, options) => {
+      bodies.push(JSON.parse(options.body));
+      return Response.json({ choices: [{ message: { content: 'done' } }], usage: { total_tokens: 10 } });
+    };
+    const descOf = (body) => body.tools.find((tool) => tool.function.name === 'get_message_images')?.function.description || '';
+    append(1, '在吗', '42');
+    await runner.wake('group:1');
+    assert.match(descOf(bodies[0]), /抽 4 帧/);
+
+    cfg.messageTypes.videoFrames = false;
+    setRuntimeConfig(cfg);
+    append(2, '再看看', '42');
+    await runner.wake('group:1');
+    assert.doesNotMatch(descOf(bodies[1]), /抽 4 帧/, '关掉后同一进程内的工具描述必须跟着改');
+    assert.match(descOf(bodies[1]), /视频画面看不到/);
+  });
+
   it('收藏总闸关闭时只摘 collect_sticker，发送/列表/看图仍在（2026-10-02）', async (t) => {
     // 总闸（collectEnabled）管的是"收"：关掉后模型不该再有主动收藏的工具，
     // 否则它会去调一个必然失败的收藏（还先白花一次看图判断）。
@@ -819,6 +1020,33 @@ describe('Orchestrator', () => {
     assert.equal([...system.matchAll(/stickerId：/g)].length, 10, '条数按配置取满');
   });
 
+  it('语音回复/提醒关掉时：工具表与提示词同步撤（send_voice 必失败、remind 不会被派发）', async (t) => {
+    const { cfg, runner, append } = fixture(t);
+    cfg.tts = { ...(cfg.tts || {}), enabled: false };       // 语音回复关（出厂默认就是关）
+    cfg.reminders = { ...(cfg.reminders || {}), enabled: false };
+    setRuntimeConfig(cfg);
+    let system = '';
+    let tools = [];
+    globalThis.fetch = async (_url, options) => {
+      const body = JSON.parse(options.body);
+      system = body.messages[0].content;
+      tools = body.tools || [];
+      return Response.json({ choices: [{ message: { content: 'done' } }], usage: { total_tokens: 10 } });
+    };
+    append(1, '在吗', '42');
+    await runner.wake('group:1');
+    const names = tools.map((tool) => tool.function?.name);
+    assert.equal(names.includes('send_voice'), false, '语音回复关掉 → send_voice 不该在工具表里（调了必然失败）');
+    assert.equal(names.includes('remind'), false, '提醒关掉 → remind 不该在工具表里（不会被派发）');
+    // 提示词侧不许再教这两个（只看平台自己写的工具引导段，角色卡正文是管理员内容）。
+    // 注意标题名要跟 prompt.js 一致：'【群游戏规则】' 早就改名成 '【玩法与工具箱】'，
+    // indexOf 返回 -1 时 slice(-1) 只取最后一个字符 —— 断言会**空转**（2026-10-07 审计发现）。
+    const rules = system.slice(system.indexOf('【玩法与工具箱】'));
+    assert.ok(rules.length > 0 && rules.startsWith('【玩法与工具箱】'), `提示词里应有玩法工具箱段，实际片段：${rules.slice(0, 40)}`);
+    assert.equal(rules.includes('send_voice'), false, '提示词不该再教 send_voice');
+    assert.equal(rules.includes('remind'), false, '提示词不该再教 remind（工具已被摘）');
+  });
+
   it('图片输入关掉时，表情清单不能再教模型"先看一眼"（提示词不能自相矛盾）', async (t) => {
     const { cfg, runner, append } = fixture(t);
     cfg.sticker.enabled = true;
@@ -851,7 +1079,9 @@ describe('Orchestrator', () => {
     // 清单不能再说"可以先 get_sticker_image 看一眼"——那句话指向一个不存在的工具
     const listBlock = system.slice(system.indexOf('【可用表情包】'));
     assert.ok(listBlock.includes('stickerId：'), '清单段要在');
-    assert.equal(listBlock.includes('get_sticker_image'), false, '清单里不该再出现这个工具名');
+    // 只断言"教它去看"的那句不在；工具名本身会出现在后面的机制说明里
+    //（"get_sticker_image 不在工具表里"），那是刻意保留的覆盖说明
+    assert.equal(listBlock.includes('先 get_sticker_image 看一眼'), false, '清单里不该再教它去调这个工具');
     assert.equal(listBlock.includes('st-2（'), false, '没备注的（看不明白也用不了看图工具）不该列出来');
     assert.ok(listBlock.includes('st-1'), '有备注的照常列');
     assert.match(system, /看不到图/, '看不到图时的口径要在');
@@ -964,8 +1194,36 @@ describe('Orchestrator', () => {
     assert.match(offPrompt, /画面/);
   });
 
+  it('按群人设：同一个进程里不同群用不同的角色卡与群内名字', async (t) => {
+    const { cfg, runner, store } = fixture(t);
+    cfg.allow.groups = ['1', '2'];
+    cfg.personaPerChat = { 'group:2': { templateId: 'maoniang', botName: '猫猫' } };
+    setRuntimeConfig(cfg);
+    const bodies = [];
+    globalThis.fetch = async (_url, options) => {
+      bodies.push(JSON.parse(options.body));
+      return Response.json({ choices: [{ message: { content: 'done' } }], usage: { total_tokens: 10 } });
+    };
+    store.appendIncoming('group:1', { mid: 1, text: '在吗', senderId: '42', senderName: 'member-42' });
+    await runner.wake('group:1');
+    store.appendIncoming('group:2', { mid: 2, text: '@猫猫 在吗', senderId: '43', senderName: 'member-43' });
+    await runner.wake('group:2');
+
+    const globalPrompt = bodies[0].messages[0].content;
+    const catPrompt = bodies[1].messages[0].content;
+    assert.match(globalPrompt, /DeepSeek 小鲸鱼/, 'group:1 用全局卡');
+    assert.match(catPrompt, /二次元猫娘/, 'group:2 用按群覆盖的卡');
+    assert.notEqual(globalPrompt, catPrompt);
+    // 群内展示名优先用 QQ 昵称；按群覆盖的 botName 用于点名/称呼判断
+    assert.match(catPrompt, /你在群里的名字是「bot」/);
+    const catUserPrompt = String(bodies[1].messages?.[1]?.content || '');
+    assert.match(catUserPrompt, /@我/, '@这个群生效的机器人名字要标成「@我」');
+  });
+
   it('generate_image 只在图片生成开关打开且配置齐时注入（按张计费，未配就别让模型去调）', async (t) => {
     const { cfg, runner, append } = fixture(t);
+    // 生图的发送路径是"进表情库 → send_sticker"：这条用例只测生图开关本身，先把表情包打开
+    cfg.sticker.enabled = true;
     const bodies = [];
     globalThis.fetch = async (_url, options) => {
       bodies.push(JSON.parse(options.body));
@@ -1608,8 +1866,172 @@ it('换卡后 24 小时内，历史与交接口径会说明"旧口癖不作数"'
     assert.equal(runner.reminders.items[0].status, 'pending', '租约还在时不能标记已触发（否则提醒永久丢失）');
   });
 
+  it('定时提醒：预算闸门会丢的唤醒顺延 24 小时而不是标成已触发；没超预算就正常派发', async (t) => {
+    const { runner, store, cfg, append } = fixture(t, { reminders: new ReminderStore(path.join(root, 'reminders-budget.json')) });
+    append(1);
+    const item = { id: 'r-budget', chatKey: 'group:1', at: Date.now() - 1000, text: '喝水', status: 'pending', createdBy: '42' };
+    runner.reminders.items.push(item);
+    let woke = 0;
+    runner.wake = async (chatKey) => {
+      woke++;
+      store.appendSelf(chatKey, { mid: `self-budget-${woke}`, ts: Date.now(), text: '提醒' });
+    };
+    // 今天已花超 + 策略「停止」：#wake 的预算闸门会直接丢弃这次唤醒，派发侧必须先接住
+    setRuntimeConfig({ ...cfg, api: { ...cfg.api, budget: { enabled: true, dailyYuan: 0.01, onExceed: 'block' } } });
+    runner.sessions.todayUsage = () => ({ estimatedYuan: 5 });
+    const origAt = item.at;
+    runner.fireDueReminders();
+    assert.equal(woke, 0, '预算会丢掉这次唤醒：不能派发');
+    const after = runner.reminders.items.find((x) => x.id === 'r-budget');
+    assert.equal(after.status, 'pending', '没派发就不能标记已触发（否则提醒内容永久丢失）');
+    assert.ok(after.at >= origAt + 23 * 3600 * 1000,
+      `到点时间要顺延 24 小时，实际 ${new Date(after.at).toISOString()}`);
+    // 顺延的意义：12 小时作废窗口从**新**到点时间起算 —— 持续超预算一整天也不会被静默作废
+    assert.equal(runner.reminders.expired(origAt + 13 * 3600 * 1000).length, 0,
+      '按新到点时间起算，13 小时后不该被判超时作废（不顺延的话这条早就没了）');
+    // 反向：没超预算时必须正常派发（否则「顺延」变成永远不提醒）
+    after.at = Date.now() - 1000;
+    runner.sessions.todayUsage = () => ({ estimatedYuan: 0 });
+    runner.fireDueReminders();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(woke, 1, '没超预算要正常派发');
+    assert.equal(runner.reminders.items.find((x) => x.id === 'r-budget').status, 'fired');
+  });
+
+  it('测试用远景时间窗在任何时刻都成立：下一个窗口至少 4 分钟外（跨午夜回归）', () => {
+    // 覆盖跨午夜前后与周日→周一（otherDay 走 7→1 分支）的边界时刻。
+    // 老写法（写死 '00:01'）在每天 23:57–00:01 之间只剩不到 4 分钟就开窗，
+    // 顺延到"即将打开的窗口"本身正确，但用例断言"必须晚于 now+4min"会误报（2026-10-13 凌晨实测）。
+    const moments = [
+      '2026-10-12T15:57:30Z',   // 周一 23:57:30（老写法：窗口 3.5 分钟后开）
+      '2026-10-12T15:59:59Z',   // 周一 23:59:59（老写法：1 分钟后开）
+      '2026-10-12T16:00:00Z',   // 周二 00:00:00
+      '2026-10-12T16:30:00Z',   // 周二 00:30:00
+      '2026-10-17T16:00:00Z'    // 周日 00:00（otherDay 的 7→1 分支）
+    ].map((iso) => new Date(iso));
+    for (const d of moments) {
+      const tc = { enabled: true, schedule: { mode: 'custom', windows: [farWindowFor(d)] }, overrides: {} };
+      const st = timeControlState(tc, 'group:1', d.getTime());
+      assert.equal(st.active, false, `${d.toISOString()}：远景窗不能把当前时刻算成活跃`);
+      const ahead = st.nextActiveAt - d.getTime();
+      assert.ok(ahead >= 4 * 60 * 1000,
+        `${d.toISOString()}：下一个窗口应当至少在 4 分钟以外，实际 ${ahead}ms`);
+    }
+  });
+
+  it('定时提醒：时间控制静默段顺延到窗口恢复而不是标成已触发', async (t) => {
+    const { runner, store, cfg, append } = fixture(t, { reminders: new ReminderStore(path.join(root, 'reminders-time.json')) });
+    append(1);
+    const item = { id: 'r-time', chatKey: 'group:1', at: Date.now() - 1000, text: '喝水', status: 'pending', createdBy: '42' };
+    runner.reminders.items.push(item);
+    let woke = 0;
+    runner.wake = async (chatKey) => {
+      woke++;
+      store.appendSelf(chatKey, { mid: `self-time-${woke}`, ts: Date.now(), text: '提醒' });
+    };
+    // 时间控制开着、当前落在静默段（farWindowFor：窗口在"不是今天"的星期几，任何时刻跑都成立）：
+    // #wakePreflight 的 canRun 会拒掉这次唤醒 —— 派发侧必须先接住并顺延，不能 markFired。
+    setRuntimeConfig({
+      ...cfg,
+      timeControl: { enabled: true, schedule: { mode: 'custom', windows: [farWindowFor()] }, overrides: {} }
+    });
+    runner.fireDueReminders();
+    assert.equal(woke, 0, '静默段派不出去：不能唤醒');
+    const after = runner.reminders.items.find((x) => x.id === 'r-time');
+    assert.equal(after.status, 'pending', '没派发就不能标记已触发（否则提醒内容永久丢失）');
+    assert.ok(after.at > Date.now() + 4 * 60 * 1000,
+      `到点时间要顺延到窗口恢复，实际 ${new Date(after.at).toISOString()}`);
+    // 反向：关掉时间控制后必须正常派发（顺延不能变成永远不提醒）
+    setRuntimeConfig({ ...cfg });
+    after.at = Date.now() - 1000;
+    runner.fireDueReminders();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(woke, 1, '窗口恢复后要正常派发');
+    assert.equal(runner.reminders.items.find((x) => x.id === 'r-time').status, 'fired');
+  });
+
+  it('定时提醒：观察模式下顺延而不是标成已触发（切回 active 后补发）', async (t) => {
+    const { runner, store, cfg } = fixture(t, { reminders: new ReminderStore(path.join(root, 'reminders-observe.json')) });
+    const item = { id: 'r-obs', chatKey: 'group:1', at: Date.now() - 1000, text: '喝水', status: 'pending', createdBy: '42' };
+    runner.reminders.items.push(item);
+    let woke = 0;
+    runner.wake = async (chatKey) => {
+      woke++;
+      store.appendSelf(chatKey, { mid: `self-observe-${woke}`, ts: Date.now(), text: '提醒' });
+    };
+    setRuntimeConfig({ ...cfg, runtime: { ...cfg.runtime, mode: 'observe' } });
+    runner.fireDueReminders();
+    assert.equal(woke, 0, '观察模式派不出去');
+    const after = runner.reminders.items.find((x) => x.id === 'r-obs');
+    assert.equal(after.status, 'pending', '观察模式下也不能标记已触发');
+    assert.ok(after.at > Date.now() + 25 * 60 * 1000, '观察模式下按 30 分钟节奏顺延');
+    setRuntimeConfig({ ...cfg });
+    after.at = Date.now() - 1000;
+    runner.fireDueReminders();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(woke, 1, '切回 active 后要正常派发');
+    assert.equal(runner.reminders.items.find((x) => x.id === 'r-obs').status, 'fired');
+  });
+
+  it('自安排唤醒：静默段顺延并保留留言而不是销毁；观察模式作废；恢复后正常唤醒', async (t) => {
+    const { runner, cfg } = fixture(t, {});
+    setRuntimeConfig({
+      ...cfg,
+      timeControl: { enabled: true, schedule: { mode: 'custom', windows: [farWindowFor()] }, overrides: {} }
+    });
+    const note = '【自安排】过会儿回来看看';
+    runner.scheduledWakes.set('group:1', { at: Date.now() - 1000, note, kind: 'selfWake' });
+    let woke = 0;
+    runner.wake = async () => { woke++; };
+    runner.fireDueScheduledWakes();
+    assert.equal(woke, 0, '静默段不能真的唤醒');
+    const kept = runner.scheduledWakes.get('group:1');
+    assert.ok(kept, '留言不能被销毁（删了安排又没唤醒 = 内容永久丢失）');
+    assert.equal(kept.note, note, '顺延时留言要原样保留');
+    assert.ok(kept.at > Date.now() + 50 * 1000, `到点时间要顺延，实际 ${new Date(kept.at).toISOString()}`);
+    // 观察模式：无法兑现 → 作废（不能留一个不停重排的空转）
+    setRuntimeConfig({ ...cfg, runtime: { ...cfg.runtime, mode: 'observe' } });
+    runner.scheduledWakes.set('group:2', { at: Date.now() - 1000, note: 'x', kind: 'selfWake' });
+    runner.fireDueScheduledWakes();
+    assert.equal(runner.scheduledWakes.has('group:2'), false, '观察模式下留言作废');
+    // 反向：关掉时间控制后正常唤醒
+    setRuntimeConfig({ ...cfg });
+    runner.scheduledWakes.set('group:1', { at: Date.now() - 1000, note, kind: 'selfWake' });
+    runner.fireDueScheduledWakes();
+    assert.equal(woke, 1, '窗口恢复后要正常唤醒');
+    assert.equal(runner.scheduledWakes.has('group:1'), false);
+  });
+
+  it('定时提醒：@ 落在第 51–100 条未读里时 degrade 不会丢这次唤醒，提醒也不该被顺延', async (t) => {
+    // 派发预检与 #wake 的 degrade 闸门必须看同一批未读（都是 100 条）。看少 50 条时，
+    // @ 落在第 51–100 条会被预检判成"会丢"→ 提醒无谓顺延 24 小时，而 #wake 其实照常派发
+    //（2026-10-05 复审实测的窗口不一致）。
+    const { runner, store, cfg } = fixture(t, { reminders: new ReminderStore(path.join(root, 'reminders-degrade.json')) });
+    for (let i = 1; i <= 60; i++) {
+      store.appendIncoming('group:1', {
+        mid: i, text: i === 55 ? 'bot 在吗' : `m${i}`, senderId: '42', senderName: 'member-42', mentionsSelf: i === 55
+      });
+    }
+    runner.reminders.items.push({
+      id: 'r-degrade', chatKey: 'group:1', at: Date.now() - 1000, text: '喝水', status: 'pending', createdBy: '42'
+    });
+    let woke = 0;
+    runner.wake = async (chatKey) => {
+      woke++;
+      store.appendSelf(chatKey, { mid: `self-degrade-${woke}`, ts: Date.now(), text: '提醒' });
+    };
+    setRuntimeConfig({ ...cfg, api: { ...cfg.api, budget: { enabled: true, dailyYuan: 0.01, onExceed: 'degrade' } } });
+    runner.sessions.todayUsage = () => ({ estimatedYuan: 5 });   // 已超限，但 degrade 只丢"没 @"的那批
+
+    runner.fireDueReminders();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.equal(woke, 1, '@ 在 100 条窗口里 → #wake 不会丢这次唤醒，预检不该拦');
+    assert.equal(runner.reminders.items.find((x) => x.id === 'r-degrade').status, 'fired');
+  });
+
   it('定时提醒：一次只派发装得进提示词的条数，装不下的留到下一轮（标记与内容一致）', async (t) => {
-    const { runner, append } = fixture(t, { reminders: new ReminderStore(path.join(root, 'reminders-merge.json')) });
+    const { runner, store, append } = fixture(t, { reminders: new ReminderStore(path.join(root, 'reminders-merge.json')) });
     append(1);
     const long = 'A'.repeat(200);
     // 单条正文上限 200 字，note 正文上限 400 字 → 第一条就吃掉全部预算，其余必须留到下一轮
@@ -1619,9 +2041,13 @@ it('换卡后 24 小时内，历史与交接口径会说明"旧口癖不作数"'
       });
     }
     const notes = [];
-    runner.wake = async (_chatKey, opts = {}) => { notes.push(String(opts.wakeNote || '')); };
+    runner.wake = async (chatKey, opts = {}) => {
+      notes.push(String(opts.wakeNote || ''));
+      store.appendSelf(chatKey, { mid: `self-merge-${Date.now()}-${notes.length}`, ts: Date.now(), text: '提醒' });
+    };
 
     runner.fireDueReminders();
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     const byStatus = (s) => runner.reminders.items.filter((x) => x.status === s).map((x) => x.id);
     assert.equal(notes.length, 1, '一轮只唤醒一次');
@@ -1643,9 +2069,76 @@ it('换卡后 24 小时内，历史与交接口径会说明"旧口癖不作数"'
     runner.reminders.items[2].text = '开会'; runner.reminders.items[3].text = '睡觉';
     notes.length = 0;
     runner.fireDueReminders();
+    await new Promise((resolve) => setTimeout(resolve, 0));
     assert.equal(notes.length, 1);
     assert.deepEqual(byStatus('pending'), [], '四条短提醒应当一轮派完');
     for (const text of ['喝水', '吃药', '开会', '睡觉']) assert.ok(notes[0].includes(text), `${text} 应在同一条 note 里`);
+  });
+
+  it('定时提醒：确认播报前的一轮 tick 不会重复派发同一条', async (t) => {
+    const { runner, store, append } = fixture(t, { reminders: new ReminderStore(path.join(root, 'reminders-inflight.json')) });
+    append(1);
+    runner.reminders.items.push({ id: 'r-inflight', chatKey: 'group:1', at: Date.now() - 1000, text: '喝水', status: 'pending', createdBy: '42' });
+    let woke = 0;
+    let release;
+    runner.wake = (chatKey) => {
+      woke++;
+      store.appendSelf(chatKey, { mid: `self-inflight-${woke}`, ts: Date.now(), text: '提醒' });
+      return new Promise((resolve) => { release = resolve; });
+    };
+    runner.fireDueReminders();
+    runner.fireDueReminders();
+    assert.equal(woke, 1, '唤醒还没确认（提醒仍是 pending）时，下一轮不能把同一条再派一次');
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(runner.reminders.items.find((x) => x.id === 'r-inflight').status, 'fired');
+  });
+
+  it('定时提醒：派发话术带归属（谁提的/提醒谁），模型不用再自己圆', async (t) => {
+    const { runner, append } = fixture(t, { reminders: new ReminderStore(path.join(root, 'reminders-attribution-fire.json')) });
+    append(1);
+    runner.reminders.items.push({
+      id: 'r-attr', chatKey: 'group:1', at: Date.now() - 1000, text: '去吃饭',
+      status: 'pending', createdBy: '彭于晏', targetName: '吴彦祖'
+    });
+    const notes = [];
+    runner.wake = async (_chatKey, opts = {}) => { notes.push(String(opts.wakeNote || '')); };
+
+    runner.fireDueReminders();
+
+    assert.equal(notes.length, 1);
+    assert.ok(notes[0].includes('之前彭于晏让你在'), notes[0]);
+    assert.ok(notes[0].includes('提醒吴彦祖：去吃饭'), notes[0]);
+    assert.ok(notes[0].includes('是谁请你提醒谁的要说清'), notes[0]);
+  });
+
+  it('定时提醒：缺归属时话术明确"别猜"，不把提醒说成被提醒人自己设的', async (t) => {
+    const { runner, append } = fixture(t, { reminders: new ReminderStore(path.join(root, 'reminders-plain-fire.json')) });
+    append(1);
+    runner.reminders.items.push({
+      id: 'r-plain', chatKey: 'group:1', at: Date.now() - 1000, text: '喝水', status: 'pending'
+    });
+    const notes = [];
+    runner.wake = async (_chatKey, opts = {}) => { notes.push(String(opts.wakeNote || '')); };
+
+    runner.fireDueReminders();
+
+    assert.equal(notes.length, 1);
+    assert.ok(notes[0].includes('之前有人让你在'), notes[0]);
+    assert.ok(notes[0].includes('别猜'), notes[0]);
+  });
+
+  it('锚点（2026-10-10 反馈）：提醒走"逐字"框架，话术真源在 reminders.buildReminderNote', () => {
+    const orch = fs.readFileSync(new URL('../src/core/orchestrator.js', import.meta.url), 'utf8');
+    assert.ok(orch.includes("const isReminderNote = String(wakeNote).startsWith('【定时提醒】');"), '要有提醒专用分支');
+    assert.ok(orch.includes('? `${safeSlice(String(wakeNote), 600)}\\n`'), '提醒 note 要逐字进入（不套"给自己留过话"框架）');
+    assert.ok(orch.includes('把提醒自然地说出来即可；说完就结束'), '提醒分支要有自己的收尾语');
+    assert.ok(orch.includes('buildReminderNote(chosen, { now })') && orch.includes('reminderNoteCost(item)'),
+      '话术与预算要共用 reminders 的唯一实现');
+    assert.ok(orch.includes('triggerEntries: (triggerEntries || []).map'),
+      '工具 ctx 要带本轮触发消息（remind 的 from 兜底要用）');
+    const rem = fs.readFileSync(new URL('../src/core/reminders.js', import.meta.url), 'utf8');
+    assert.ok(rem.includes('不要说是被提醒的人自己设的'), '缺归属时的"别猜"指令要留在话术真源里');
   });
 
   it('自安排唤醒：会话接不了这次唤醒时顺延，而不是删掉安排后静默丢弃', async (t) => {
@@ -1694,6 +2187,73 @@ it('换卡后 24 小时内，历史与交接口径会说明"旧口癖不作数"'
     assert.equal(lastTraceId(), traceAtSend, 'lastTraceId 必须是最近一次运行的 id');
   });
 
+  it('每日预算 block：主动唤醒（冷场开话题/自安排唤醒）也不跑模型、不发文案', async (t) => {
+    const sentTo = [];
+    const { runner, cfg } = fixture(t, {
+      sender: {
+        sendTextBatch: async (chatKey, messages) => {
+          sentTo.push({ chatKey, messages });
+          return { sent: messages.map((text, i) => ({ text, at: Date.now(), messageId: i + 1 })), failed: [] };
+        }
+      }
+    });
+    cfg.api.budget = { enabled: true, dailyYuan: 1, onExceed: 'block', notify: false };
+    setRuntimeConfig(cfg);
+    fs.writeFileSync(path.join(root, 'usage-today.json'), JSON.stringify({ dayKey: todayKey(), estimatedYuan: 2 }));
+    let modelCalls = 0;
+    globalThis.fetch = async () => {
+      modelCalls += 1;
+      return Response.json({ choices: [{ message: { content: 'x' } }] });
+    };
+    await runner.wake('group:1', { proactive: true });
+    assert.equal(modelCalls, 0, 'block 策略下主动唤醒同样不许调模型（"今天别再花钱"就该真的停）');
+    assert.equal(sentTo.filter((s) => s.messages.join('').includes('今天的额度用完了')).length, 0,
+      'proactive 不该往群里发"额度用完"（那是新消息场景的回话）');
+  });
+
+  it('主动机会落在私聊时用私聊措辞，不说"群里"', async (t) => {
+    const { runner, cfg } = fixture(t);
+    cfg.allow.private = ['42'];
+    cfg.proactive.privateEnabled = true;
+    setRuntimeConfig(cfg);
+    const bodies = [];
+    globalThis.fetch = async (_url, options) => {
+      bodies.push(JSON.parse(options.body));
+      return Response.json({ choices: [{ message: { content: 'done' } }], usage: { total_tokens: 10 } });
+    };
+    await runner.wake('private:42', { proactive: true });
+    assert.equal(bodies.length, 1);
+    const wake = bodies[0].messages.at(-1).content;
+    assert.match(wake, /私聊里已经安静了一会儿/);
+    assert.match(wake, /不该打扰就安静结束/);
+    assert.doesNotMatch(wake, /群里已经安静了一会儿/, '私聊里不该套群聊的开场白');
+  });
+
+  it('"今天的额度用完了"同一天同一会话只发一次（否则兜底回收每 5~25s 重排一次 → 刷屏）', async (t) => {
+    const sentTo = [];
+    const { runner, store, cfg, append } = fixture(t, {
+      sender: {
+        sendTextBatch: async (chatKey, messages) => {
+          sentTo.push({ chatKey, messages });
+          return { sent: messages.map((text, i) => ({ text, at: Date.now(), messageId: i + 1 })), failed: [] };
+        }
+      }
+    });
+    cfg.api.budget = { enabled: true, dailyYuan: 1, onExceed: 'block', notify: false };
+    setRuntimeConfig(cfg);
+    fs.writeFileSync(path.join(root, 'usage-today.json'), JSON.stringify({ dayKey: todayKey(), estimatedYuan: 2 }));
+    globalThis.fetch = async () => Response.json({ choices: [{ message: { content: 'x' } }] });
+    append(1);
+    await runner.wake('group:1');
+    const first = sentTo.filter((s) => s.messages.join('').includes('今天的额度用完了')).length;
+    assert.equal(first, 1, '第一轮应发一次');
+    // 兜底回收会因"未读未被消费"重排（这正是刷屏的成因）→ 再来一轮仍只应有一条
+    await runner.wake('group:1');
+    const total = sentTo.filter((s) => s.messages.join('').includes('今天的额度用完了')).length;
+    assert.equal(total, 1, '同一天同一会话不该重复说额度用完');
+    assert.equal(store.findByMid('group:1', 1).read, false, '消息仍保留未读');
+  });
+
   it('每日预算 degrade：群里非 @ 跳过（保留未读）；有 @ 的同批照常运行（改进方案 #8）', async (t) => {
     const { runner, store, cfg, append } = fixture(t);
     cfg.api.budget = { enabled: true, dailyYuan: 1, onExceed: 'degrade', notify: false };
@@ -1714,6 +2274,242 @@ it('换卡后 24 小时内，历史与交接口径会说明"旧口癖不作数"'
     assert.ok(modelCalls >= 1, '有 @ 时应运行');
   });
 
+  // ── 唤醒/排程的失败收口（2026-10-08 二轮审查）──
+  // 这两条守同一件事：前置判定与预判里**有 store 读写**（getChatMeta / 线程过期写回 /
+  // applyWaitingConversation），任何一步抛出都不能留下"永远停在等待中"的会话，也不能让
+  // pendingWake 永久占位（那会让恢复循环从此跳过这个会话）。旧代码里这两处都在 try 之外 ——
+  // 抛一次就得重启才能恢复。
+  it('唤醒前置判定抛错：等待中会话要被收掉，不能留在 waiting', async (t) => {
+    const { runner, store, sessions, append } = fixture(t);
+    append(1);
+    const waiting = sessions.create({
+      chatKey: 'group:1', trigger: [], triggerSummary: '', status: 'waiting', waitUntil: Date.now() + 1000
+    });
+    // 模拟 sqlite 损坏/磁盘满：前置判定要读会话元数据（getChatMeta → 线程过期写回）
+    store.getChatMeta = () => { throw new Error('database disk image is malformed'); };
+    await runner.wake('group:1', { waitingSessionId: waiting.id });
+    // finish() 会把会话从 current 摘掉并写进索引 —— 两边都要查，否则"undefined !== 'waiting'"
+    // 这种空断言会假装通过（实测踩到）。
+    assert.equal(sessions.current.has(waiting.id), false, '不能还挂在 current 里当活跃会话');
+    const idx = sessions.index.find((s) => s.id === waiting.id);
+    assert.ok(idx, '会话应落进索引');
+    assert.notEqual(idx.status, 'waiting',
+      `前置判定抛错后等待中会话不能被留在 waiting（实际 ${idx.status}）`);
+  });
+
+  it('排程预判抛错：pendingWake 不能永久占位（否则恢复循环从此跳过这个会话）', async (t) => {
+    const { runner, store } = fixture(t);
+    const chatKey = 'group:1';
+    // 注入点要在 try 之内（预判/建"等待中"会话那一段读 peekUnread）：
+    // 顶层那次 #chatRuntimeDecision 在 pendingWake.add 之前，它抛错不会留下占位。
+    store.peekUnread = () => { throw new Error('database or disk is full'); };
+    // 排程窗口给足 5s：不然那个 debounce 定时器会在 30ms 内自己跑掉、顺手把 pendingWake 删了，
+    // 断言就永远是绿的（实测：窗口给 5ms 时这条用例连变异都咬不住）。
+    assert.doesNotThrow(() => runner.scheduleWake(chatKey, 5000));
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(runner.pendingWake.has(chatKey), false, 'pendingWake 不该留下这次排程的痕迹');
+    assert.equal(runner.firstPendingAt.has(chatKey), false, 'firstPendingAt 也要清掉');
+  });
+
+  it('插件工具按注册表的授权进工具表，且真的能执行（默认拒）', async (t) => {
+    // 注册表在插件侧另有一整套门控（总开关 / enabledIds / 进程状态 / manifest 声明），
+    // 这里钉的是**编排器这一侧**的接线：注册表给什么就注入什么、执行走的是同一个 executeTool，
+    // 注册表收回授权（返回空数组）时工具立刻消失。
+    let defs = [];
+    const seen = [];
+    defs = [{
+      name: 'demo__echo',
+      description: '第三方插件给的只读工具（来自插件「demo」）',
+      parameters: { type: 'object', properties: { text: { type: 'string' } } },
+      pluginId: 'demo',
+      execute: async (_ctx, args) => { seen.push(args); return { content: JSON.stringify({ ok: true, echo: args.text }) }; }
+    }];
+    const { runner, append } = fixture(t, { getPlugins: () => ({ toolDefsFor: () => defs }) });
+    const bodies = [];
+    globalThis.fetch = async (_url, options) => {
+      const body = JSON.parse(options.body);
+      bodies.push(body);
+      if (bodies.length === 1) {
+        assert.ok(body.tools.some((tool) => tool.function.name === 'demo__echo'),
+          '注册表提供了插件工具，工具表里就该有它');
+        return Response.json({
+          choices: [{
+            message: {
+              tool_calls: [{
+                id: 'plug-1', type: 'function',
+                function: { name: 'demo__echo', arguments: JSON.stringify({ text: '来自群里的输入' }) }
+              }]
+            }
+          }],
+          usage: { prompt_tokens: 100, total_tokens: 110 }
+        });
+      }
+      return Response.json({ choices: [{ message: { content: 'done' } }], usage: { total_tokens: 120 } });
+    };
+    append(1, '在吗');
+    await runner.wake('group:1');
+    assert.deepEqual(seen, [{ text: '来自群里的输入' }], '插件工具必须真的被执行到');
+    assert.match(JSON.stringify(bodies[1].messages), /demo__echo/, '执行结果要回到模型那一轮');
+
+    // 注册表收回授权（未启用 / 进程没跑 / 未声明）→ 下一轮就不该再出现
+    defs = [];
+    append(2, '还在吗');
+    await runner.wake('group:1');
+    assert.ok(!bodies[2].tools.some((tool) => tool.function.name === 'demo__echo'),
+      '注册表不给的时候，插件工具一个都不该出现');
+  });
+});
+
+describe('proactiveCandidates（冷场开话题挑会话）', () => {
+  const now = 10_000_000;
+  const quiet = now - 60 * 60 * 1000;
+  const cfg = (over = {}) => ({
+    allow: { groups: ['1'], private: ['900001', '777777'] },
+    allowAllWhenEmpty: false,
+    proactive: {
+      idleThresholdMs: 1800000,
+      groupEnabled: true,
+      privateEnabled: false,
+      ...over
+    }
+  });
+  const metas = (over = {}) => ({
+    'group:1': { lastTs: quiet, unread: 0, ...(over['group:1'] || {}) },
+    'private:900001': { lastTs: quiet, unread: 0, ...(over['private:900001'] || {}) },
+    'private:777777': { lastTs: quiet, unread: 0, ...(over['private:777777'] || {}) }
+  });
+
+  it('默认只挑群聊，不会主动私聊任何人', () => {
+    const out = proactiveCandidates({
+      chatKeys: ['group:1', 'private:900001'],
+      cfg: cfg(),
+      metaOf: (key) => metas()[key],
+      now
+    });
+    assert.deepEqual(out, ['group:1']);
+  });
+
+  it('配置里没有两个范围键时：群聊开、私聊关（升级前行为）', () => {
+    const out = proactiveCandidates({
+      chatKeys: ['group:1', 'private:900001'],
+      cfg: { allow: { groups: ['1'] }, allowAllWhenEmpty: false, proactive: {} },
+      metaOf: () => ({ lastTs: quiet, unread: 0 }),
+      now
+    });
+    assert.deepEqual(out, ['group:1']);
+    assert.deepEqual(proactiveScopes({}), { groups: true, private: false });
+    assert.equal(DEFAULT_CONFIG.proactive.groupEnabled, true);
+    assert.equal(DEFAULT_CONFIG.proactive.privateEnabled, false);
+  });
+
+  it('私聊候选受 allow.private / deny.private 约束（与 canRun 同口径）', () => {
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.runtime.mode = 'active';
+    cfg.runtime.paused = false;
+    cfg.allow.groups = [];
+    cfg.allow.private = ['900001'];
+    cfg.deny.private = ['777777'];
+    cfg.allowAllWhenEmpty = false;
+    cfg.proactive.privateEnabled = true;
+    setRuntimeConfig(cfg);
+    try {
+      const out = proactiveCandidates({
+        chatKeys: ['private:900001', 'private:777777', 'private:555555'],
+        cfg,
+        metaOf: () => ({ lastTs: quiet, unread: 0 }),
+        canWake: canRun,
+        now
+      });
+      assert.deepEqual(out, ['private:900001'],
+        '白名单外的 555555 与 deny 里的 777777 都必须被 canRun 挡掉');
+    } finally {
+      setRuntimeConfig(structuredClone(DEFAULT_CONFIG));
+    }
+  });
+
+  it('生产路径把 canWake 接到 canRun，候选选择不绕过白名单', () => {
+    const src = fs.readFileSync(new URL('../src/core/orchestrator.js', import.meta.url), 'utf8');
+    assert.match(src, /canWake: \(chatKey\) => canRun\(chatKey\)/);
+  });
+
+  it('勾选私聊后按私聊白名单挑人，不限于管理员', () => {
+    const out = proactiveCandidates({
+      chatKeys: ['group:1', 'private:900001', 'private:777777'],
+      cfg: cfg({ privateEnabled: true }),
+      metaOf: (key) => metas()[key],
+      now
+    });
+    assert.deepEqual(out, ['group:1', 'private:900001', 'private:777777']);
+  });
+
+  it('只勾私聊时不再挑群聊', () => {
+    const out = proactiveCandidates({
+      chatKeys: ['group:1', 'private:900001'],
+      cfg: cfg({ groupEnabled: false, privateEnabled: true }),
+      metaOf: (key) => metas()[key],
+      now
+    });
+    assert.deepEqual(out, ['private:900001']);
+  });
+
+  it('两个范围都不勾时没有候选', () => {
+    const out = proactiveCandidates({
+      chatKeys: ['group:1', 'private:900001'],
+      cfg: cfg({ groupEnabled: false, privateEnabled: false }),
+      metaOf: (key) => metas()[key],
+      now
+    });
+    assert.deepEqual(out, []);
+  });
+
+  it('私聊仍有未读、刚说过话、正在运行或不在允许名单时不挑', () => {
+    const base = {
+      chatKeys: ['private:900001', 'private:777777'],
+      cfg: cfg({ privateEnabled: true }),
+      now
+    };
+    assert.deepEqual(proactiveCandidates({ ...base, metaOf: () => ({ lastTs: quiet, unread: 1 }) }), []);
+    assert.deepEqual(proactiveCandidates({ ...base, metaOf: () => ({ lastTs: now - 60000, unread: 0 }) }), []);
+    assert.deepEqual(proactiveCandidates({ ...base, metaOf: () => ({ lastTs: quiet, unread: 0 }), isRunning: () => true }), []);
+    assert.deepEqual(proactiveCandidates({
+      ...base,
+      metaOf: () => ({ lastTs: quiet, unread: 0 }),
+      canWake: (key) => key === 'private:900001'
+    }), ['private:900001'], 'canRun 会挡住不在私聊白名单里的人，候选选择不绕过它');
+  });
+});
+
+describe('主动发言时段（控制台可配的多窗口）', () => {
+  const at = (hhmm) => new Date(`2026-10-23T${hhmm}:00+08:00`).getTime();
+
+  it('解析 windows / 旧的 start-end 两种形状', () => {
+    assert.deepEqual(proactiveWindows({ windows: [{ start: '09:00', end: '12:00' }] }),
+      [{ start: 540, end: 720 }]);
+    assert.deepEqual(proactiveWindows({ start: '14:00', end: '24:00' }), [{ start: 840, end: 1440 }]);
+    assert.deepEqual(proactiveWindows(undefined), [], '未配置 = 全天，由调用方判 active');
+  });
+
+  it('窗口内/外与 24:00 边界', () => {
+    const hours = { windows: [{ start: '09:00', end: '12:00' }] };
+    assert.equal(proactiveWindowState(hours, at('10:00')).active, true);
+    assert.equal(proactiveWindowState(hours, at('12:00')).active, false);
+    assert.equal(proactiveWindowState(hours, at('08:59')).active, false);
+    const late = { windows: [{ start: '14:00', end: '24:00' }] };
+    assert.equal(proactiveWindowState(late, at('23:30')).active, true);
+    assert.equal(proactiveWindowState(late, at('00:30')).active, false);
+  });
+
+  it('跨午夜窗口在两侧都算生效', () => {
+    const hours = { windows: [{ start: '23:00', end: '02:00' }] };
+    assert.equal(proactiveWindowState(hours, at('23:30')).active, true);
+    assert.equal(proactiveWindowState(hours, at('01:30')).active, true);
+    assert.equal(proactiveWindowState(hours, at('12:00')).active, false);
+  });
+
+  it('空列表 = 全天；非法窗口被忽略，不会把机器人永久静音', () => {
+    assert.equal(proactiveWindowState({ windows: [] }, at('03:00')).active, true);
+    assert.equal(proactiveWindowState({ windows: [{ start: 'abc', end: '12:00' }] }, at('03:00')).active, true);
+  });
 });
 
 describe('proactiveProbability（冷场开话题的发言概率）', () => {
@@ -1726,6 +2522,19 @@ describe('proactiveProbability（冷场开话题的发言概率）', () => {
     assert.equal(proactiveProbability(-3), 0, '负值夹到 0');
     assert.equal(proactiveProbability(undefined), 0.25, '没配置才用默认 0.25');
     assert.equal(proactiveProbability('abc'), 0.25);
+  });
+
+
+});
+
+describe('finish 同批屏障（issue #58）', () => {
+  it('前置工具失败时拒绝 finish；finish 成功后拒绝后续副作用', () => {
+    assert.equal(finishBarrierBlock('finish', {}), '');
+    assert.match(finishBarrierBlock('finish', { priorFailure: true }), /失败项/);
+    assert.match(finishBarrierBlock('finish', { unsentDeliveryFailure: true }), /改用 send_message/);
+    assert.match(finishBarrierBlock('send_message', { finished: true }), /终止边界/);
+    assert.equal(finishBarrierBlock('send_message', { priorFailure: true }), '', '失败只挡 finish，不挡其它工具');
+    assert.equal(finishBarrierBlock('finish', { unsentDeliveryFailure: false }), '', '已有送达或无发送失败时不拦截 finish');
   });
 });
 

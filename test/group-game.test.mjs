@@ -887,3 +887,26 @@ test('报名快截止时提一句「还差 N 人」（只提一次；窗口太�
   await w2.mgr.tick();
   assert.equal(w2.sent.filter((x) => /报名马上截止/.test(x.msgs[0])).length, 0, '10 秒窗口不提');
 });
+
+test('别名撞车（某人的备注 = 另一个人的群名片）时宁缺勿错：不解析成任何一个人', async () => {
+  // u1 的备注写成 u2 的群名片 → 键「群友2」同时指向两个人
+  const w1 = makeWorld({ players: 4 });
+  updateConfig({ memberNotes: { u1: '群友2' } });
+  const hit = await w1.mgr.start({ chatKey: 'group:1', gameId: 'number-bomb', players: ['群友2'] });
+  assert.equal(hit.ok, false, '撞车的名字不该被静默解析成某一个人（原来是 Map 后写覆盖 → 身份/查验结果发错对象）');
+  // 光断言 ok:false 咬不住：解析成 u2 时也会因为"只有 1 个能用"而失败。要钉住"一个都没解析到"。
+  assert.match(hit.error, /只有 0 个能用/, '撞车的键必须整个作废，不能落到某一个人身上');
+
+  // 对照组一：没撞车的名字照常解析（别把整张表都废掉）
+  const w2 = makeWorld({ players: 4 });
+  updateConfig({ memberNotes: { u1: '群友2' } });
+  const fine = await w2.mgr.start({ chatKey: 'group:1', gameId: 'number-bomb', players: ['群友3', '群友4'] });
+  assert.equal(fine.ok, true, `没撞车的名字仍要能开局：${fine.error || ''}`);
+
+  // 对照组二：没有备注时，两个名片各自可解析
+  //   注意 memberNotes 必须用 __replace__ 清空：普通深合并删不掉键（备注会一直留着）
+  const w3 = makeWorld({ players: 4 });
+  updateConfig({ memberNotes: { __replace__: {} } });
+  const back = await w3.mgr.start({ chatKey: 'group:1', gameId: 'number-bomb', players: ['群友1', '群友2'] });
+  assert.equal(back.ok, true, `没有备注时名片应可解析：${back.error || ''}`);
+});

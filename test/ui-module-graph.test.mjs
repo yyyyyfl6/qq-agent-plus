@@ -214,10 +214,17 @@ test('再没有文件靠改写全局包裹渲染入口（要接管请走 QARegis
   const offenders = [];
   for (const rel of files) {
     const code = stripComments(fs.readFileSync(path.join(UI, rel), 'utf8'));
-    for (const m of code.matchAll(/window\.[A-Za-z_$][\w$]*\s*=/g)) {
+    // ⚠️ `=(?!=)`：只认赋值。原来的 `\s*=` 会把 `typeof window.addEventListener === 'function'`
+    // 里的 `===` 当成"往 window 上挂东西"（2026-10-17 咬到一次假阳性；当时为了绕开它把函数
+    // 检查删了，反而让 render-test 的窗口桩抛错 —— 修判据，别修被测代码）
+    for (const m of code.matchAll(/window\.[A-Za-z_$][\w$]*\s*=(?!=)/g)) {
       const hit = `${rel}:${m[0].replace(/\s*=$/, '')}`;
       if (!allowed.has(hit)) offenders.push(hit);
     }
   }
   assert.deepEqual(offenders, [], `这些位置还在往 window 上挂东西：\n${offenders.join('\n')}`);
+  // 判据自检：赋值要抓到、比较不许误报（两个方向都钉住，免得下次又被"改宽/改窄"骗过）
+  const probe = (src) => [...src.matchAll(/window\.[A-Za-z_$][\w$]*\s*=(?!=)/g)].map((m) => m[0].replace(/\s*=$/, ''));
+  assert.deepEqual(probe('window.QARegistry = {};'), ['window.QARegistry'], '赋值要被抓到');
+  assert.deepEqual(probe("typeof window.addEventListener === 'function'"), [], '`===` 不是赋值');
 });

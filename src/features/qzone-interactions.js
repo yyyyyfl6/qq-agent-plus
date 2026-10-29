@@ -46,7 +46,13 @@ function cleanText(value, max = 1000) {
 function readJson(file, fallback) {
   try {
     return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch {
+  } catch (error) {
+    // 同 daily-moments：状态文件坏掉先留档 .broken-<时间戳>（丢失的 'unknown' 标记会让
+    // 未确认结果被当成没做过、可能重复互动 —— 留证据便于人工核对；2026-10-12 审查）。
+    if (error?.code !== 'ENOENT') {
+      console.error(`[qzone] 读取 ${file} 失败，按默认状态处理，原文件已备份为 .broken-<时间戳>：`, error?.message ?? error);
+      try { fs.renameSync(file, `${file}.broken-${Date.now()}`); } catch { /* 备份失败就留在原处 */ }
+    }
     return fallback;
   }
 }
@@ -128,6 +134,7 @@ function normalizedConfig(raw = getConfig().qzoneInteractions || {}) {
 function defaultState() {
   return {
     version: 1,
+    accountId: '',
     feedInitializedAt: 0,
     replyInitializedAt: 0,
     lastFeedPollAt: 0,
@@ -146,6 +153,9 @@ function normalizeState(raw) {
     if (!Array.isArray(state[key])) state[key] = fallback[key];
   }
   state.version = 1;
+  // 2026-10-06 复审 P2：持久化状态绑定账号（详见 #run 里的闸门）。旧状态文件没有该字段
+  // 时保持空串，首次运行回填当前 selfId。
+  state.accountId = String(state.accountId || '');
   state.feedInitializedAt = Number(state.feedInitializedAt) || 0;
   state.replyInitializedAt = Number(state.replyInitializedAt) || 0;
   state.lastFeedPollAt = Number(state.lastFeedPollAt) || 0;
@@ -452,7 +462,7 @@ export class QzoneInteractionManager {
     this.nextRunAt = this.now() + Math.max(1000, Number(delay) || 1000);
     this.timer = setTimeout(() => {
       withTrace(newTraceId(), () => this.#tick()).catch((error) => {
-        this.log('[qzone-interactions] scheduler error:', error?.message ?? error);
+        this.log('[qzone-interactions] scheduler error:', error);
         // 这一轮炸了也要把下一次排上：否则 enabled:true 但永远不再跑，只有重启能恢复
         try { this.#schedule(60000); } catch { /* 已停用 */ }
       });
@@ -483,7 +493,16 @@ export class QzoneInteractionManager {
       || now - this.state.lastFeedPollAt >= cfg.feedIntervalMinutes * 60000;
     const replyDue = !this.state.lastReplyPollAt
       || now - this.state.lastReplyPollAt >= cfg.replyIntervalMinutes * 60000;
-    if (feedDue || replyDue) {
+    // 账号不一致：#run 里会 #recordFailure 并跳过执行 —— 这里干脆不进 #exclusive，
+    // 且下面"成功清零"的分支不能吃掉这次失败（否则退避失效、退回 1Hz 空转，P1-2）
+    const runSelfId = String(this.onebot?.selfId || '');
+    const accountMismatch = Boolean(this.state.accountId) && this.state.accountId !== runSelfId;
+    if (accountMismatch) {
+      // 账号不一致是**持久**状态：不进 #exclusive 就等于连失败都不记 → failStreak 恒 0、
+      // 退避失效、每 1 秒重排一次，功能静默停摆（2026-10-13 全项目审查 P2-1）。
+      this.#recordFailure(`QQ 登录账号与 qzone-interactions 状态文件不一致（状态里是 ${this.state.accountId}，当前是 ${runSelfId}），本轮跳过`);
+    }
+    if ((feedDue || replyDue) && !accountMismatch) {
       try {
         const result = await this.#exclusive('scheduled', () => this.#run({
           kind: feedDue && replyDue ? 'all' : (feedDue ? 'feed' : 'reply'),
@@ -522,7 +541,8 @@ export class QzoneInteractionManager {
     const streak = Math.min(6, (Number(this.state.failStreak) || 0) + 1);
     this.state.failStreak = streak;
     this.#save();
-    if (streak === FAILURE_NOTIFY_STREAK) this.log('[qzone-interactions] run failed:', message);
+    // 传 Error 实例而不是字符串：moduleLog 只对带 Error 的调用进异常面板（2026-10-07 复审）
+    if (streak === FAILURE_NOTIFY_STREAK) this.log('[qzone-interactions] run failed:', new Error(String(message)));
     else console.log(`[qzone-interactions] run failed（连续 ${streak} 次，退避重试中）:`, message);
   }
 
@@ -1028,6 +1048,12 @@ export class QzoneInteractionManager {
         continue;
       }
       await this.#pauseBetweenActions(cfg, writes++);
+      // ⚠️ 动作间隔是一次**不感知 abort 的 setTimeout**：中止正好落在这一步时，循环头那次
+      // 检查已经过去了。下面 replyComment 带着已中止的 signal 会立刻抛错，被 catch 里的
+      // `signal.aborted` 分支记成 unknown —— 而这条**根本没发出去**，本该保持 unread 留给
+      // 下个窗口重试（与 docs/QZONE_INTERACTIONS.md 的不变量、以及本文件「写入前中止」
+      // 那条用例直接矛盾）。所以等待**之后**必须再查一次（2026-10-04 全面复审 P2）。
+      if (signal?.aborted) break;
       item.status = 'acting';
       item.replyContent = action.content;
       this.#save();
@@ -1087,6 +1113,20 @@ export class QzoneInteractionManager {
       this.#save();
       if (wantsComment) {
         await this.#pauseBetweenActions(cfg, writes++);
+        // 同 reply 循环：间隔等待不感知 abort，这里必须再查一次，否则"根本没发出去"
+        // 的评论会被下面的 catch 记成 unknown（2026-10-04 全面复审 P2）。
+        if (signal?.aborted) {
+          // ⚠️ 本循环把 status 置 'acting' 在**等待之前**（reply 循环是在之后），
+          // 所以中止早退时条目会卡在 acting —— 而 acting → unknown 的回收只发生在
+          // **构造时**的恢复里（load 之后那段），运行期没人回收它：既不重试也不上报。
+          // 2026-10-04 全面复审 P3 实测：111:k1:acting / run=done，两条路径语义不一致。
+          // 这里退回 unread：本次根本没发出去，留给下个活跃窗口，与 reply 路径同口径。
+          item.status = 'unread';
+          item.commentContent = '';
+          item.updatedAt = this.now();
+          this.#save();
+          break;
+        }
         try {
           const result = await this.onebot.call('comment_qzone', {
             tid: item.post.tid,
@@ -1119,6 +1159,27 @@ export class QzoneInteractionManager {
       }
       if (wantsLike && !item.post.isLiked) {
         await this.#pauseBetweenActions(cfg, writes++);
+        // 同上：间隔等待不感知 abort，这里必须再查一次（2026-10-04 全面复审 P2）
+        if (signal?.aborted) {
+          // ⚠️ 本循环把 status 置 'acting' 在**等待之前**（reply 循环是在之后），
+          // 所以中止早退时条目会卡在 acting —— 而 acting → unknown 的回收只发生在
+          // **构造时**的恢复里（load 之后那段），运行期没人回收它：既不重试也不上报。
+          // 2026-10-04 全面复审 P3 实测：111:k1:acting / run=done，两条路径语义不一致。
+          //
+          // ⚠️⚠️ 但只有「评论还没发过」才允许退回 unread：like_comment 组合动作里评论阶段
+          // 可能**已经成功**（commentStatus='done'，评论真实发出去了），这时退回 unread 会让
+          // 下轮按 unread 重新决策 —— 模型看不到自己已评论过（commentContent 还被抹了），
+          // 大概率再评一次，正是下面 1122 行注释自己划的红线（2026-10-04 复审 P1）。
+          if (item.commentStatus === 'done') {
+            item.status = 'reviewed';   // 保住评论成果；点赞这一下丢了就算了（低价值、不会重复）
+          } else {
+            item.status = 'unread';     // 本次确实什么都没发出去 → 留给下个活跃窗口
+            item.commentContent = '';
+          }
+          item.updatedAt = this.now();
+          this.#save();
+          break;
+        }
         try {
           await this.onebot.call('like_qzone', {
             tid: item.post.tid,
@@ -1168,6 +1229,24 @@ export class QzoneInteractionManager {
   }
 
   async #run({ kind, source, includeExisting }) {
+    // 2026-10-06 复审 P2：持久化状态必须绑定账号。协议端（NapCat）换号登录后 selfId 变了，
+    // 旧账号积压的动态/评论队列若照常出批，会以新账号身份对旧账号好友的动态点赞/评论、
+    // 把回复发给旧账号的评论 —— daily-moments 对同一场景专门设了 MOMENT_ACCOUNT_CHANGED 闸，
+    // 这里补齐同款防线：首次运行为空则回填当前账号；账号不匹配则拒绝执行（保留队列，
+    // 换回原账号或清空状态后自动恢复）。
+    const runSelfId = String(this.onebot?.selfId || '');
+    if (!this.state.accountId) {
+      if (runSelfId) {
+        this.state.accountId = runSelfId;
+        this.#save();
+      }
+    } else if (this.state.accountId !== runSelfId) {
+      this.log(`[qzone-interactions] QQ 登录账号已改变（状态属于 ${this.state.accountId}，当前 ${runSelfId || '未知'}），本轮跳过执行；如确认切换账号，请清空 qzone-interactions 状态文件`);
+      // 必须记失败走退避：裸 return 会让 lastFeedPollAt 停在过去，dueDelay 恒为 1000ms，
+      // 巡检循环 1Hz 空转（2026-10-10 审查 C2）。账号不一致本身也值得让 owner 知道。
+      this.#recordFailure('QQ 登录账号与 qzone-interactions 状态文件不一致，本轮跳过');
+      return;
+    }
     const cfg = normalizedConfig();
     const run = {
       id: crypto.randomUUID(),
@@ -1257,11 +1336,10 @@ export class QzoneInteractionManager {
       run.usage = decided.usage;
       run.model = decided.model;
       run.plan = decided.plan;
-      for (const item of [...batch.feeds, ...batch.replies]) {
-        item.state.status = 'reviewed';
-        item.state.reviewedAt = this.now();
-        item.state.updatedAt = this.now();
-      }
+      // ⚠️ 这里**不要**提前把整批标成 reviewed（2026-10-03 全量审查）：下面 #executePlan 的两个
+      // 循环头会在"手动停止/窗口关闭"时 break，未执行的条目必须保持 unread 留给下个活跃窗口重试 ——
+      // 提前标记会让它们既没被互动、又永远不再进批次（下一轮只挑 unread），静默吞掉。
+      // 状态由 #executePlan 逐条落（成功 reviewed / 失败 unknown / 未尝试保持原样）。
       this.#save();
       await this.#executePlan(decided.plan, batch, cfg, this.controller.signal, run);
       run.status = run.actions.some((action) => action.status === 'unknown')

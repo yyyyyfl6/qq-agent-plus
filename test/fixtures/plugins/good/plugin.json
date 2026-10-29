@@ -1,0 +1,17 @@
+{
+  "id": "good",
+  "apiVersion": 1,
+  "name": "示例插件（测试用）",
+  "version": "1.0.0",
+  "description": "把 v1 的每条能力都走一遍的夹具：tools / observe / schedule / storage / log / config",
+  "capabilities": ["tools", "observe", "schedule", "log", "storage", "config"],
+  "tools": [
+    { "name": "echo", "description": "原样回显入参", "parameters": { "type": "object", "properties": { "text": { "type": "string" } }, "required": ["text"] } },
+    { "name": "settings", "description": "读回 init 时收到的插件配置段", "parameters": { "type": "object", "properties": {} } },
+    { "name": "remember", "description": "写一条状态再读回来（验证 cap.storage 落盘）", "parameters": { "type": "object", "properties": { "value": { "type": "string" } }, "required": ["value"] } },
+    { "name": "probe_isolation", "description": "试着读外部文件 / 起子进程 / 写文件，报告拦截结果", "parameters": { "type": "object", "properties": {} } },
+    { "name": "counters", "description": "返回 observe 与 schedule 各被投递了几次", "parameters": { "type": "object", "properties": {} } },
+    { "name": "log_probe", "description": "经 cap.log.write 写一行日志", "parameters": { "type": "object", "properties": {} } }
+  ],
+  "schedule": [ { "name": "tick", "everyMs": 60000 } ]
+}

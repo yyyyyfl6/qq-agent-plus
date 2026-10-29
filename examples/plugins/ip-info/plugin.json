@@ -1,0 +1,22 @@
+{
+  "id": "ip-info",
+  "apiVersion": 1,
+  "name": "IP 查询",
+  "version": "1.0.0",
+  "description": "查一个 IP 或域名归属地：国家、省市、运营商、ASN 与反向解析，走 ip-api 免费接口，不需要 Key",
+  "entry": "index.mjs",
+  "capabilities": ["tools", "http", "config"],
+  "tools": [
+    {
+      "name": "lookup",
+      "description": "查一个 IP 地址或域名的归属信息。群友问“这个 IP 是哪里的”“example.com 的服务器在哪”时用它。参数 query 是要查的 IP（如 8.8.8.8）或域名（如 github.com）。返回国家/省市、运营商(ISP)、所属组织、ASN 与反向解析。注意：只支持公网地址，内网/私有地址查不出来。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "description": "要查的 IP 或域名，例如 8.8.8.8 或 github.com" }
+        },
+        "required": ["query"]
+      }
+    }
+  ]
+}

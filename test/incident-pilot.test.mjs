@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import { rmDirBestEffort } from './helpers/cleanup.mjs';
 
 const {
   IncidentPilotManager,
@@ -48,7 +49,7 @@ function fixture(t, patch = {}) {
   });
   t.after(async () => {
     await manager.stop();
-    fs.rmSync(dataDir, { recursive: true, force: true });
+    rmDirBestEffort(dataDir);
   });
   return {
     dataDir,
@@ -152,7 +153,7 @@ test('pending notifications resume once while unknown notification results never
   });
   t.after(async () => {
     await manager.stop();
-    fs.rmSync(dataDir, { recursive: true, force: true });
+    rmDirBestEffort(dataDir);
   });
   manager.start();
   const unknown = manager.capture(new Error('critical write'), {

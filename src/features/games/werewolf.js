@@ -588,7 +588,7 @@ export function onPrivateMessage(state, msg, { now = 0, rng = Math.random } = {}
       }
       s.pending.witch = { use: 'heal' };
       if (canAck) effects.push({ type: 'private', userId: uid, text: `✔ 记下了：用解药救 ${killTarget ? `${idxOf(s, killTarget)} 号 ${killTarget.name}` : '今晚被刀的人'}。` });
-    } else if (/^(毒|下毒|毒药|用毒)/.test(text)) {
+    } else if (/^(下毒|毒药|用毒|毒)/.test(text)) {
       if (!potions.poison) {
         // 她是被刀的人时不能再劝她「救」——那条路被"不能自救"堵死，会变成死循环
         const selfHit = String(s.pending.killTarget) === uid;
@@ -598,7 +598,7 @@ export function onPrivateMessage(state, msg, { now = 0, rng = Math.random } = {}
             : '【狼人杀】你的毒药已经用过了。要救今晚被刀的人就回「救」。' }] }
           : { state: s, effects: [], consume: true };
       }
-      const victim = parseTarget(s, text.replace(/^(毒|下毒|毒药|用毒)\s*/, ''));
+      const victim = parseTarget(s, text.replace(/^(下毒|毒药|用毒|毒)\s*/, ''));
       if (!victim) {
         return canAck
           ? { state: s, effects: [{ type: 'private', userId: uid, text: '【狼人杀】没看懂毒谁：回「毒 3」这样的编号或群名片。' }] }

@@ -1,12 +1,16 @@
 import { getConfig } from './config.js';
 import { isTimeActive } from './time-gate.js';
+import { idList } from './list.js';
+
+// 名单字段读成字符串数组的守卫集中到 list.js；这里保留导出，兼容既有调用方。
+export { idList };
 
 export function chatAllowed(chatKey, cfg = getConfig()) {
   const [kind, id] = String(chatKey).split(':');
   if (!['group', 'private'].includes(kind) || !/^\d+$/.test(id || '')) return false;
   const field = kind === 'group' ? 'groups' : 'private';
-  if ((cfg.deny?.[field] || []).map(String).includes(id)) return false;
-  const allow = (cfg.allow?.[field] || []).map(String);
+  if (idList(cfg.deny?.[field]).includes(id)) return false;
+  const allow = idList(cfg.allow?.[field]);
   return allow.length ? allow.includes(id) : cfg.allowAllWhenEmpty === true;
 }
 
@@ -36,7 +40,9 @@ export function assertCanSend(chatKey, signal, { gameScoped = false } = {}) {
     if (cfg.runtime?.mode !== 'active' || cfg.runtime?.paused) {
       throw new Error('Send blocked: observe/paused mode or chat not allowed');
     }
-    if ((cfg.deny?.private || []).map(String).includes(id)) {
+    // 与 chatAllowed 同一口径：名单形状坏掉时按"空名单"处理，别在这里抛（这条在每次
+    // 游戏作用域的私聊发送上，抛一次就等于那条链路静默坏掉）
+    if (idList(cfg.deny?.private).includes(id)) {
       throw new Error('Send blocked: 该用户被管理员屏蔽（deny 优先于游戏豁免）');
     }
     return;

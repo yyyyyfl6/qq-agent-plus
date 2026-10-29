@@ -23,6 +23,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DATA_DIR } from '../core/config.js';
 import { setRemotePrices } from './model-prices.js';
+import { readJsonBounded } from '../core/http-body.js';
 
 const CACHE_FILE = path.join(DATA_DIR, 'price-feed-cache.json');
 const FETCH_TIMEOUT_MS = 10000;
@@ -204,7 +205,8 @@ function writeDiskCache(tag, url, prices, aliases = null) {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     const tmp = `${CACHE_FILE}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ tag, url, fetchedAt: Date.now(), prices, aliases: aliases || {} }), 'utf8');
+    // 与其他落盘同口径锁 0600（缓存本身不敏感，但避免 umask 波动带来的文件权限漂移）
+    fs.writeFileSync(tmp, JSON.stringify({ tag, url, fetchedAt: Date.now(), prices, aliases: aliases || {} }), { encoding: 'utf8', mode: 0o600 });
     fs.renameSync(tmp, CACHE_FILE);
   } catch { /* 缓存写不进去不影响使用 */ }
 }
@@ -254,7 +256,13 @@ async function refreshOnce(configured, options = {}) {
     try {
       const res = await fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs) });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json().catch(() => { throw new Error('返回的不是合法 JSON'); });
+      // 有界读（2MB）：超限与非法 JSON 分开报（2026-10-09 审查）
+      let data;
+      try {
+        data = await readJsonBounded(res, 2 * 1024 * 1024);
+      } catch (error) {
+        throw new Error(error?.code === 'BODY_TOO_LARGE' ? '价格文件过大（超过 2MB）' : '返回的不是合法 JSON');
+      }
       const norm = normalizePriceFeed(data);
       if (!norm) throw new Error('JSON 里没有可用的价格条目');
       applyPrices(norm.prices, 'remote', norm.aliases);

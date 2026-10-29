@@ -4,6 +4,7 @@ import { bindGlobalMemoryStore } from './memory-runtime-integration.js';
 import { backupPersonBeforeConsolidation } from './memory-consolidation-backup.js';
 import '../pilots/relationship-runtime-integration.js';
 import { impressionVisible, memoryVisibilityOf } from '../core/memory-visibility.js';
+import { sanitizeUserText } from '../core/util.js';
 
 export class MemoryStore extends BaseMemoryStore {
   constructor(...args) {
@@ -34,7 +35,8 @@ export class MemoryStore extends BaseMemoryStore {
         memberImpression.push({
           userId: String(member.userId || ''),
           target: String(member.name || member.userId || '某人'),
-          content: entry.content,
+          // 印象正文是群聊内容的沉淀：出工具口前过一道段头弱化（与 memory-global 同口径）
+          content: sanitizeUserText(entry.content),
           createdAt: entry.createdAt,
           lastObservedAt: entry.lastObservedAt,
           origin: entry.origin || '',

@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { parseArgs } from 'node:util';
 import {
@@ -7,6 +8,7 @@ import {
   assertUpdateConfigAccess,
   autoUpdatePaths,
   consumeAutoUpdateRequest,
+  failureDetail,
   readAutoUpdateState,
   sanitizeUpdateError,
   writeAutoUpdateState
@@ -17,7 +19,8 @@ import {
   normalizeUpdateNetworkSettings,
   retryUpdateOperation
 } from '../src/update-network.js';
-import { checkForUpdate, githubApiBase } from '../src/update-notice.js';
+import { checkForUpdate, githubApiBase, readVersionAt } from '../src/update-notice.js';
+import { readJsonBounded } from '../src/core/http-body.js';
 
 const { values } = parseArgs({
   options: {
@@ -96,7 +99,8 @@ function command(binary, args, {
   if (allowFailure) return result;
   if (result.error) throw result.error;
   if (result.status !== 0) {
-    const detail = String(result.stderr || result.stdout || '').trim().slice(-2000);
+    // 详情口径见 failureDetail：node --test 优先列 not ok 失败项，不拿输出结尾凑数
+    const detail = failureDetail(result);
     const error = new Error(`${path.basename(binary)} ${args[0] || ''} failed`
       + `${detail ? `: ${detail}` : ` with exit ${result.status}`}`);
     error.status = result.status;
@@ -118,7 +122,8 @@ function networkGitArgs(args) {
 
 function commandFailure(binary, args, result) {
   if (result?.error) return result.error;
-  const detail = String(result?.stderr || result?.stdout || '').trim().slice(-2000);
+  // 与 command() 同一口径（见 failureDetail）：有 TAP 失败项就别拿输出结尾当详情
+  const detail = failureDetail(result);
   const error = new Error(`${path.basename(binary)} ${args[0] || ''} failed`
     + `${detail ? `: ${detail}` : ` with exit ${result?.status}`}`);
   error.status = result?.status;
@@ -431,7 +436,11 @@ async function fetchReleaseTag(tag) {
    取回之后的流程（npm ci → 单元测试 → deploy.sh）与 git 通道完全一致。
 
    安全性：两条通道都是 HTTPS、都以 GitHub 给出的 commit sha 为锚点；tarball 的
-   地址里带的就是 API 解析出来的那个 sha，信任级别与 git fetch 一致。
+   地址里带的就是 API 解析出来的那个 sha。注意**不要**把 codeload 通道当成与 git
+   等价的强校验：git 对对象做 sha1 内容寻址，而 tar.gz 之外没有可对照的官方摘要
+   （GitHub 不公布 tar 的校验和），这里只有"HTTPS + sha 定位的 URL"这一层信任 ——
+   所以下载后把 sha256 记进日志，供需要时与 GitHub 页面上的产物对照审计
+   （2026-10-12 审查：原注释自称"信任级别与 git fetch 一致"属于过度承诺）。
    压缩包大小设上限，避免异常地址把内存吃满。
 */
 
@@ -461,7 +470,8 @@ async function githubApiJson(pathname, timeoutMs) {
     error.retryable = res.status >= 500 || res.status === 429;
     throw error;
   }
-  return res.json();
+  // 有界读：GitHub API 响应（release/commit 元数据）远小于此，2MB 只兜"路径被劫持/代理发疯"
+  return readJsonBounded(res, 2 * 1024 * 1024);
 }
 
 /** git 通道探不通时的第二探：用 API 问同一个仓库/分支。 */
@@ -603,6 +613,8 @@ async function materializeFromApi(workDir, revision) {
     onRetry: retryLog('codeload download')
   });
   const archive = path.join(path.dirname(workDir), `source-${revision.slice(0, 12)}.tar.gz`);
+  // 摘要落日志（见文件头"安全性"段）：没有可对照的官方摘要，至少留一条审计线索
+  console.log(`[auto-update] 源码包 sha256=${crypto.createHash('sha256').update(downloaded.value).digest('hex')}（${downloaded.value.length} 字节，revision ${revision.slice(0, 12)}）`);
   fs.writeFileSync(archive, downloaded.value, { mode: 0o600 });
   try {
     command('tar', ['-xzf', archive, '-C', workDir, '--strip-components=1'], {
@@ -737,10 +749,13 @@ async function run() {
   cfg = readObject(configFile);
   const settings = cfg.autoUpdate || {};
   networkSettings = normalizeUpdateNetworkSettings(settings);
-  if (mode === 'scheduled' && settings.enabled !== true) return;
+  const previous = readAutoUpdateState(dataDir);
+  // disableOnFailure 落下 enabled:false 后，控制台的任何一次保存都可能把主进程内存里的旧配置
+  // （enabled:true）写回文件、把自停悄悄抹掉 —— 升级自停还得认数据目录里的 autoDisabled，
+  // 它只由更新器自己与被显式 resume 的控制台接口读写（2026-10-07 复审 P2）。
+  if (mode === 'scheduled' && (settings.enabled !== true || previous.autoDisabled === true)) return;
   assertUpdateConfigAccess(configFile);
 
-  const previous = readAutoUpdateState(dataDir);
   const now = Date.now();
   const intervalMs = Math.max(1, Number(settings.intervalHours) || 6) * 60 * 60 * 1000;
   if (
@@ -789,12 +804,16 @@ async function run() {
     // 每次运行显式清空：状态是浅合并的，不清会残留上一次成功的通道值
     transport: '',
     error: '',
-    notification: {
-      pending: false,
-      ownerUin: autoUpdateOwner(cfg),
-      sentAt: 0,
-      error: ''
-    },
+    // 上一轮还没送出去的失败/结果未知通知（disableOnFailure=false 时会留 pending）不能被这次写入清掉，
+    // 否则管理员永远收不到那条告警（docs/AUTO_UPDATE.md 承诺"保留 pending 等重连"；2026-10-13 全项目审查 P3）。
+    notification: (previous?.notification && (previous.notification.pending || previous.notification.deliveryUnknown))
+      ? { ...previous.notification }
+      : {
+        pending: false,
+        ownerUin: autoUpdateOwner(cfg),
+        sentAt: 0,
+        error: ''
+      },
     connectivity: {
       status: 'testing',
       transport: '',
@@ -852,7 +871,12 @@ async function run() {
   // 判定与控制台弹窗共用 checkForUpdate，避免两边口径不一致。
   // 手动 update-now 是明确的重试意图：绕过"忽略该版本"——否则更新失败一次之后
   // 同名 Release 永远 no-update，只能手改 state 文件（Issue #7 踩到的坑）。
-  const notice = await checkForUpdate(dataDir, cfg, { force: mode === 'manual' });
+  // 版本判定读的是**这次要更新的那棵树**（--app-dir），不是更新器脚本所在树：
+  // 两者在标准部署下相同，但显式传入才能覆盖"从别处运行更新器"和端到端用例。
+  const notice = await checkForUpdate(dataDir, cfg, {
+    force: mode === 'manual',
+    localVersion: readVersionAt(appDir) || undefined
+  });
   targetVersion = releaseTarget(notice, mode === 'manual' ? '' : previous?.ignoredVersion);
   if (!targetVersion) {
     console.log(`[auto-update] no released version to deploy (${notice?.reason || 'unknown'})`);
@@ -865,6 +889,8 @@ async function run() {
       targetRevision: '',
       targetVersion: '',
       transport,
+      // 原因进 state（此前只在日志里，控制台/接口看不到"为什么没更新"；2026-10-12 审查）
+      reason: String(notice?.reason || 'unknown'),
       error: '',
       autoDisabled: false
     });
@@ -886,6 +912,7 @@ async function run() {
       targetRevision,
       targetVersion,
       transport,
+      reason: 'revision-already-current',
       error: '',
       autoDisabled: false
     });
@@ -954,20 +981,58 @@ async function run() {
   const testTmpDir = path.join(workDir, '.auto-update-test-tmp');
   fs.mkdirSync(testDataDir, { recursive: true, mode: 0o700 });
   fs.mkdirSync(testTmpDir, { recursive: true, mode: 0o700 });
-  command(process.execPath, ['--test', ...tests], {
+  const testEnv = {
+    ...runtimeEnv,
+    NODE_ENV: 'test',
+    QQ_AGENT_DATA_DIR: testDataDir,
+    TMPDIR: testTmpDir,
+    TMP: testTmpDir,
+    TEMP: testTmpDir
+  };
+  // 强制 TAP：默认 reporter 在管道里可能是 spec（✔/✖），failureDetail 解析不到失败项，
+  // 只能回退成输出尾部——#50 的日志就是这样把「install-oneclick 假红」显示成狼人杀用例。
+  command(process.execPath, ['--test', '--test-reporter=tap', ...tests], {
     cwd: workDir,
     timeout: 20 * 60 * 1000,
-    env: {
-      ...runtimeEnv,
-      NODE_ENV: 'test',
-      QQ_AGENT_DATA_DIR: testDataDir,
-      TMPDIR: testTmpDir,
-      TMP: testTmpDir,
-      TEMP: testTmpDir
-    }
+    env: testEnv
   });
   command(process.execPath, ['--check', 'src/server.js'], { cwd: workDir });
   command(process.execPath, ['--check', 'scripts/auto-update.mjs'], { cwd: workDir });
+
+  // ── 与 CI（.github/workflows/ci.yml 的 test job）对齐的其余门禁 ──
+  // 原来只跑 `node --test test/*.test.mjs`，于是"提示词 / 渲染 / 滚动 / 用量端到端"这几条
+  // 与 UI 直接相关的回归**在更新器这一层没有任何覆盖**：它们都是纯 Node + 本仓源码
+  // （不 import happy-dom / eslint 这些 devDeps），--omit=dev 下照样能跑，却漏在门外
+  // ——UI 类回归因此能绕过自动更新直接上线（2026-10；CI 早就拦得住，更新器没有）。
+  // 逐个按文件是否存在执行：真实候选树是完整 checkout，只有测试替身的最小树会缺文件；
+  // 真缺了，发布前置闸门（release.yml 的 verify job）与 CI 也会红，这里不重复兜底。
+  //
+  // 这里**刻意不跑 `npm run lint`**：按 D6 更新器用 `npm ci --omit=dev`，装不了 eslint，
+  // 硬加会让每次自动更新都失败。lint 由 CI 的 lint job 与发布前置闸门
+  // （release.yml 的 verify job，用完整依赖跑 `npm run lint`）覆盖；更新器部署的又只可能是
+  // "已经过发布闸门"的 Release——所以这条不是漏测（别下一个人再提一遍）。
+  for (const [script, timeout] of [
+    ['test/test-prompt.mjs', 5 * 60 * 1000],
+    ['test/render-test.mjs', 10 * 60 * 1000],
+    ['test/scroll-test.mjs', 5 * 60 * 1000],
+    ['test/usage-e2e.mjs', 10 * 60 * 1000],
+    ['test/local/run.mjs', 10 * 60 * 1000]
+  ]) {
+    if (!fs.existsSync(path.join(workDir, script))) {
+      console.log(`[auto-update] 跳过 ${script}（候选树里没有这个文件）`);
+      continue;
+    }
+    command(process.execPath, [script], { cwd: workDir, timeout, env: testEnv });
+  }
+  // CI 的静态门禁：未定义调用扫描（node src/ops.js scan --strict）。纯 Node，不依赖 devDeps。
+  if (fs.existsSync(path.join(workDir, 'src', 'ops.js'))) {
+    command(process.execPath, ['src/ops.js', 'scan', '--strict'], {
+      cwd: workDir,
+      timeout: 5 * 60 * 1000
+    });
+  } else {
+    console.log('[auto-update] 跳过 src/ops.js scan --strict（候选树里没有这个文件）');
+  }
   // 两个目录必须在 deploy.sh 之前删掉：它 rsync 的是整个 checkout（根目录多什么就被部署什么）
   fs.rmSync(testDataDir, { recursive: true, force: true });
   fs.rmSync(testTmpDir, { recursive: true, force: true });
@@ -982,27 +1047,42 @@ async function run() {
     targetVersion,
     transport
   });
-  command('/bin/bash', [
-    path.join(workDir, 'deploy.sh'),
-    '--install-dir', appDir,
-    '--data-dir', dataDir,
-    '--host', String(cfg.server?.host || '127.0.0.1'),
-    '--port', String(Number(cfg.server?.port) || 3210),
-    '--service', service,
-    '--node', process.execPath,
-    // 期望的来源仓库/分支透传给部署侧：与安装记录比对，堵"在错误源码树里跑 deploy.sh"
-    '--repository', repository,
-    '--branch', branch
-  ], {
-    cwd: workDir,
-    timeout: 20 * 60 * 1000,
-    env: {
-      ...runtimeEnv,
-      QQ_AGENT_SOURCE_REVISION: targetRevision,
-      QQ_AGENT_REPOSITORY: repository,
-      QQ_AGENT_BRANCH: branch
+  try {
+    command('/bin/bash', [
+      path.join(workDir, 'deploy.sh'),
+      '--install-dir', appDir,
+      '--data-dir', dataDir,
+      '--host', String(cfg.server?.host || '127.0.0.1'),
+      '--port', String(Number(cfg.server?.port) || 3210),
+      '--service', service,
+      '--node', process.execPath,
+      // 期望的来源仓库/分支透传给部署侧：与安装记录比对，堵"在错误源码树里跑 deploy.sh"。
+      // 自动更新发起的部署里，控制台设置就是真相源 —— 校验侧对"更新器驱动"的不一致按警告
+      // 处理（见 verify-deployment-target.mjs），否则改过分支的实例会永久卡死在拒绝部署上。
+      '--repository', repository,
+      '--branch', branch
+    ], {
+      cwd: workDir,
+      timeout: 20 * 60 * 1000,
+      env: {
+        ...runtimeEnv,
+        QQ_AGENT_SOURCE_REVISION: targetRevision,
+        QQ_AGENT_REPOSITORY: repository,
+        QQ_AGENT_BRANCH: branch
+      }
+    });
+  } catch (error) {
+    const output = `${error?.stdout || ''}${error?.stderr || ''}`;
+    if (/Another deployment is running|Another deployment may be running|Another deployment is taking over a stale lock/.test(output)) {
+      // 有人（多为手动部署）正持锁：这是正常碰撞，不是失败 —— 按 busy 结清
+      //（不自停、不发告警，等下个周期再来）。此前会误判成部署失败并触发 disableOnFailure
+      // + 给管理员发告警（2026-10-07 复审 P3）。
+      const busy = new Error('另一个部署正在进行，本轮更新跳过（不算失败）');
+      busy.code = 'UPDATE_BUSY';
+      throw busy;
     }
-  });
+    throw error;
+  }
 
   writeAutoUpdateState(dataDir, {
     status: 'succeeded',

@@ -97,6 +97,13 @@ try {
   const problems = [];
   const reject = (msg) => problems.push(msg);
 
+  // 数据目录就是安装目录：deploy.sh 的 rsync --delete 会把数据当源码树的一部分清掉。
+  // 放在记录比对之前：这个组合本身就不合法，跟 .deployment.json 里记了什么无关。
+  if (path.resolve(args.installDir) === path.resolve(args.dataDir)) {
+    reject('数据目录不能与安装目录相同：更新时的 rsync --delete 会把 config.json / SQLite 等数据删掉'
+      + '（可以放在安装目录内，如 INSTALL_DIR/data，或放在安装目录之外，但不能就是安装目录本身）');
+  }
+
   if (!fs.existsSync(metaPath)) {
     const owned = installerOwnedEntries(args.installDir, args.dataDir);
     const foreign = dirHasFiles(args.installDir, owned);
@@ -139,6 +146,11 @@ try {
       else reject(`service 与记录不一致：记录 ${meta.service} / 传入 ${args.service}`);
     } else skipped.push('service（记录缺 service）');
 
+    // 更新器驱动的部署（QQ_AGENT_SOURCE_REVISION 由 scripts/auto-update.mjs 设置）里，
+    // 源码树是刚从"控制台配置的仓库/分支"的 Release 物化出来的 —— 控制台设置就是真相源，
+    // 与记录不一致只可能是"操作员刚改过设置"。此时硬拒绝会让该实例此后每次更新
+    // 都被拒、disableOnFailure 还会把自动更新自停（2026-10-07 复审 P2）。手动部署维持拒绝。
+    const updaterDriven = Boolean(process.env.QQ_AGENT_SOURCE_REVISION);
     for (const [name, expected] of [['repository', args.repository], ['branch', args.branch]]) {
       if (!expected) continue; // 调用方没给期望值（手动部署）：无可比对，跳过
       const recorded = typeof meta[name] === 'string' ? meta[name] : '';
@@ -147,7 +159,12 @@ try {
         continue;
       }
       if (recorded === expected) ok.push(`${name} 与记录一致`);
-      else reject(`${name} 与记录不一致：记录 ${recorded} / 传入 ${expected}（确认是不是在错误的源码树里跑 deploy.sh）`);
+      else if (updaterDriven) {
+        warnings.push(`${name} 与记录不一致：记录 ${recorded} / 本次 ${expected}`
+          + '（本次由自动更新发起，按控制台设置部署，部署成功后记录会同步）');
+      } else {
+        reject(`${name} 与记录不一致：记录 ${recorded} / 传入 ${expected}（确认是不是在错误的源码树里跑 deploy.sh）`);
+      }
     }
 
     if (args.host !== undefined && typeof meta.host === 'string' && meta.host && meta.host !== args.host) {

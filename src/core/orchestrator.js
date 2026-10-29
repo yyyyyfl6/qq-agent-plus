@@ -10,7 +10,6 @@ import { skinScope } from '../skins/context.js';
 // 同一会话（群/私聊）同时最多一个运行；运行期间新消息只写 JSON（未读），不叠加触发。
 // 不同会话之间并行，受 maxConcurrentRuns 全局限流。
 import crypto from 'node:crypto';
-import fs from 'node:fs';
 import path from 'node:path';
 import {
   DATA_DIR,
@@ -26,6 +25,7 @@ import {
   updateConfig
 } from './config.js';
 import { cappedByTokenSaver, effectiveRunLimits, tokenSaverCapsOf } from './token-saver.js';
+import { filterBlockedHistory } from './blocklist.js';
 import { redactText } from './redact.js';
 // ── 主动开话题的时间段：窗口外不主动开口（聊天回复不受影响）──
 
@@ -40,11 +40,6 @@ const REMINDER_NOTE_BODY_MAX = 400;
 // 主动唤醒被"接不了"（会话在跑 / 并发满 / 没配模型）时的重试间隔：
 // 不设这个的话模型自安排的唤醒会在那些时刻被静默丢掉（2026-09-29 审查 P2）。
 const WAKE_RETRY_MS = 60 * 1000;
-function readProactiveLastAttempt() {
-  try {
-    return Number(JSON.parse(fs.readFileSync(PROACTIVE_STATE_FILE, 'utf8')).lastAttemptAt) || 0;
-  } catch { return 0; }
-}
 /**
  * "我说了话但没人接" 的补话判定（纯函数，便于单测）。
  * 只给一次机会：20 分钟内不重复安排；有人刚说话/已有安排/不在发言时段都不安排。
@@ -64,12 +59,6 @@ export function followUpPlan({
   return { schedule: true, minutes: 10 + Math.floor(random() * 3), reason: '发言后没人接话' };
 }
 
-function writeProactiveLastAttempt(ts) {
-  try {
-    fs.writeFileSync(PROACTIVE_STATE_FILE, JSON.stringify({ lastAttemptAt: Number(ts) || Date.now() }));
-  } catch { /* 写不进去也不影响正常发言 */ }
-}
-
 function activeHoursMinuteOf(value, end = false) {
   if (end && String(value) === '24:00') return 1440;
   const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(String(value ?? ''));
@@ -77,7 +66,7 @@ function activeHoursMinuteOf(value, end = false) {
 }
 
 /** 解析时间段：支持 {start,end} 或 {windows:[{start,end},…]}；未配置 = 全天。 */
-function proactiveWindows(raw) {
+export function proactiveWindows(raw) {
   const list = [];
   const push = (w) => {
     const start = activeHoursMinuteOf(w?.start);
@@ -90,7 +79,7 @@ function proactiveWindows(raw) {
 }
 
 /** 现在是否在某个窗口内；不在时给出最近的窗口开始时间。 */
-function proactiveWindowState(raw, now) {
+export function proactiveWindowState(raw, now) {
   const windows = proactiveWindows(raw);
   if (!windows.length) return { active: true, nextActiveAt: now };
   const minute = minuteOfDayInZone(now);
@@ -107,21 +96,32 @@ function proactiveWindowState(raw, now) {
 
 
 import { safeSlice } from './util.js';
-import { canRun } from './access.js';
-import { assertTimeAllowed, isTimeActive, TimeControlError, watchTimeWindow, withTimeScope } from './time-gate.js';
-import { vendorOfConfig } from '../pricing/model-prices.js';
+import { canRun, chatAllowed } from './access.js';
+import { idList } from './list.js';
+import { assertTimeAllowed, isTimeActive, TimeControlError, timeUntilActive, watchTimeWindow, withTimeScope } from './time-gate.js';
+import { vendorOfConfig, vendorOfBaseUrl } from '../pricing/model-prices.js';
 import { budgetStatus } from './budget.js';
 import { readOwnerUin } from './notify-owner.js';
-import { ZONE_OFFSET_MS, minuteOfDayInZone, randInt, createEventBus, todayKey } from './util.js';
-import { buildSystemPrompt, buildUserPrompt, resolveContextTier } from '../llm/prompt.js';
-import { chatCompletion, chatCompletionWithRetry, addUsage, isRetryableError } from '../llm/llm.js';
-import { buildToolDefs, toOpenAiTools, executeTool } from '../tools/tools.js';
+import { notePersonaInteraction, personaStatePrompt } from './persona-state.js';
+import { memeDensityPrompt } from '../llm/humanize.js';
+import { memesForPrompt } from '../memes/store.js';
+import { visibleImpressions, memoryVisibilityOf } from './memory-visibility.js';
+import { knowledgeEnabled } from '../knowledge/store.js';
+import { buildReminderNote, reminderNoteCost } from './reminders.js';
+import { ZONE_OFFSET_MS, minuteOfDayInZone, randInt, createEventBus, todayKey, sanitizeUserText } from './util.js';
+import { readProactiveAttempts, readProactiveState, writeProactiveAttempt, writeProactiveChatAttempts } from './proactive-state.js';
+import { buildSystemPrompt, buildUserPrompt, isAtMe, resolveContextTier } from '../llm/prompt.js';
+import { chatCompletion, chatCompletionWithRetry, addUsage, emptyUsage, isRetryableError } from '../llm/llm.js';
+import { buildToolDefs, toOpenAiTools, executeTool, platformToolAllowed } from '../tools/tools.js';
 import { normalizeMid } from '../tools/tools-core.js';
+import { skillGateMessage } from '../skills/registry.js';
 import { visionEnabled } from '../llm/vision-scan.js';
+import { resolvePersona, voiceForPersona } from '../personas.js';
 import { currentProviders } from './providers.js';
 import { buildSlangContextForChat } from '../console/asset-observer.js';
 import { parseInlineToolCalls } from '../tools/inline-tools.js';
 import { createLogger, newTraceId, withTrace } from './logger.js';
+import { ttsConfigured } from '../llm/tts-openai.js';
 
 const log = createLogger('orchestrator');
 
@@ -243,6 +243,57 @@ export function proactiveProbability(raw) {
   return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 0.25;
 }
 
+/**
+ * 冷场开话题的作用范围。默认群聊开、私聊关（与升级前行为一致）；
+ * tick 的早退与候选选择共用这一处，避免两处各写一份默认值后漂移。
+ */
+export function proactiveScopes(cfg = {}) {
+  return {
+    groups: cfg.proactive?.groupEnabled !== false,
+    private: cfg.proactive?.privateEnabled === true
+  };
+}
+
+/**
+ * 挑出这次"冷场主动开话题"可以去的会话（纯函数，便于单测）。
+ *
+ * 作用范围由控制台两个复选框决定：
+ *   · 群聊（proactive.groupEnabled，默认开）：沿用 allow.groups / allowAllWhenEmpty；
+ *   · 私聊（proactive.privateEnabled，默认关）：沿用 allow.private（deny 优先、名单空时看
+ *     allowAllWhenEmpty），与平时回复私聊的白名单规则一致，不另建名单。
+ */
+export function proactiveCandidates({
+  chatKeys = [], cfg = {}, metaOf = () => ({}), now = Date.now(),
+  canWake = () => true, isRunning = () => false
+} = {}) {
+  // 注入点先落本地 const（ops scan --strict 只认 const/let；同 capabilities.js 约定）
+  const metaOfFn = metaOf;
+  const canWakeFn = canWake;
+  const isRunningFn = isRunning;
+  const idleMs = Math.max(300000, Number(cfg.proactive?.idleThresholdMs) || 1800000);
+  const allowGroups = idList(cfg.allow?.groups);
+  const scopes = proactiveScopes(cfg);
+  const out = [];
+  for (const chatKey of chatKeys) {
+    const [kind, id] = String(chatKey).split(':');
+    if (kind === 'group') {
+      if (!scopes.groups) continue;
+      if (allowGroups.length > 0 ? !allowGroups.includes(id) : !cfg.allowAllWhenEmpty) continue;
+    } else if (kind === 'private') {
+      if (!scopes.private) continue;
+    } else {
+      continue;
+    }
+    if (!canWakeFn(chatKey)) continue;
+    if (isRunningFn(chatKey)) continue;
+    const meta = metaOfFn(chatKey) || {};
+    if (meta.unread > 0) continue;
+    if (now - (Number(meta.lastTs) || 0) < idleMs) continue;
+    out.push(chatKey);
+  }
+  return out;
+}
+
 export function triggerKindForTier(result = {}, {
   manual = false,
   proactive = false,
@@ -315,14 +366,37 @@ function mergeImpressionLists(base = [], extra = []) {
  *
  * @returns {string} 拒绝原因；可以采纳时返回空串。
  */
+/**
+ * finish 的同批屏障（issue #58）：finish 可以与其它工具同批，但
+ *  - 同批前面已有工具失败时，finish 不许提交（否则模型以为答完了，实际消息没发出去）；
+ *  - finish 成功之后，同批后面的工具不再执行（不能再产生副作用）。
+ * 返回空串 = 放行；返回非空串 = 这条工具要返回的拒绝原因。
+ */
+export function finishBarrierBlock(name, {
+  finished = false,
+  priorFailure = false,
+  unsentDeliveryFailure = false
+} = {}) {
+  if (finished) return '未执行：finish 已形成本轮终止边界，之后的工具不能再产生副作用。';
+  if (name === 'finish' && unsentDeliveryFailure) {
+    return 'finish 未执行：本轮尝试发送内容但尚未成功送达。请立即改用 send_message 发送文字回复；不要重试表情，也不要只结束本轮。';
+  }
+  if (name === 'finish' && priorFailure) {
+    return 'finish 未执行：本轮前置工具有失败项，需要先查看错误并重新决定。';
+  }
+  return '';
+}
+
 export function consolidationRejectionReason({ isNew = false, existing = [], next = [] } = {}) {
-  if (isNew) return '';
+  // 形状护栏先于 isNew：新建模式同样不能收坏结构 —— 否则对象条目会被 String() 成
+  // "[object Object]" 落进记忆（isNew 以前直接短路掉这两道检查，2026-10-10 审查 A1）。
   // 结果必须是数组：`{"result":[…]}` 这类坏结构以前会被就地当成 [] 处理，
   // 于是"模型答歪了"和"模型明说没有可保留的"长得一模一样 —— 前者会把印象全清空。
   if (!Array.isArray(next)) return '结果不是 impressions 数组（疑似坏结构）';
   // 非字符串条目（弱模型偶尔返回对象/数字）会把无意义的 `[object Object]` 写进记忆，
   // 而按 String() 计数的字数护栏又看不见它（对象只算 15 个字符），直接拒绝。
   if (next.some((item) => typeof item !== 'string')) return '结果里有非字符串条目（疑似坏结构）';
+  if (isNew) return '';
   const prev = Array.isArray(existing) ? existing : [];
   const list = next;
   const prevChars = prev.reduce((n, e) => n + String(e?.content ?? '').length, 0);
@@ -342,10 +416,78 @@ export function consolidationRejectionReason({ isNew = false, existing = [], nex
   return `结果变多（${prev.length}→${list.length} 条、${prevChars}→${nextChars} 字），疑似幻觉`;
 }
 
+/**
+ * 裸名字要独立成词：左边不能紧贴名字字符，否则「小鲸」会吃掉「小鲸鱼」。
+ * 右边分两档：中文没有空格，3 字及以上的名字允许直接接正文（「小鲸鱼在吗」）；
+ * 2 字以内的短名仍要求右边界，否则「小鲸」会在「小鲸鱼」里误命中。
+ * 紧跟在 @ 后面的出现交给 isAtMe（它要求名字右侧有边界）。
+ */
+function containsStandaloneName(text, name) {
+  const isNameChar = (char) => Boolean(char) && /[\w\u3400-\u9fff]/.test(char);
+  let index = text.indexOf(name);
+  while (index !== -1) {
+    const before = text[index - 1];
+    if (before !== '@' && !isNameChar(before)) {
+      const after = text[index + name.length];
+      if (!isNameChar(after) || name.length >= 3) return true;
+    }
+    index = text.indexOf(name, index + 1);
+  }
+  return false;
+}
+
+/** 拍一拍命中的是机器人自己（群拍 target_id / 私聊拍自己都会落到 targetUserId）。 */
+function isPokeAtBot(message, selfId) {
+  if (getConfig().conversation?.pokeReplyEnabled === false) return false;
+  return message?.eventKind === 'poke'
+    && String(message?.targetUserId || '') === String(selfId || '');
+}
+
+/** 拍一拍也算"被直接点名"：档位、自主节奏、降级闸门与回复纠正共用这一口径。 */
+function mentionsOrPokesBot(message, selfId) {
+  return message?.mentionsSelf === true || isPokeAtBot(message, selfId);
+}
+
+/**
+ * 这条消息是不是"明确在问机器人"：私聊、被 @、引用/回复它、文本里提到它在该群的名字。
+ * 只用于"该回却没发"的补救判定 —— 不参与是否唤醒（档位那边有自己的判定）。
+ */
+export function isDirectedAtBot({ kind, triggerEntries = [], persona = {}, selfId = '', accountNickname = '' } = {}) {
+  if (kind === 'private') return true;
+  if (triggerEntries.some((message) => isPokeAtBot(message, selfId))) return true;
+  const names = [persona.selfNickname, persona.botName, accountNickname]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
+  const lowered = names.map((name) => name.toLowerCase());
+  const nameSet = new Set(lowered);
+  return (Array.isArray(triggerEntries) ? triggerEntries : []).some((message) => {
+    if (message?.mentionsSelf === true) return true;
+    const reply = message?.reply;
+    if (reply) {
+      if (selfId && String(reply.senderId || '') === String(selfId)) return true;
+      const repliedName = String(reply.sender || '').trim().toLowerCase();
+      if (repliedName && nameSet.has(repliedName)) return true;
+    }
+    // 引用的原文、展开的合并转发、卡片聊天记录都是"转述"，里面出现名字不等于在叫它
+    //（2026-10-18 审查：B 引用 A 的话、而 A 的话里有机器人名字时曾被误判为"在问它"）
+    const raw = String(message?.text || '');
+    if (/^\[(?:合并转发|卡片聊天记录)/.test(raw)) return false;
+    const body = raw.replace(/^\[引用[^\]]*\]/, '');
+    // @昵称 / @QQ号 / CQ:at 与提示词同口径。字符串上报时 mentionsSelf 恒为 false，
+    // 只能靠这里兜住（2026-10-19 发版前审查：此前会漏掉 CQ 码形态的 @）。
+    if (isAtMe(body, { selfNickname: persona.selfNickname, botName: persona.botName, selfId })) {
+      return true;
+    }
+    const lowerBody = body.toLowerCase();
+    return lowered.some((name) => containsStandaloneName(lowerBody, name));
+  });
+}
+
 export class Orchestrator {
   constructor({
     store,
     memory,
+    livingMemory = null,
     stickers,
     sender,
     sessions,
@@ -355,15 +497,22 @@ export class Orchestrator {
     emit = null,
     random = Math.random,
     getIdentityPilot = null,
-    getIncidentPilot = null
+    getIncidentPilot = null,
+    getPlugins = null,
+    getMcp = null,
+    getLifeFeed = null
   }) {
     this.store = store;
     this.memory = memory;
+    this.livingMemory = livingMemory;
     this.stickers = stickers;
     this.sender = sender;
     this.sessions = sessions;
     this.onebot = onebot;
     this.reminders = reminders;
+    this.getPlugins = typeof getPlugins === 'function' ? getPlugins : null;
+    this.getMcp = typeof getMcp === 'function' ? getMcp : null;
+    this.getLifeFeed = typeof getLifeFeed === 'function' ? getLifeFeed : null;
     this.getGames = typeof getGames === 'function' ? getGames : null;
     this.random = random;
     this.getIdentityPilot = typeof getIdentityPilot === 'function' ? getIdentityPilot : (() => null);
@@ -383,9 +532,14 @@ export class Orchestrator {
     this.retryTimer = null;
     this.consolidating = new Set();    // 正在整理记忆的 chatKey
     this.runningChats = new Set();     // 正在运行的 chatKey
+    // 本进程此刻仍在执行的租约 id。兜底回收必须绕开它们 —— 否则「租约先到期、执行还活着」
+    // 的窗口里回收会把消息放回 pending，而那个执行稍后照样发出去 → 同一批被答两遍。
+    // 详见 store.recoverExpired 的注释（2026-10-09 全面审查）。
+    this.liveLeases = new Set();
     this.activeRuns = new Map();       // chatKey -> sessionId
     this.skinTasks = new Map();
     this.skinSwitching = new Set();
+    this.actionMemory = new Map();     // chatKey -> { at: { kind: ts } }（动作冷却跨轮）
     this.runSeq = new Map();           // chatKey -> 第几次处理（跨重启清零即可）
     // 预判时掷出的随机骰子：{ chatKey -> { roll, at } }。
     // 概率档下"要不要回"是随机的，预判（建等待会话）与实跑（真跑）必须用同一次，
@@ -393,7 +547,8 @@ export class Orchestrator {
     this.pendingRolls = new Map();
     this.paused = getConfig().runtime?.paused === true;
     this.pauseReason = null;
-    this.proactiveTimer = null;
+    this.proactiveTimers = new Map();   // scope(group/private) -> timer：两个范围各自排程
+    this.proactiveEpoch = 0;            // 重启循环时 +1：旧 tick 不能再排新 timer
     this.proactiveSuppressions = new Set();
     // 模型自己安排的「稍后主动发言」：chatKey -> { at, note, timer }
     this.scheduledWakes = new Map();
@@ -459,25 +614,62 @@ export class Orchestrator {
    */
   drainBacklogAfterResume() {
     for (const chatKey of this.store.listChats()) {
-      if (this.store.unreadCount(chatKey) > 0) this.scheduleWake(chatKey, 0);
+      if (this.store.unreadCount(chatKey) <= 0) continue;
+      // 同兜底回收：已有活跃租约的会话由那次执行的收尾自己 drain，这里再排一次只会
+      // 空转出一个立刻被中止的会话（2026-10-09 全面审查，与上面 ticker 同一类问题）。
+      if (this.store.hasLeasedRun(chatKey)) continue;
+      if (this.#budgetWouldDrop(chatKey)) continue;   // 同兜底回收：会丢的唤醒就不排
+      this.scheduleWake(chatKey, 0);
     }
+  }
+
+  /**
+   * 这次唤醒会不会被 #wake 里的预算闸门**直接丢掉**（而不是"稍后再来"）。
+   * 给"派发前预检"用：提醒这类派发完就 markFired 的路径，必须先在这里挡住 ——
+   * #wake 闸门只管"这轮不跑"，管不了"派发侧已经把提醒记成已触发"（那等于把
+   * 到点的提醒内容吞掉，2026-10-04 复审 P2）。
+   * block：一律会丢。degrade：群里当前未读里没有 @ 的会丢（闸门判的就是这个）。
+   */
+  #budgetWouldDrop(chatKey) {
+    const b = budgetStatus(getConfig(), this.sessions?.todayUsage?.(todayKey()) || {});
+    if (!b.enabled || !b.exceeded) return false;
+    if (b.onExceed === 'block') return true;
+    if (!String(chatKey).startsWith('group:')) return false;   // 私聊不受 degrade 影响
+    // ⚠️ 窗口必须与 #wake 的 degrade 闸门一致（#unreadScanLimit = min(100, batchLimit)，即
+    // claimUnread 真正领取的批次大小）：
+    // 闸门看的是「这次要处理的那批未读里有没有 @」。窗口偏小时，落在窗口之后的 @ 会被这里
+    // 判成"会丢"，提醒被无谓顺延 24 小时（#wake 其实照常派发）—— 2026-10-05 复审实测。
+    const pending = this.store.peekUnread(chatKey, this.#unreadScanLimit()) || [];
+    return !pending.some((m) => mentionsOrPokesBot(m, this.onebot.selfId));
   }
 
   startRecoveryLoop() {
     clearInterval(this.retryTimer);
-    this.store.recoverExpired();
+    this.store.recoverExpired(Date.now(), { live: this.liveLeases });
     this.store.expireConversationThreads?.();
     this.retryTimer = setInterval(() => {
       // 兜底回收不能把进程带走：SQLITE_BUSY、磁盘满、库损坏都可能在恢复期间抛出，
       // 而 server.js 的 uncaughtException 会直接 process.exit(1)。下一个 tick 再试即可。
       try {
-        this.store.recoverExpired();
+        this.store.recoverExpired(Date.now(), { live: this.liveLeases });
         this.store.expireConversationThreads?.();
         if (this.paused || this.aborted) return;
+        // ⚠️ 「今天别再花钱」（onExceed=block）时**不能**继续给有未读的会话排唤醒：
+        // wake 会在预算闸门处直接 return，未读原地不动 → 下一个 tick 又排一次 ——
+        // 每 tick 新建并中止一个会话、当日 runs 计一次，永不停止（2026-10-04 全面复审 P2
+        // 实测：5 tick → 5 个会话文件、runs=5、模型调用 0；配合会话保留策略会挤掉真实历史）。
+        // ⚠️ degrade 同样会空转（只是没有模型调用与 runs 计数）：wake 走到 degrade 闸门 →
+        // 建好的等待会话被立刻丢弃 → 未读原地不动 → 下个 tick 再来。所以这里**逐会话**判
+        // 「这个唤醒会不会被预算闸门丢掉」，会丢的就不排（2026-10-04 复审 P2）。
         for (const key of this.store.listChats()) {
-          if (canRun(key) && !this.runningChats.has(key) && !this.pendingWake.has(key)
-            && this.#chatRuntimeDecision(key).allowed
-            && this.store.unreadCount(key) > 0) this.scheduleWake(key);
+          // ⚠️ hasLeasedRun：硬崩溃后 runs 表会留下未过期的 leased 残行，此时排唤醒 →
+          // claimUnread 返回 null → 静默中止，每 5 秒建一个空会话（详见 store.recoverExpired）。
+          if (!canRun(key) || this.runningChats.has(key) || this.pendingWake.has(key)
+            || this.store.hasLeasedRun(key)
+            || !this.#chatRuntimeDecision(key).allowed
+            || this.store.unreadCount(key) <= 0) continue;
+          if (this.#budgetWouldDrop(key)) continue;
+          this.scheduleWake(key);
         }
       } catch (error) {
         log.error('[recovery] 兜底回收这一轮出错（不影响下一轮）:', error?.message ?? error);
@@ -528,8 +720,10 @@ export class Orchestrator {
     if (this.runningChats.has(chatKey)) return;   // 运行结束后 drain 会接管
     // 自主节奏：不即时唤醒，攒着等"自己安排的醒来"统一处理；被 @ 时例外
     if (this.#pacingApplies(chatKey)) {
-      const pending = this.store.peekUnread(chatKey, 50) || [];
-      const mentioned = pending.some((m) => m.mentionsSelf === true);
+      // 窗口与 #wake / #budgetWouldDrop 同口径（#unreadScanLimit）：@ 落在窗口后半段时同样
+      // 算"被 @ 了"，不该因为看少了而被丢进自主节奏排队。
+      const pending = this.store.peekUnread(chatKey, this.#unreadScanLimit()) || [];
+      const mentioned = pending.some((m) => mentionsOrPokesBot(m, this.onebot.selfId));
       if (!(mentioned && getConfig().pacing?.instantOnMention !== false)) {
         this.#ensurePacedWake(chatKey);
         return;
@@ -549,6 +743,15 @@ export class Orchestrator {
     return chatKey.startsWith('group:');
   }
 
+  // 未读扫描窗口：全部判定口（degrade 闸门 / #budgetWouldDrop / 即时@例外 / #predictTier）共用。
+  // 必须**等于**实际领取的批次大小：claimUnread 内部把它夹在 100 以内（store.js 的
+  // Math.min(100, …)），所以窗口开得更大反而有害 —— 超预算的群里，第 101 条之后的 @ 会让
+  // degrade 闸门判"有 @，可以回"，而真正领到的 100 条里没有 @，于是没被 @ 也回了一句
+  // （2026-10-08 审查）。两处取同一个值，别再各算一份。
+  #unreadScanLimit() {
+    return Math.min(100, Math.max(1, Number(getConfig().store?.batchLimit) || 100));
+  }
+
   /** 确保该会话有一次自主节奏唤醒安排；已有且在合理范围内则不动。 */
   #ensurePacedWake(chatKey) {
     const p = getConfig().pacing || {};
@@ -556,6 +759,11 @@ export class Orchestrator {
     const maxMs = Math.max(minMs, (Number(p.maxSilenceMinutes) || 45) * 60000);
     const defMs = Math.max(minMs, Math.min(maxMs, (Number(p.defaultWakeMinutes) || 20) * 60000));
     const existing = this.scheduledWakes.get(chatKey);
+    // 已有安排是模型自安排的唤醒（selfWake）或任何带留言的安排时不要顶掉：
+    // scheduleInitiativeWake 是单槽覆盖，会把留言一起清掉 —— fireDueScheduledWakes 专门
+    // 为 selfWake 绕开重排以保留言，这里却会先把槽覆写掉（2026-10-06 复审 P3：pacing 开启时
+    // 群里来一条普通消息，模型 2 小时后带留言的唤醒就被换成 20 分钟后的无留言 paced）。
+    if (existing && (existing.kind === 'selfWake' || String(existing.note || '').trim())) return;
     if (existing && existing.at - Date.now() <= maxMs) return;
     this.scheduleInitiativeWake(chatKey, defMs, '', { paced: true });
   }
@@ -575,8 +783,10 @@ export class Orchestrator {
    */
   #predictTier(chatKey, { roll } = {}) {
     const cfg = getConfig();
+    // 按群人设：判定"是否在回复机器人"要用这个群生效的名字（可能与全局不同）
+    const persona = resolvePersona(cfg, chatKey);
     const conversation = conversationConfigForChat(chatKey);
-    const entries = this.store.peekUnread(chatKey, 100) || [];
+    const entries = this.store.peekUnread(chatKey, this.#unreadScanLimit()) || [];
     if (chatKey.startsWith('private:')) {
       const caps = tokenSaverCapsOf(cfg);
       return {
@@ -592,8 +802,8 @@ export class Orchestrator {
     }
     const result = resolveContextTier({
       triggerEntries: entries,
-      selfNickname: cfg.persona?.selfNickname || this.onebot.selfNickname || '',
-      botName: cfg.persona?.botName || '',
+      selfNickname: persona.selfNickname || this.onebot.selfNickname || '',
+      botName: persona.botName || '',
       selfId: cfg.onebot?.selfId || this.onebot.selfId || '',
       cfg: storeConfigForChat(chatKey),  // 按会话取档位：统一开关关闭时各群可以有独立滑条
       roll                                // 传入已固定的骰子：预判与实跑必须用同一次
@@ -624,18 +834,35 @@ export class Orchestrator {
     return { ...result, conversationMode: 'legacy' };
   }
 
-  #isReplyToSelf(entries) {
+  #isReplyToSelf(chatKey, entries) {
     const cfg = getConfig();
+    const persona = resolvePersona(cfg, chatKey);
     const selfId = String(cfg.onebot?.selfId || this.onebot.selfId || '');
     const names = new Set([
-      cfg.persona?.selfNickname,
+      persona.selfNickname,
       this.onebot.selfNickname,
-      cfg.persona?.botName
+      persona.botName
     ].map((v) => String(v || '').trim()).filter(Boolean));
     return entries.some((m) => {
       if (selfId && String(m.reply?.senderId || '') === selfId) return true;
       return names.has(String(m.reply?.sender || '').trim());
     });
+  }
+
+  /**
+   * 把这批消息的最后一条标为已读（platform.readReceipts，默认关）。
+   * 只发最后一条：QQ 的已读是"读到某条"的语义，后面的自然覆盖前面的。
+   * best-effort —— 失败只打个日志，绝不影响运行收尾。
+   */
+  #markBatchRead(chatKey, entries) {
+    const mids = (Array.isArray(entries) ? entries : [])
+      .map((m) => m?.mid)
+      .filter((v) => v !== null && v !== undefined && String(v) !== '');
+    const last = mids[mids.length - 1];
+    if (last === undefined) return;
+    Promise.resolve()
+      .then(() => this.onebot.markMessageRead?.(last))
+      .catch((error) => log.warn(`[orchestrator] ${chatKey} 标已读失败（不影响本轮）：${error?.message ?? error}`));
   }
 
   #continuationTier(chatKey, entries, fallback, conversation) {
@@ -644,7 +871,7 @@ export class Orchestrator {
       Math.min(500, Math.max(1, Number(conversation?.continuationContextCount) || 100)),
       tokenSaverCapsOf(getConfig())?.allCount
     );
-    if (this.#isReplyToSelf(entries)) {
+    if (this.#isReplyToSelf(chatKey, entries)) {
       return {
         tier: 5, count, reason: '续接：引用机器人',
         shouldRespond: true, conversationMode: 'threaded'
@@ -691,7 +918,7 @@ export class Orchestrator {
         };
       }
     }
-    if (this.#isReplyToSelf(entries)) {
+    if (this.#isReplyToSelf(chatKey, entries)) {
       return {
         tier: 5, count, reason: '生命周期：引用机器人',
         shouldRespond: true, conversationMode: 'lifecycle'
@@ -763,8 +990,11 @@ export class Orchestrator {
       // 概率档下"要不要回"是随机的：预判与实跑必须是同一次掷骰，
       // 否则会出现"会话页显示等待中、随后又干净消失"或者反过来的自相矛盾
       // （2026-09-22 审查发现）。这里掷一次存起来，wake 时取走。
-      const roll = Math.random() * 100;
+      const roll = this.random() * 100;
       this.pendingRolls.set(chatKey, { roll, at: Date.now() });
+      // 这一段里有 store 读（#predictTier 的档位判定、#applyWaitingConversation 的写回）：
+      // 中间抛出去就会留下上面 #abortSchedule 注释里那两笔烂账，所以整体兜住（2026-10-08 审查）。
+      try {
       const predicted = this.#predictTier(chatKey, { roll });
       if (predicted.shouldRespond === false) {
         // 不响应：把已存在的等待会话撤掉（例如刚被艾特、随后判定又不成立的情况）
@@ -809,6 +1039,12 @@ export class Orchestrator {
         this.emit('session-start', { sessionId: session.id, chatKey, status: 'waiting', triggerSummary: summary });
       }
       this.emit('chat-update', chatKey);
+      }
+      } catch (error) {
+        // 预测/创建"等待中"会话途中失败：把排程痕迹与会话一起收掉，别留下半成品。
+        // 收完必须返回 —— 否则下面照常安装定时器，把刚收掉的排程原样装回去（2026-10-10 审查 A3）。
+        this.#abortSchedule(chatKey, error);
+        return;
       }
     }
 
@@ -855,6 +1091,31 @@ export class Orchestrator {
   }
 
   #budgetNotifiedDay = '';
+
+  /** 「今天的额度用完了」这句按 chatKey × 天去重：没有它，兜底回收每 5~25s 重排一次就会在群里刷屏。 */
+  #budgetSaid = new Map();
+
+  /**
+   * 正在派发、还没确认播报的提醒 id。标记已触发改到了唤醒完成之后（2026-10-20），
+   * 这中间状态仍是 pending；没有这个集合，30 秒后的下一轮会把同一条再派一次。
+   */
+  #remindersInFlight = new Set();
+
+  /**
+   * 额度用完的固定文案：同一天同一会话只发一次（2026-10-03 全量审查：原来无条件发，
+   * 而该分支又不消费未读 → 兜底回收无限重排 → 同一天同一个群能刷出几十条）。
+   * 跨天自动重来；条目按天淘汰（只保留当天的，内存不涨）。
+   */
+  async #maybeSayBudgetExhausted(chatKey) {
+    const day = todayKey();
+    if (this.#budgetSaid.get(chatKey) === day) return;
+    this.#budgetSaid.set(chatKey, day);
+    if (this.#budgetSaid.size > 500) {
+      for (const [key, seenDay] of this.#budgetSaid) if (seenDay !== day) this.#budgetSaid.delete(key);
+    }
+    try { await this.sender.sendTextBatch(chatKey, ['今天的额度用完了，明天再聊'], {}); }
+    catch { /* 发送失败不阻断 */ }
+  }
 
   /**
    * 超限当天私聊管理员一次（改进方案 #8/J.3：去重键 = dayKey，内存态即可 —— 重启最多重发一条，
@@ -916,6 +1177,12 @@ export class Orchestrator {
     if (this.runningChats.has(chatKey)) {
       return { ok: false, reason: '该会话正在处理中' };
     }
+    // 硬崩溃会留下未过期的 leased 残行：此时手动唤醒 → claimUnread 返回 null → 静默中止，
+    // 控制台却显示"已触发"。与自动路径（ticker/drainBacklog 的 hasLeasedRun 闸门）同一口径
+    //（2026-10-10 审查 A2）；正常情况下回收器几秒内清掉残行，稍后重试即可。
+    if (this.store.hasLeasedRun(chatKey)) {
+      return { ok: false, reason: '该会话有未回收的运行租约（上次运行可能硬崩溃），几秒后重试' };
+    }
     if (this.runningChats.size >= Math.max(1, Number(getConfig().maxConcurrentRuns) || 2)) {
       return { ok: false, reason: '当前并发已满，请稍后重试' };
     }
@@ -953,64 +1220,121 @@ export class Orchestrator {
     return task;
   }
 
-  async #wake(chatKey, { proactive = false, manual = false, waitingSessionId = null, wakeNote = '', paced = false } = {}) {
-    if (this.skinSwitching.has(chatKey)) return;
-    if (!canRun(chatKey)) { if (waitingSessionId) this.#discardWaiting(waitingSessionId); return; }
+  /**
+   * #wake 的前置判定：能不能跑、要不要现在跑。返回 false ＝ 这一轮不跑（该收的会话已收掉）。
+   *
+   * 为什么单独成一个方法：这一段里有 **store 读写**（canRun 读配置、#chatRuntimeDecision 会
+   * getChatMeta 并把过期线程写回）。任何一步抛出都会让 waiting 会话永远停在"等待中" —— 调用方
+   * 已经把它从 pendingSessions 摘掉了，控制台清不掉、abortAll 也够不到它，直到重启。
+   * 与 2026-10-06（add 之后）、2026-10-07（claimUnread 之后）修的两处是同一类窗口，
+   * 这次把 add 之前的这一段也圈进来（2026-10-08 审查）。
+   */
+  #wakePreflight(chatKey, waitingSessionId) {
+    if (this.skinSwitching.has(chatKey)) { if (waitingSessionId) this.#discardWaiting(waitingSessionId); return false; }
+    if (!canRun(chatKey)) { if (waitingSessionId) this.#discardWaiting(waitingSessionId); return false; }
     if (!this.#chatRuntimeDecision(chatKey).allowed) {
       if (waitingSessionId) this.#discardWaiting(waitingSessionId);
-      return;
+      return false;
     }
-    if (this.aborted) { if (waitingSessionId) this.#finishWaiting(waitingSessionId, 'aborted'); return; }
-    if (this.paused) { if (waitingSessionId) this.#finishWaiting(waitingSessionId, 'aborted'); return; }
-    if (this.runningChats.has(chatKey)) return;
+    if (this.aborted) { if (waitingSessionId) this.#finishWaiting(waitingSessionId, 'aborted'); return false; }
+    if (this.paused) { if (waitingSessionId) this.#finishWaiting(waitingSessionId, 'aborted'); return false; }
+    if (this.runningChats.has(chatKey)) return false;
 
     // 模型未设置：不产生报错会话，消息保留为未读；设置模型后（下一条消息或手动唤醒）自动补处理
     if (!String(getConfig().api.model || '').trim()) {
       if (waitingSessionId) this.#finishWaiting(waitingSessionId, 'aborted', '模型未设置');
-      return;
+      return false;
     }
 
     // 全局并发限制：满了就稍后重试
     if (this.runningChats.size >= Math.max(1, Number(getConfig().maxConcurrentRuns) || 2)) {
       if (waitingSessionId) this.#discardWaiting(waitingSessionId);
       this.scheduleWake(chatKey, 3000);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * 排程/唤醒中途出错时把这一次的痕迹清干净。不清的话有两笔烂账：
+   *   · pendingWake 会永久占着这个会话 —— 恢复循环 `pendingWake.has(key)` 直接 continue，
+   *     这个群从此不会被自动唤醒（只有新消息能救回来）；
+   *   · 刚刚 create 出来的"等待中"会话不在 pendingSessions 里，谁也收不掉。
+   */
+  #abortSchedule(chatKey, error) {
+    log.error(`[orchestrator] 排程失败（${chatKey}）：`, error);
+    this.pendingWake.delete(chatKey);
+    const timer = this.wakeTimers.get(chatKey);
+    if (timer) { clearTimeout(timer); this.wakeTimers.delete(chatKey); }
+    this.firstPendingAt.delete(chatKey);
+    this.pendingRolls.delete(chatKey);
+    const waitingId = this.pendingSessions.get(chatKey);
+    this.pendingSessions.delete(chatKey);
+    if (waitingId) this.#finishWaiting(waitingId, 'aborted', '排程失败');
+  }
+
+  async #wake(chatKey, { proactive = false, manual = false, waitingSessionId = null, wakeNote = '', paced = false } = {}) {
+    try {
+      if (!this.#wakePreflight(chatKey, waitingSessionId)) return;
+    } catch (error) {
+      log.error(`[orchestrator] 唤醒前置判定失败（${chatKey}）：`, error);
+      if (waitingSessionId) this.#finishWaiting(waitingSessionId, 'aborted', '前置判定失败');
       return;
     }
 
     // 未命中时只确认本次判定的快照；运行批次在模型处理成功后确认。
     const cfgNow = getConfig();
-    const conversation = conversationConfigForChat(chatKey);
+    // 2026-10-07 复审 P2：这段前置区（配置读取、预算判定、未读扫描、档位解析、claimUnread
+    // 的 sqlite 读写）任何一步抛出，都会让 waiting 会话永远停在 waiting —— 调用方已把它从
+    // pendingSessions 摘掉，控制台"等待中"清不掉、abortAll 也够不到它，直到重启。
+    // 与 10-06 修的"add 之后准备段"是同一类窗口，范围补齐 add 之前。
+    let conversation = null;
     let pendingEntries = [];
     let tierResult = null;
+    let runTimeoutMs = 0;
+    let lease = null;
+    let triggerEntries = [];
+    try {
+    conversation = conversationConfigForChat(chatKey);
+    // ── 每日预算拦截（改进方案 #8/J.3）──
+    // block：本次运行不进行（active 模式下同一天同一会话只回一句固定文案）；degrade：只回应 @ ——
+    // 群聊里非 @ 触发直接跳过、消息保留未读（等被 @ 或明天）。两者都只影响**新**运行，
+    // 不打断进行中的会话；私聊、手动唤醒与主动唤醒不受 degrade 限制。
+    // ⚠️ 这一段必须在 `if (!proactive)` **之外**：原来整段被塞在里面，于是"停止"策略下
+    // 冷场开话题、模型自安排唤醒这些 proactive 唤醒照常整轮跑模型、照常花钱 ——
+    // 管理员设 block 的意思就是"今天别再花钱"（2026-10-03 全量审查）。
+    const budget = budgetStatus(getConfig(), this.sessions?.todayUsage?.(todayKey()) || {});
+    // ⚠️ **自主节奏唤醒（paced）不是人工**：#ensurePacedWake 用 manual:true 派发它，是为了绕开
+    // 唤醒侧的闸门（wakeBlockedNow / proactive 判定），但它**照样要花钱**。预算闸门若也按
+    // `!manual` 判，开了 pacing 的实例在 onExceed=block 之后照样每轮整跑模型，管理员设的
+    // 「今天别再花钱」形同虚设（2026-10-04 全面复审 P2 实测：block 与 degrade 下均有 12 次
+    // 模型调用）。真正人工触发的（控制台点一下）才豁免。
+    const budgetExempt = manual && !paced;
+    if (budget.enabled && budget.exceeded) {
+      if (budget.notify) this.#maybeNotifyBudgetExceeded(budget);
+      if (budget.onExceed === 'block' && !budgetExempt) {
+        const activeMode = String(getConfig().runtime?.mode || 'active') !== 'observe';
+        // 只在"有新消息"这一路回话：主动唤醒没有人在等，插一句只会变成刷屏
+        if (activeMode && !proactive) await this.#maybeSayBudgetExhausted(chatKey);
+        if (waitingSessionId) this.#finishWaiting(waitingSessionId, 'aborted', '本轮额度已用完');
+        return;
+      }
+    }
     if (!proactive) {
-      // peekUnread 只看不取，limit 给足以免漏判（判定用的是这批的文本）
-      pendingEntries = this.store.peekUnread(chatKey, 100) || [];
+      // peekUnread 只看不取，limit 给足以免漏判（判定用的是这批的文本；与 claimUnread 的
+      // batchLimit 同窗口，见 #unreadScanLimit）
+      pendingEntries = this.store.peekUnread(chatKey, this.#unreadScanLimit()) || [];
       // 取用预判时那颗骰子（超过 2 分钟就当过期，避免串到后面的批次）
       const pendingRoll = this.pendingRolls.get(chatKey);
       this.pendingRolls.delete(chatKey);
       const roll = pendingRoll && Date.now() - pendingRoll.at < 120000 ? pendingRoll.roll : undefined;
-      // ── 每日预算拦截（改进方案 #8/J.3）──
-      // block：本次运行不进行（active 模式下回一句固定文案）；degrade：只回应 @ ——
-      // 群聊里非 @ 触发直接跳过、消息保留未读（等被 @ 或明天）。两者都只影响**新**运行，
-      // 不打断进行中的会话；私聊、手动唤醒与主动唤醒不受 degrade 限制。
-      const budget = budgetStatus(getConfig(), this.sessions?.todayUsage?.(todayKey()) || {});
-      if (budget.enabled && budget.exceeded && budget.notify) this.#maybeNotifyBudgetExceeded(budget);
-      if (budget.enabled && budget.exceeded) {
-        const activeMode = String(getConfig().runtime?.mode || 'active') !== 'observe';
-        if (budget.onExceed === 'block' && !manual) {
-          if (activeMode) {
-            try { await this.sender.sendTextBatch(chatKey, ['今天的额度用完了，明天再聊'], {}); }
-            catch { /* 发送失败不阻断 */ }
-          }
-          if (waitingSessionId) this.#finishWaiting(waitingSessionId, 'aborted', '本轮额度已用完');
-          return;
-        }
-        if (budget.onExceed === 'degrade' && !manual && !proactive && String(chatKey).startsWith('group:')) {
-          const mentioned = pendingEntries.some((entry) => entry?.mentionsSelf === true);
-          if (!mentioned) {
-            if (waitingSessionId) this.#discardWaiting(waitingSessionId);
-            return;   // 保留未读：被 @ 时（或跨日重置后）自然会再进这里
-          }
+      // degrade 只拦"新消息触发"的这一路（主动唤醒不在这个分支里，上面的 block 已经先判过了）
+      if (budget.enabled && budget.exceeded && budget.onExceed === 'degrade' && !budgetExempt
+        && String(chatKey).startsWith('group:')) {
+        const mentioned = pendingEntries.some((entry) => mentionsOrPokesBot(entry, this.onebot.selfId));
+        if (!mentioned) {
+          if (waitingSessionId) this.#discardWaiting(waitingSessionId);
+          return;   // 保留未读：被 @ 时（或跨日重置后）自然会再进这里
         }
       }
 
@@ -1067,11 +1391,11 @@ export class Orchestrator {
       }
     }
 
-    const runTimeoutMs = Math.min(240000, Math.max(1000, Number(cfgNow.api.runTimeoutMs) || 180000));
-    const lease = proactive ? null : this.store.claimUnread(chatKey, {
+    runTimeoutMs = Math.min(240000, Math.max(1000, Number(cfgNow.api.runTimeoutMs) || 180000));
+    lease = proactive ? null : this.store.claimUnread(chatKey, {
       limit: cfgNow.store.batchLimit, maxChars: cfgNow.store.batchMaxChars, leaseMs: runTimeoutMs + 60000
     });
-    const triggerEntries = lease?.messages || [];
+    triggerEntries = lease?.messages || [];
     if (!proactive && triggerEntries.length === 0) {
       if (waitingSessionId) this.#finishWaiting(waitingSessionId, 'aborted');
       return; // 没有未读就不空跑
@@ -1100,60 +1424,98 @@ export class Orchestrator {
     // 否则后续每次渲染提示词都会重新掷，会话记录与提示词会对不上。
     tierResult ||= resolveContextTier({
       triggerEntries,
-      selfNickname: cfgNow.persona?.selfNickname || this.onebot.selfNickname || '',
-      botName: cfgNow.persona?.botName || '',
+      selfNickname: resolvePersona(cfgNow, chatKey).selfNickname || this.onebot.selfNickname || '',
+      botName: resolvePersona(cfgNow, chatKey).botName || '',
       selfId: cfgNow.onebot?.selfId || this.onebot.selfId || '',
       cfg: storeConfigForChat(chatKey)   // 与 #predictTier 同一来源，保证预判/实跑一致
     });
+    } catch (error) {
+      // 前置区答案：会话落终态（否则永远等待中），原样上抛让调用方照旧记日志/告警。
+      if (waitingSessionId) this.#finishWaiting(waitingSessionId, 'aborted', String(error?.message ?? error));
+      throw error;
+    }
 
     this.runningChats.add(chatKey);
-    const seq = (this.runSeq.get(chatKey) || 0) + 1;
-    this.runSeq.set(chatKey, seq);
+    // 租约在这里登记为「在跑」：再往后的任何出口（准备段抛错、主 try 的 finally）都会注销它。
+    // 登记点放在 claimUnread 之后是安全的 —— 租约 `expires_at` 至少还有 runTimeoutMs+60s，
+    // 而 recoverExpired 只回收 `expires_at <= now` 的行，这段间隔不可能被扫到。
+    if (lease?.id) this.liveLeases.add(lease.id);
+    // 2026-10-06 复审 P2：add 与主 try 之间原本是一大段无保护的同步准备 —— sqlite 读线程
+    // （#applyWaitingConversation → getConversationThread 里还有 BEGIN IMMEDIATE）、会话落盘、
+    // emit 监听器都可能抛（磁盘满/库损坏/监听器异常）。一旦抛出，主 try 的 finally 不会执行，
+    // runningChats 就永远不清：该会话此后被 onIncoming、恢复循环、手动唤醒、主动候选全部绕开，
+    // 静默卡死到重启。准备段单独兜底：清掉已挂上的控制器/定时器/租约，会话落终态后原样上抛。
     const [kind, chatId] = String(chatKey).split(':');
-
-    // 触发摘要
-    const first = triggerEntries[0];
-    const triggerSummary = manual
-      ? '控制台主动唤醒'
-      : proactive
-      ? '主动机会（冷场开话题）'
-      : (first ? `${first.senderName || first.senderId}：${String(first.text || '').slice(0, 40)}` : '');
-
-    // 把“等待中”会话原地转成运行中；没有等待会话（主动/手动唤醒）才新建
+    let controller = null;
+    let runTimer = null;
+    let releaseTimeGuard = null;
+    let seq = 0;
     let session = waitingSessionId ? this.sessions.get(waitingSessionId) : null;
     let createdSession = false;
-    if (session && session.status === 'waiting') {
-      this.sessions.current.get(waitingSessionId).status = 'running';
-      this.sessions.current.get(waitingSessionId).waitUntil = null;
-      this.sessions.current.get(waitingSessionId).trigger = triggerEntries;
-      this.sessions.current.get(waitingSessionId).triggerSummary = triggerSummary;
-      this.sessions.current.get(waitingSessionId).triggerText = triggerEntries.map((m) => `${m.senderName || m.senderId}: ${String(m.text || '').slice(0, 80)}`).join(' | ').slice(0, 500);
-      session = this.sessions.current.get(waitingSessionId);
-    } else {
-      session = this.sessions.create({ chatKey, trigger: triggerEntries, triggerSummary });
-      createdSession = true;
+    try {
+      seq = (this.runSeq.get(chatKey) || 0) + 1;
+      this.runSeq.set(chatKey, seq);
+
+      // 触发摘要
+      const first = triggerEntries[0];
+      const triggerSummary = manual
+        ? (paced ? '到点唤醒' : '控制台主动唤醒')
+        : proactive
+        ? '主动机会（冷场开话题）'
+        : (first ? `${first.senderName || first.senderId}：${String(first.text || '').slice(0, 40)}` : '');
+
+      // 把“等待中”会话原地转成运行中；没有等待会话（主动/手动唤醒）才新建
+      if (session && session.status === 'waiting') {
+        this.sessions.current.get(waitingSessionId).status = 'running';
+        this.sessions.current.get(waitingSessionId).waitUntil = null;
+        this.sessions.current.get(waitingSessionId).trigger = triggerEntries;
+        this.sessions.current.get(waitingSessionId).triggerSummary = triggerSummary;
+        this.sessions.current.get(waitingSessionId).triggerText = triggerEntries.map((m) => `${m.senderName || m.senderId}: ${String(m.text || '').slice(0, 80)}`).join(' | ').slice(0, 500);
+        session = this.sessions.current.get(waitingSessionId);
+      } else {
+        session = this.sessions.create({ chatKey, trigger: triggerEntries, triggerSummary });
+        createdSession = true;
+      }
+      this.#applyWaitingConversation(session, tierResult, chatKey);
+      this.#applySessionTrigger(session, tierResult, { manual, proactive, chatKey });
+      this.sessions.update(session.id);
+      if (createdSession) {
+        this.emit('session-start', {
+          sessionId: session.id,
+          chatKey,
+          triggerSummary,
+          triggerKind: session.triggerKind,
+          triggerReason: session.triggerReason
+        });
+      } else {
+        this.emit('session-update', session.id);
+      }
+      this.activeRuns.set(chatKey, session.id);
+      session.leaseId = lease?.id || session.id;
+      controller = new AbortController();
+      this.controllers.set(chatKey, controller);
+      runTimer = setTimeout(() => controller.abort(new Error('Run deadline exceeded')), runTimeoutMs);
+      releaseTimeGuard = watchTimeWindow((error) => controller.abort(error), chatKey);
+      this.emit('chat-update', chatKey);
+    } catch (setupError) {
+      if (runTimer !== null) clearTimeout(runTimer);
+      releaseTimeGuard?.();
+      if (controller) this.controllers.delete(chatKey);
+      this.activeRuns.delete(chatKey);
+      this.runningChats.delete(chatKey);
+      if (lease?.id) this.liveLeases.delete(lease.id);
+      try {
+        if (session && session.status === 'running') this.sessions.finish(session.id, 'error');
+        if (lease) {
+          const setupTimeClosed = setupError?.code === 'TIME_CONTROL_INACTIVE' || !isTimeActive(chatKey);
+          if (setupTimeClosed && !this.store.hasEffects(lease.id)) this.store.ackLease(lease.id);
+          else this.store.failLease(lease.id, setupError, { retryable: !setupTimeClosed && isRetryableError(setupError) });
+        }
+      } catch (cleanupError) {
+        log.warn(`[orchestrator] ${chatKey} 唤醒准备段中断后的清理失败：${cleanupError?.message ?? cleanupError}`);
+      }
+      throw setupError;
     }
-    this.#applyWaitingConversation(session, tierResult, chatKey);
-    this.#applySessionTrigger(session, tierResult, { manual, proactive, chatKey });
-    this.sessions.update(session.id);
-    if (createdSession) {
-      this.emit('session-start', {
-        sessionId: session.id,
-        chatKey,
-        triggerSummary,
-        triggerKind: session.triggerKind,
-        triggerReason: session.triggerReason
-      });
-    } else {
-      this.emit('session-update', session.id);
-    }
-    this.activeRuns.set(chatKey, session.id);
-    session.leaseId = lease?.id || session.id;
-    const controller = new AbortController();
-    this.controllers.set(chatKey, controller);
-    const runTimer = setTimeout(() => controller.abort(new Error('Run deadline exceeded')), runTimeoutMs);
-    const releaseTimeGuard = watchTimeWindow((error) => controller.abort(error), chatKey);
-    this.emit('chat-update', chatKey);
 
     try {
       const runResult = await this.#runAgent(session, { kind, chatId, chatKey, triggerEntries, proactive, wakeNote, paced, seq,
@@ -1173,8 +1535,18 @@ export class Orchestrator {
           chatKey, triggerEntries, handoff, conversation, runResult
         });
       }
+      // 已读回执（platform.readReceipts，默认关）：这批处理完就在 QQ 里标已读，
+      // 各端未读数不再堆积；默认关是因为它会改变"你自己打开机器人 QQ 时的未读观感"。
+      if (getConfig().platform?.readReceipts === true) this.#markBatchRead(chatKey, triggerEntries);
       const status = session.sent.length > 0 ? 'done' : 'noreply';
       this.sessions.finish(session.id, status);
+      // 写入走异步缓冲；总结、Embedding 或记忆服务失败绝不能拖慢/打断当前聊天回合。
+      this.livingMemory?.captureTurn?.({
+        chatKey,
+        sessionId: session.id,
+        triggerEntries,
+        sent: session.sent
+      });
       this.emit('session-end', { sessionId: session.id, chatKey, status,
         sent: session.sent.length, finishReason: session.finishReason, usage: session.usage });
       // 主动好友候选已整体退役（Issue #10，见 docs/KNOWN-ISSUES.md）：
@@ -1205,16 +1577,28 @@ export class Orchestrator {
           details: { rounds: session.rounds, sentCount: session.sent.length }
         });
       }
-      if (lease) {
-        // 时间窗口关闭打断在途批次：无效果（模型没说话、无发送）时直接归档（ack）——
-        // 这是文档化的刻意设计（README："非活跃期消息仅归档，不积压自动补回复"，
-        // test/time-control-integration.test.mjs "prevents retry" 钉住了该语义），
-        // 管理员可见性由上面的 info 级 incident 记录兜底。有发送效果时走 failLease
-        // 进 held/failed 人工核对，不自动重试。
-        if (timeClosed && !this.store.hasEffects(lease.id)) this.store.ackLease(lease.id);
-        else this.store.failLease(lease.id, session.error, {
-          retryable: !timeClosed && (isRetryableError(error) || controller.signal.aborted)
-        });
+      // 租约/outbox 收尾单独包一层：sqlite 忙、磁盘满这类错误不能让下面的 sessions.finish
+      // 被跳过 —— 否则会话会永久停在 running（控制台一直"运行中"，用量也不计账，2026-10-13 全项目审查 P2）。
+      try {
+        if (lease) {
+
+          // 时间窗口关闭打断在途批次：无效果（模型没说话、无发送）时直接归档（ack）——
+          // 这是文档化的刻意设计（README："非活跃期消息仅归档，不积压自动补回复"，
+          // test/time-control-integration.test.mjs "prevents retry" 钉住了该语义），
+          // 管理员可见性由上面的 info 级 incident 记录兜底。有发送效果时走 failLease
+          // 进 held/failed 人工核对，不自动重试。
+          if (timeClosed && !this.store.hasEffects(lease.id)) this.store.ackLease(lease.id);
+          else this.store.failLease(lease.id, session.error, {
+            retryable: !timeClosed && (isRetryableError(error) || controller.signal.aborted)
+          });
+        } else {
+          // 主动唤醒（无租约）失败也要收 outbox 的尾巴：成功路径会清掉 sent/failed 残行，
+          // 失败路径漏了这步 → 残行永远留在 outbox（只能手动 resolveHeld，2026-10-10 审查 A4）。
+          // unknown 行不动（本来就要人工核对）。
+          this.store.completeRun(session.leaseId);
+        }
+      } catch (cleanupError) {
+        log.warn('[orchestrator] 收尾失败（会话仍会正常收口）:', cleanupError?.message ?? cleanupError);
       }
       const status = timeClosed ? 'aborted' : 'error';
       this.sessions.finish(session.id, status);
@@ -1225,6 +1609,7 @@ export class Orchestrator {
       this.controllers.delete(chatKey);
       this.activeRuns.delete(chatKey);
       this.runningChats.delete(chatKey);
+      if (lease?.id) this.liveLeases.delete(lease.id);
       this.emit('chat-update', chatKey);
     }
 
@@ -1233,7 +1618,10 @@ export class Orchestrator {
       const pacedNow = this.#pacingApplies(chatKey);
       const unread = this.store.unreadCount(chatKey);
       if (!pacedNow && unread > 0) {
-        const drainDelay = Math.max(200, Number(getConfig().drainDelayMs) || 1200);
+        // drainDelayMs 的 0 是合法值（"连续批次之间不额外等"）：0 应当落到 200ms 的硬下限，
+        // 而不是被 `|| 1200` 当成没配（2026-10-08 审查，与 sender 的 byLengthMs 同一类）
+        const drainRaw = Number(getConfig().drainDelayMs);
+        const drainDelay = Math.max(200, Number.isFinite(drainRaw) ? drainRaw : 1200);
         this.scheduleWake(chatKey, drainDelay);
       }
       // 自主节奏：本次处理完，确保还留着下一次"自己醒来"的安排
@@ -1338,7 +1726,9 @@ export class Orchestrator {
       const persistThread = triggerEntries.length > 0
         || session.sent.length > 0
         || Boolean(session.threadDisposition);
-      const checkpointState = handoff || session.handoffDraft || {
+      // 关掉会话交接后，旧会话对象里残留的 handoffDraft 也不能再进检查点
+      const draftForCheckpoint = getConfig().memory?.handoffEnabled === false ? null : session.handoffDraft;
+      const checkpointState = handoff || draftForCheckpoint || {
         summary: session.sent.length
           ? `本轮已发送 ${session.sent.length} 条消息`
           : '本轮已读取消息并保持沉默',
@@ -1414,6 +1804,157 @@ export class Orchestrator {
     }
   }
 
+  /**
+   * 该回却没发时的补救：私聊 / 被 @ / 引用机器人 / 点名，模型只输出了正文（QQ 里看不到）。
+   * 先做**一次**纠正请求（只给 send_message，避免重新执行别的操作），仍没发就发一条固定说明。
+   * 发送结果不确定（outbox 可能已写出）时一律不动 —— 那种情况交人工核对，绝不补发。
+   */
+  async #ensureDirectedReply({
+    session, messages, ctx, toolDefs, persona, kind, triggerEntries,
+    proactive, manual, signal, runLimits, roundsExhausted
+  }) {
+    if (getConfig().conversation?.replyGuardEnabled === false) {
+      session.replyCorrection = 'skipped';
+      return;
+    }
+    if (proactive || manual) return;
+    if (session.sent.length > 0 || session.visibleReply === true) return;
+    if (!Array.isArray(triggerEntries) || !triggerEntries.length) {
+      // 触发条目被另一轮 claim 走等场景会走到这里；此前静默 return，会话里
+      // replyCorrection=null 与"没走到 guard"分不清（issue #64 附带的私聊现象）
+      session.replyCorrection = 'skipped';
+      log.warn(`[reply-guard] ${session.chatKey || kind || ''} 触发条目为空，跳过回复纠正`);
+      return;
+    }
+    let directed = isDirectedAtBot({
+      kind, triggerEntries, persona,
+      selfId: this.onebot.selfId,
+      accountNickname: this.onebot.selfNickname
+    });
+    if (!directed && session.triggerKind === 'keyword') {
+      // 关键词命中是"必回"档（prompt.js 的 tier 2），名字边界判不出"在叫它"不代表不用回
+      // （issue #64：两字昵称/名字前接汉字时名字判定失败，模型写好的正文被静默丢弃）。
+      // 只在模型确实写出了正文草稿时纠正；「（这条不用接）」类自注和空内容仍保持沉默。
+      const draft = [...messages].reverse().find((message) => message?.role === 'assistant');
+      const draftText = String(draft?.content ?? '').trim();
+      if (draftText && !/^[（(【\[]/.test(draftText)) directed = true;
+    }
+    if (!directed) return;
+    if (this.store.hasUncertainEffects?.(session.leaseId)) {
+      // 可能已经发出去了：补发会造成重复，交给人工核对
+      session.replyCorrection = 'skipped';
+      return;
+    }
+
+    const fallbackText = roundsExhausted
+      ? '这条我还没处理完，稍后再试。'
+      : '这条我暂时处理不了，稍后再试。';
+    const sendTool = toolDefs.find((tool) => tool.name === 'send_message');
+    // 预算：主循环是"已用 + 本次估算 > 上限"就停，所以这里也要把这次请求的体量算进去，
+    // 否则会把主循环刚刚拒掉的那次调用原样再发一遍（2026-10-18 审查 P2）
+    const lastPromptTokens = Number(session.callUsage?.at(-1)?.promptTokens)
+      || Math.ceil((Number(session.inputEstimateChars) || 0) / 2)
+      || 4000;
+    const budgetLeft = (Number(session.usage?.totalTokens) || 0) + lastPromptTokens < runLimits.maxRunTokens;
+    let sendFailed = false;
+
+    if (sendTool && budgetLeft) {
+      try {
+        const response = await chatCompletionWithRetry({
+          messages: [...messages, {
+            role: 'user',
+            content: '你上一轮把回答写成了正文，没有调用 send_message —— 用户在 QQ 里收不到这段文字。'
+              + '请用 send_message 重新回答：能答就直接答；做不了（功能没启用、没有权限、没有这个工具）就简短说明原因。'
+              + '不要重复执行其它工具，也不要解释这条系统提示。'
+          }],
+          tools: toOpenAiTools([sendTool]),
+          signal,
+          // 用 chat 的思考档位：'reply-correction' 不在 api.thinking 的映射表里，会退回 default（常常是思考开）
+          purpose: 'chat'
+        });
+        addUsage(session.usage, response.usage);
+        session.usage.calls += 1;
+        session.replyCorrectionUsage = response.usage;
+        // 与主循环同口径：兜底渠道换过端点时，成本记到实际渠道；per-call 台账也要有一行
+        session.model = response.model || session.model;
+        if (response.channelChanged && response.originBaseUrl) {
+          session.vendor = vendorOfBaseUrl(getConfig(), response.originBaseUrl) || session.vendor;
+        }
+        session.callUsage ||= [];
+        session.callUsage.push({
+          round: (session.rounds || 0) + 1,
+          promptTokens: Number(response.usage?.prompt_tokens) || 0,
+          cachedTokens: 0,
+          cacheHitRate: 0,
+          completionTokens: Number(response.usage?.completion_tokens) || 0,
+          totalTokens: Number(response.usage?.total_tokens) || 0,
+          correction: true
+        });
+        const rawMessage = response.message || {};
+        let calls = (Array.isArray(rawMessage.tool_calls) ? rawMessage.tool_calls : [])
+          .filter((call) => call && typeof call === 'object')
+          .map((call) => ({
+            name: String(call.function?.name ?? ''),
+            args: typeof call.function?.arguments === 'string'
+              ? call.function.arguments
+              : JSON.stringify(call.function?.arguments ?? {})
+          }));
+        if (!calls.length && typeof rawMessage.content === 'string' && rawMessage.content) {
+          // 少数模型把工具调用写成文本：只在明确是 send_message 时执行
+          calls = parseInlineToolCalls(rawMessage.content)
+            .filter((call) => call?.name === 'send_message')
+            .map((call) => ({ name: 'send_message', args: JSON.stringify(call.args ?? {}) }));
+        }
+        for (const call of calls) {
+          if (call.name !== 'send_message') continue;
+          // 走与主循环同一个执行器：禁言预检、限频、outbox 记账全部复用。
+          // 注意 send_message 对"整批失败"仍返回 ok（失败明细在正文里），所以以
+          // session.sent 是否真的增加判定，而不是看 isError。
+          const before = session.sent.length;
+          const sentResult = await executeTool(toolDefs, ctx, 'send_message', call.args);
+          if (session.sent.length === before) {
+            // 只有"明确被拒"（禁言/限频）才放弃兜底；参数写错、目标非法这类失败仍要发固定说明，
+            // 否则这条消息会一句回复都没有（2026-10-18 审查 P2）
+            const reason = String(sentResult?.content || '');
+            sendFailed = /禁言|限频|频率|太快|muted|rate.?limit/i.test(reason);
+          }
+          // 不 break：同一纠正响应里若有多条 send_message（模型没合成一个数组），后半句同样要发；
+          // 主循环也是逐条执行，这里保持同一口径。
+        }
+      } catch (error) {
+        if (signal?.aborted) return;
+        log.warn(`[reply-guard] ${session.chatKey || ''} 纠正请求失败：${error?.message ?? error}`);
+      }
+    }
+
+    if (session.sent.length > 0) {
+      session.replyCorrection = 'corrected';
+      session.finishReason ||= '该回未发，已自动纠正';
+      log.info(`[reply-guard] ${session.chatKey || ''} 首轮未发送 → 已纠正并发出一条`);
+      return;
+    }
+    if (sendFailed) {
+      // 纠正轮的发送被明确拒绝（禁言/限频）：不再补发兜底，避免二次打扰或重复失败
+      session.replyCorrection = 'failed';
+      log.warn(`[reply-guard] ${session.chatKey || ''} 首轮未发送，纠正轮发送被拒（禁言/限频？）`);
+      return;
+    }
+    // 纠正仍没发（或预算不足跳过）：发一条固定说明，绝不转发模型正文
+    try {
+      await executeTool(toolDefs, ctx, 'send_message', JSON.stringify({ messages: [fallbackText] }));
+    } catch (error) {
+      log.warn(`[reply-guard] ${session.chatKey || ''} 兜底发送异常：${error?.message ?? error}`);
+    }
+    if (session.sent.length > 0) {
+      session.replyCorrection = 'fallback';
+      session.finishReason ||= '该回未发，已发送兜底说明';
+      log.info(`[reply-guard] ${session.chatKey || ''} 首轮未发送 → 已发送兜底说明`);
+    } else {
+      session.replyCorrection = 'failed';
+      log.warn(`[reply-guard] ${session.chatKey || ''} 首轮未发送，兜底也失败（禁言/限频？）`);
+    }
+  }
+
   async #runAgent(session, {
     kind,
     chatId,
@@ -1430,9 +1971,24 @@ export class Orchestrator {
     signal
   }) {
     const cfg = getConfig();
+    // 本轮生效的人设：全局 persona + 这个群的覆盖（见 personas.resolvePersona）。
+    // 一次解析、多处共用 —— 提示词、群内显示名、运行记录必须是同一份，
+    // 否则会出现"提示词是猫娘、落款还是小鲸鱼"。
+    const persona = resolvePersona(cfg, chatKey);
+    // 人类化状态：有真实互动才轻微抬心情/掉精力；关闭时整条链路不碰。
+    if (cfg.humanize?.enabled === true && triggerEntries?.length) {
+      notePersonaInteraction(persona, { kind: 'incoming' });
+      if (cfg.humanize?.relationship?.enabled !== false) {
+        try {
+          for (const userId of handoffParticipantIds(triggerEntries)) {
+            this.memory.noteInteraction?.(userId, { at: Date.now() });
+          }
+        } catch { /* 关系记忆写盘失败不能打断本轮回复 */ }
+      }
+    }
     const conversationCfg = conversation || conversationConfigForChat(chatKey);
     const chatName = kind === 'group' ? await this.#chatName(chatId) : '';
-    const selfNickname = kind === 'group' ? (cfg.persona.selfNickname || this.onebot.selfNickname || cfg.persona.botName) : cfg.persona.botName;
+    const selfNickname = kind === 'group' ? (persona.selfNickname || this.onebot.selfNickname || persona.botName) : persona.botName;
     let thread = conversationCfg.mode !== 'legacy'
       ? this.store.getConversationThread?.(chatKey)
       : null;
@@ -1465,6 +2021,11 @@ export class Orchestrator {
     // 工具集按配置过滤：工具列表属于缓存前缀，必须先固定后再决定是否复用生命周期 transcript。
     // 口径收敛在 vision-scan.visionEnabled：只读 api.vision 会漏掉"模型不支持图片"那一半
     const canSeeImages = visionEnabled(cfg);
+    // 「消息类型」页的两个细开关（默认开），叠加在"模型能不能看图"之上：
+    // 关掉后对应工具必须一起摘掉 —— 提示词那边按同一判定收敛，两边漏一边就会出现
+    // "教了但调不到"或"调得到却没教"，两种都白花一轮模型往返。
+    const viewMessageImages = canSeeImages && cfg.messageTypes?.images !== false;
+    const viewLibraryStickers = canSeeImages && cfg.messageTypes?.stickers !== false;
     const searchEnabled = cfg.webSearch?.enabled !== false;
     // ASR 有自己的开关与供应商（asr.enabled / asr.provider / asr.apiKey），与"联网搜索"解耦：
     // 关掉搜索的人不该顺带失去语音转写（2026-09-26 审查）。判定收敛在 config.asrAvailable()。
@@ -1477,42 +2038,114 @@ export class Orchestrator {
     const selfWakeEnabled = cfg.proactive?.selfWakeEnabled !== false;
     // 图片生成按张计费：没开/没配就不注入工具，否则模型会去调一个必然失败的画图工具
     const imageGenEnabled = imageGenAvailable(cfg);
-    const toolDefs = this.toolDefs.filter((d) => {
-      if (!canSeeImages && (d.name === 'get_message_images' || d.name === 'get_sticker_image')) return false;
+    // 每轮现建一份：工具描述里有随配置变化的文案（例如 get_message_images 会写"抽 4 帧"或
+    // "视频画面看不到"）。构造函数里建一次的话，控制台改完设置（不重启）后提示词已经变了、
+    // 工具描述还是旧的，模型会收到互相矛盾的两段（2026-10-17 审查 P2）。
+    const toolDefs = buildToolDefs().filter((d) => {
+      if (!viewMessageImages && d.name === 'get_message_images') return false;
+      if (!viewLibraryStickers && d.name === 'get_sticker_image') return false;
       // 表情包总开关关掉：发送/列表/看图/收藏四个工具一并摘掉。原先只撤了提示词里的清单，
       // 工具还留着 —— 模型仍会发旧库里的表情，而【可用表情包】已被抽走、没有新选项，
       // 只能反复用记得的那一个（2026-10-02 用户反馈："不开那个按钮，它就一直发一个表情"）。
       // 与 schedule_wake / generate_image 是同一口径：开关关掉就连工具带提示词一起撤。
       if (!stickerEnabled && (d.name === 'send_sticker' || d.name === 'list_stickers'
-        || d.name === 'get_sticker_image' || d.name === 'collect_sticker')) return false;
+        || d.name === 'get_sticker_image' || d.name === 'collect_sticker'
+        || d.name === 'sticker_note')) return false;   // sticker_note 是第五个，别再漏（2026-10-03）
       // 收藏总闸关掉（表情包功能还开着）：只摘"主动收藏"这一个工具 —— 发送/列表/看图不受影响；
       // 留着的话模型会去调一个必然失败的收藏（还先白花一次看图判断，2026-10-02）。
       if (cfg.sticker?.collectEnabled === false && d.name === 'collect_sticker') return false;
+      // 语音回复与提醒：提示词侧已按开关收敛（prompt.js 里 send_voice 只在 tts 开启时教、
+      // remind 只在 reminders 开启时教），工具表却没跟上 —— 模型调过去必然失败，白花一轮
+      // 模型往返（send_voice 的描述还极具诱导性）。与上面几项同一口径（2026-10-03 全量审查）。
+      if (!ttsConfigured(cfg) && d.name === 'send_voice') return false;
+      if (cfg.reminders?.enabled === false && d.name === 'remind') return false;
       if (!searchEnabled && (d.name === 'web_search' || d.name === 'web_fetch')) return false;
       if (!selfWakeEnabled && d.name === 'schedule_wake') return false;
+      // 生活层没开：工具与提示词一起撤（与 schedule_wake / generate_image 同一口径）
+      if (cfg.lifeFeed?.enabled !== true
+        && (d.name === 'life_feed_next' || d.name === 'life_feed_feedback' || d.name === 'share_bilibili')) return false;
+      // 群游戏引擎关掉：group_game 工具一并摘掉 —— 提示词侧（prompt.js 玩法与工具箱）
+      // 只在开启时教"主持小游戏"，工具表却恒在，模型仍会去调一个必然报错的工具
+      //（group-game.js 对 enabled=false 直接拒），白花一轮（2026-10-10 审查 D3）。
+      if (cfg.groupGame?.enabled !== true && d.name === 'group_game') return false;
       // ASR 按量计费：开关关掉或没配 key 就不注入，避免模型调用必失败；也防误配置导致意外计费
       if (!asrEnabled && d.name === 'get_message_audio') return false;
-      if (!imageGenEnabled && d.name === 'generate_image') return false;
+      // 生图的唯一发送路径是"进表情库 → send_sticker"；表情包功能关掉时那条路也没了，
+      // 留着它会真的花钱生成一张发不出去的图（2026-10-17 审查）
+      if ((!imageGenEnabled || !stickerEnabled) && d.name === 'generate_image') return false;
+      // 平台能力开关（2026-10-07 协议端 1.14.22 能力接入，控制台「平台能力」页）：
+      // 关掉就连工具带提示词一起撤 —— 与"表情包/搜索/ASR"同一口径，
+      // 留着只会让模型去调一个必然不可用的工具。映射表在 core/platform-gates.js（与测试共用一份）。
+      // **带上 chatKey**：控制台可以按群覆盖（platform.perGroup），工具表与提示词必须同判。
+      if (!platformToolAllowed(d.name, cfg.platform, chatKey)) return false;
       if (d.feature === 'identityPilot' && !identityAvailable) return false;
       if (d.feature === 'friendProposal' && !friendProposalAvailable) return false;
+      if (d.feature === 'knowledge' && !knowledgeEnabled(cfg)) return false;
+      if (d.feature === 'moderation') {
+        const mod = cfg.moderation || {};
+        if (mod.enabled === false) return false;
+        const action = {
+          set_group_ban: 'ban',
+          kick_group_member: 'kick',
+          recall_message: 'recall',
+          set_group_admin: 'admin'
+        }[d.name];
+        if (action && mod.actions?.[action] === false) return false;
+        const groups = idList(mod.groups);
+        if (groups.length && !groups.includes(String(chatId))) return false;
+      }
       return true;
     });
+    // 插件工具：**不放进 buildToolDefs()**（那份是内置工具表，另有"每个工具都要有调度分类"
+    // 的契约，见 test/experimental-tool-scheduler.test.mjs），而是每轮现取现追加。
+    // 授权由注册表自己收口（总开关 / enabledIds / 进程状态 / manifest 声明，默认拒）——
+    // 内置工具的默认是"放行"（platformToolAllowed 对未登记工具返回 true），插件绝不能沿用那个默认。
+    const pluginToolDefs = this.getPlugins?.()?.toolDefsFor?.() ?? [];
+    const mcpToolDefs = this.getMcp?.()?.toolDefsFor?.() ?? [];
+    const builtinToolDefs = toolDefs;   // 前缀哈希用它（见下），插件/MCP 工具只按名字参与
+    if (pluginToolDefs.length) toolDefs.push(...pluginToolDefs);
+    if (mcpToolDefs.length) toolDefs.push(...mcpToolDefs);
     const openAiTools = toOpenAiTools(toolDefs);
-    let systemPrompt = buildSystemPrompt({
+    const baseSystemPrompt = buildSystemPrompt({
+      // 按群生效的人设（缺省 = 全局）
+      persona,
       // 与【此刻状态】用同一个名字（群名片优先），否则同一次请求里会出现两个"你在群里的名字"
       selfNickname,
       // 进行中的游戏：只注入公开摘要（不含词与身份）
       gameContext: this.getGames?.()?.summaryFor(chatKey) || '',
       identityPilotAvailable: identityAvailable,
       friendProposalAvailable,
-      stickerEntries
+      stickerEntries,
+      // 平台能力的"教不教"必须与上面工具表的"给不给"同判（含按群覆盖）：同一个 chatKey。
+      platform: cfg.platform,
+      chatKey
     });
+    // 状态行放本轮 user 消息，不拼进 system prompt：system 前缀参与 cacheKey/线程续接判定，
+    // 每半小时变一次会让前缀缓存和 lifecycle 线程反复失效。
+    const personaStateLine = personaStatePrompt(persona);
+    // 长期语义记忆属于每轮临时上下文：放入 user 内容而非 system 前缀，避免检索结果变化让
+    // lifecycle 线程与前缀缓存失效。服务不可用时仅跳过召回，聊天主链路照常。
+    let livingRecall = { text: '', entries: [], mode: 'disabled' };
+    try {
+      livingRecall = await this.livingMemory?.recall?.({ chatKey, triggerEntries, signal }) || livingRecall;
+    } catch (error) {
+      log.warn(`[living-memory] ${chatKey} 召回异常，已跳过：`, error?.message ?? error);
+    }
+    const triggerText = (triggerEntries || []).map((entry) => String(entry?.text || '')).join('\n');
+    const humanLines = [
+      personaStateLine,
+      livingRecall.text,
+      memeDensityPrompt(cfg),
+      memesForPrompt(chatKey, triggerText, { level: cfg?.humanize?.memeUse?.level })
+    ].filter(Boolean).join('\n\n');
+    let systemPrompt = baseSystemPrompt;
     const skinHandoff = this.skins?.handoffPrompt(chatKey) || '';
     if (skinHandoff) {
       systemPrompt += '\n\n' + skinHandoff;
     }
     session.skinHandoffIncluded = Boolean(skinHandoff);
     if (this.skins?.enabled) session.skinId = skinScope()?.skinId || '';
+
     const promptPrefixHash = crypto.createHash('sha256')
       .update(String(cfg.api.provider || ''))
       .update('\0')
@@ -1522,7 +2155,14 @@ export class Orchestrator {
       .update('\0')
       .update(systemPrompt)
       .update('\0')
-      .update(JSON.stringify(openAiTools))
+      // 前缀哈希：内置工具算完整 schema；插件工具**只算名字**（排序后）。
+      // 插件跑起来/崩掉重启会让"当前有哪些插件工具"抖动，但工具集其实没变 ——
+      // 那种抖动不该被当成"前缀变了"去关掉在途的对话线程（2026-10-15 复审 P3-3）。
+      .update(JSON.stringify(toOpenAiTools(builtinToolDefs)))
+      .update('\0')
+      .update(pluginToolDefs.map((def) => def.name).sort().join(','))
+      .update('\0')
+      .update(mcpToolDefs.map((def) => def.name).sort().join(','))
       .digest('hex');
 
     let priorProviderMessages = [];
@@ -1568,6 +2208,9 @@ export class Orchestrator {
       slangContext,
       incidentContext,
       selfNickname,
+      // 按群人设：点名标签与"刚换过卡"的提醒都用这个群生效的那份
+      botName: persona.botName,
+      personaChangedAt: Number(persona.changedAt) || 0,
       // 点名标签的文本兜底要用它认「@QQ号」与 CQ 码形态（存档里的 mentionsSelf 才是主判据）。
       // 取值与上面的档位判定保持一致，否则两处会对同一条消息给出不同判断。
       selfId: cfg.onebot?.selfId || this.onebot.selfId || '',
@@ -1578,6 +2221,9 @@ export class Orchestrator {
       moreUnreadDuringRun: this.store.unreadCount(chatKey) > 0,
       proactive,
       manual,
+      // 到点唤醒（定时提醒/自安排）与"控制台手动唤醒"在提示词里要说清区别：
+      // paced 唤醒不能说成"管理员从控制台唤醒"（2026-10-10 复核）
+      paced,
       contextLimit,
       tierInfo,
       thread,
@@ -1599,6 +2245,11 @@ export class Orchestrator {
     // 同名模型在不同渠道是不同商品，用量与价格要分开统计。
     session.vendor = vendorOfConfig(cfg);
     session.chatName = chatName;
+    session.livingMemory = {
+      mode: livingRecall.mode || 'disabled',
+      recalled: Array.isArray(livingRecall.entries) ? livingRecall.entries.length : 0,
+      ids: (livingRecall.entries || []).map((entry) => String(entry?.id || '')).filter(Boolean).slice(0, 12)
+    };
     // 记录本次读了多长的上下文（排查提示词长度时很有用）
     if (tierInfo) {
       session.contextTier = tierInfo.tier;
@@ -1608,27 +2259,58 @@ export class Orchestrator {
     this.sessions.update(session.id);
     this.emit('session-update', session.id);
 
+    const privateChat = String(chatKey).startsWith('private:');
     const wakeLead = wakeNote
       ? (String(wakeNote).startsWith('【系统提醒】')
         ? safeSlice(String(wakeNote), 300)
         : `这是你自己之前安排的：${safeSlice(String(wakeNote), 300)}。现在时间到了，看看当前情况决定要不要说话。`)
-      : '（主动机会）群里已经安静了一会儿。';
+      : (privateChat
+        ? '（主动机会）私聊里已经安静了一会儿，你想起了对方。'
+        : '（主动机会）群里已经安静了一会儿。');
     const selfWakeOn = cfg.proactive?.selfWakeEnabled !== false;
     // 600 而不是 200：定时提醒合并派发时 note 可能有多条（单条正文上限 200），
     // 这里截到 200 会把第二条整体截掉，而它们已经被 markFired（2026-09-29 审查 P2）
-    const pacedLead = (wakeNote ? `你之前给自己留过话：${safeSlice(String(wakeNote), 600)}\n` : '')
-      + '这些消息是攒着等你按自己的节奏来看的。决定要不要说话、说什么；不想接就安静结束'
-      + (selfWakeOn
-        ? '，并用 schedule_wake 给自己安排下一次醒来的时间（比如几分钟后、或二三十分钟后）。'
-        : '。（自安排唤醒已关闭，不用安排下次唤醒，系统会按配置的节奏再唤醒你。）');
+    // 定时提醒（【定时提醒】标记）是"别人托的承诺"，不能套"你给自己留过话"的自留话框架 ——
+    // 此前两者混在同一条分支里，模型收到"你自己留的 + 有人让你"的矛盾信号，会自己圆归属
+    //（2026-10-10 用户反馈：把别人托的提醒说成被提醒人自己设的）。提醒走逐字 + 简短收尾。
+    const isReminderNote = String(wakeNote).startsWith('【定时提醒】');
+    const pacedLead = (wakeNote
+      ? (isReminderNote
+        ? `${safeSlice(String(wakeNote), 600)}\n`
+        : `你之前给自己留过话：${safeSlice(String(wakeNote), 600)}\n`)
+      : '')
+      + (isReminderNote
+        ? '把提醒自然地说出来即可；说完就结束，不用给自己安排下一次唤醒。'
+        : '这些消息是攒着等你按自己的节奏来看的。决定要不要说话、说什么；不想接就安静结束'
+          + (selfWakeOn
+            ? '，并用 schedule_wake 给自己安排下一次醒来的时间（比如几分钟后、或二三十分钟后）。'
+            : '。（自安排唤醒已关闭，不用安排下次唤醒，系统会按配置的节奏再唤醒你。）'));
     const wakeTail = String(wakeNote).startsWith('【系统提醒】')
       ? '就按上面那条提醒处理：想补就补一句很短的，补完就放下；不想补就安静结束。'
-      : '你可以主动抛一个自然的话题（像随口说的，不要像播报），也可以判断没必要说话就安静结束。';
+      : (privateChat
+        ? '你可以主动找个由头说一句（分享点见闻、接着上次的话题、或单纯问候一下），也可以判断现在不该打扰就安静结束。'
+          + (getConfig().lifeFeed?.enabled === true
+            ? '想分享点具体的见闻，可以调用 life_feed_next 看看队列里有什么。' : '')
+        : '你可以主动抛一个自然的话题（像随口说的，不要像播报），也可以判断没必要说话就安静结束。'
+          + (getConfig().lifeFeed?.enabled === true
+            ? '今天想分享点见闻的话，可以调用 life_feed_next 看看队列里有什么。' : ''));
+    // 手动唤醒（控制台「见闻→分享」、手动触发）也可能带 wakeNote；此前只有 paced 分支
+    // 使用 note，manual 的提醒被丢掉，用户点了分享却什么都没发生。
+    const manualNote = manual && wakeNote
+      ? (isReminderNote || String(wakeNote).startsWith('【系统提醒】')
+        ? safeSlice(String(wakeNote), 600)
+        : `这是你自己之前安排的：${safeSlice(String(wakeNote), 600)}。`)
+      : '';
     const currentUserMessage = {
       role: 'user',
-      content: proactive && !manual
+      content: (humanLines ? `${humanLines}\n\n` : '') + (proactive && !manual
         ? `${userPrompt}\n\n【本次唤醒】${wakeLead}${wakeTail}`
-        : (paced ? `${userPrompt}\n\n【本次唤醒】${pacedLead}` : userPrompt)
+        : (paced
+          ? `${userPrompt}\n\n【本次唤醒】${pacedLead}`
+          : (manualNote
+            ? `${userPrompt}\n\n【本次唤醒】${manualNote}`
+              + (String(wakeNote).startsWith('【系统提醒】') ? `\n${wakeTail}` : '')
+            : userPrompt)))
     };
     const messages = [
       { role: 'system', content: systemPrompt },
@@ -1653,8 +2335,9 @@ export class Orchestrator {
       chatKey, kind, chatId,
       selfId: this.onebot.selfId,
       selfNickname,
-      botName: cfg.persona.botName,
-      behaviorProfile: cfg.persona.behaviorProfile || 'legacy',
+      botName: persona.botName,
+      behaviorProfile: persona.behaviorProfile || 'legacy',
+      voice: voiceForPersona(persona),
       onebot: this.onebot,
       store: this.store,
       memory: this.memory,
@@ -1662,14 +2345,24 @@ export class Orchestrator {
       stickers: this.stickers,
       sender: this.sender,
       session,
+      // 动作冷却跨轮：session 每次运行都新建，冷却时间不能只存在 session 上。
+      actionMemory: this.actionMemory,
       signal,
       emit: (type, payload) => this.emit(type, payload),
       // 让模型能给自己安排一次稍后的主动发言
       scheduleWake: (delayMs, note) => this.scheduleInitiativeWake(chatKey, delayMs, note),
       // 定时提醒（remind 工具）：持久化的"给别人的承诺"，到点走主动唤醒
       reminders: this.reminders,
+      // 本轮触发消息（remind 的 from 兜底要判断"是否只有一个发送者"；只带最小字段）
+      triggerEntries: (triggerEntries || []).map((m) => ({
+        senderId: m?.senderId || '', senderName: m?.senderName || '', self: Boolean(m?.self),
+        // 群管理授权要核对管理员这句到底说了什么；只留文本片段，不带媒体/原始段。
+        text: safeSlice(String(m?.text || ''), 300)
+      })),
       // 群游戏（group_game 工具）：进行中的局由管理器负责推进与判定
-      games: this.getGames?.() || null
+      games: this.getGames?.() || null,
+      // 生活层（见闻）：候选队列由宿主管理；工具只取/回写，不直接发消息
+      getLifeFeed: () => this.getLifeFeed?.() || null
     };
 
     // 省 Token 模式：轮数与单次运行预算夹上限（关闭时与升级前逐字一致）
@@ -1677,6 +2370,8 @@ export class Orchestrator {
     const maxRounds = runLimits.maxRounds;
     let finish = false;
     let completed = false;
+    // 发送动作跨模型轮次失败时仍要阻止“只总结、不回复”的 finish；有任何内容送达后解除。
+    let unsentDeliveryFailure = false;
     let webSearchCount = 0;
     session.activity = '';
     session.webSearchCount = 0;
@@ -1740,6 +2435,12 @@ export class Orchestrator {
       signal.throwIfAborted();
       if (skinHandoff) this.skins.markHandoffUsed(chatKey);
       session.model = response.model || session.model;
+      // 2026-10-06 复审 P3：兜底模型接管且端点真的换了渠道时，成本要记到实际渠道名下
+      //（model-prices 的约定就是"会话用它自己记录的 vendor"）—— 否则渠道价/渠道价目表
+      // 会按主渠道单价给兜底模型计价，而渠道价目表可自动注入，错价路径生产可达。
+      if (response.channelChanged && response.originBaseUrl) {
+        session.vendor = vendorOfBaseUrl(getConfig(), response.originBaseUrl) || session.vendor;
+      }
       addUsage(session.usage, response.usage);
       session.usage.calls += 1;
       const promptTokens = Number(response.usage?.prompt_tokens) || 0;
@@ -1763,7 +2464,25 @@ export class Orchestrator {
       const reasoningContent = typeof msg.reasoning_content === 'string'
         ? msg.reasoning_content
         : null;
-      const finalToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length ? msg.tool_calls : undefined;
+      // 2026-10-06 复审 P2：部分网关/自部署推理服务返回的 tool_calls 形态不规整（缺 id、
+      // 非数组、null 项）。缺 id 的 tool 消息下一轮会被多数 OpenAI 兼容端点整请求 400 拒掉，
+      // isRetryableError 判 false → 批次转人工、被 @ 的消息当场无人回。与 inline 路径自造
+      // inline_${round}_${i} 同口径：进 messages 前先归一化 —— 补 id、补 type、参数字符串化
+      //（id 要同步落在 providerAssistant.tool_calls 上，保证 assistant/tool 配对一致）。
+      const normalizedToolCalls = (Array.isArray(msg.tool_calls) ? msg.tool_calls : [])
+        .filter((c) => c && typeof c === 'object')
+        .map((c, i) => ({
+          ...c,
+          id: c.id || `toolcall_${round}_${i}`,
+          type: c.type || 'function',
+          function: {
+            name: String(c.function?.name ?? ''),
+            arguments: typeof c.function?.arguments === 'string'
+              ? c.function.arguments
+              : JSON.stringify(c.function?.arguments ?? {})
+          }
+        }));
+      const finalToolCalls = normalizedToolCalls.length ? normalizedToolCalls : undefined;
       const providerAssistant = {
         role: 'assistant',
         content: finalContent,
@@ -1779,7 +2498,7 @@ export class Orchestrator {
       session.rounds = round + 1;
       markActivity('');
 
-      let toolCalls = msg.tool_calls ?? [];
+      let toolCalls = normalizedToolCalls;
       // 兼容：少数模型把工具调用写成文本而不是原生 tool_calls。解析成功后需要把
       // 该 assistant 消息改成 tool_calls 形态回填 messages，并追加真正的 tool 结果。
       const rawContent = typeof msg.content === 'string' ? msg.content : '';
@@ -1815,8 +2534,30 @@ export class Orchestrator {
         break;
       }
 
+      // finish 是终止标记，必须最后执行：模型偶尔会把它排在 send_message 前面，
+      // 若按原顺序执行，finish 先成功 → 外层的 !finish 立刻退出循环，后面的 send_message
+      // 即便被屏障拒绝也没有下一轮让模型补发，消息就静默丢了（复审 P1）。
+      if (toolCalls.length > 1) {
+        const ordered = [
+          ...toolCalls.filter((call) => call?.function?.name !== 'finish'),
+          ...toolCalls.filter((call) => call?.function?.name === 'finish')
+        ];
+        if (ordered.some((call, index) => call !== toolCalls[index])) {
+          toolCalls = ordered;
+          const lastAssistant = messages[messages.length - 1];
+          if (lastAssistant?.role === 'assistant') lastAssistant.tool_calls = toolCalls;
+          const live = this.sessions.current.get(session.id);
+          const liveLast = live?.messages?.[live.messages.length - 1];
+          if (liveLast?.role === 'assistant') liveLast.tool_calls = structuredClone(toolCalls);
+          this.sessions.update(session.id);
+          this.emit('session-update', session.id);
+        }
+      }
+
       const toolResults = [];
       const imageUserMessages = [];
+      // 只在"同一批 tool_calls"内有效：上一批的失败不挡下一批（模型可能已经在新一批里修正了）。
+      let priorFailure = false;
       // 流式响应结束后，把 assistant 条目的 tool_calls 也同步到会话消息流（一次）
       const liveTool = this.sessions.current.get(session.id);
       const lastAssistantUi = liveTool?.messages?.[liveTool.messages.length - 1];
@@ -1831,7 +2572,18 @@ export class Orchestrator {
         if (name === 'web_search' || name === 'web_fetch') webSearchCount += 1;
         session.webSearchCount = webSearchCount;
         markActivity(`正在调用 ${name}…`);
-        const result = await executeTool(toolDefs, ctx, name, argsRaw);
+        // 技能白名单只收窄本轮工具；finish/skill_list/skill_use 在 skill_use 时已加入集合。
+        // send_message 永远放行：模型可能只是想“看看有哪些技能，然后正常回一句”；
+        // 不能因为列过一次技能就把正常回复也堵死。
+        const skillGate = skillGateMessage(ctx.activeSkill, ctx.pendingSkillUse, name, safeParse(argsRaw));
+        const blocked = finishBarrierBlock(name, {
+          finished: finish,
+          priorFailure,
+          unsentDeliveryFailure: unsentDeliveryFailure && session.sent.length === 0 && session.visibleReply !== true
+        }) || skillGate;
+        const result = blocked
+          ? { content: blocked, isError: true, reportIncident: false, skillBlocked: Boolean(skillGate) }
+          : await executeTool(toolDefs, ctx, name, argsRaw);
         if (
           result.isError
           && result.incidentCaptured !== true
@@ -1887,6 +2639,20 @@ export class Orchestrator {
         if (this.store.hasUncertainEffects(session.leaseId)) {
           throw new Error('Delivery uncertain; batch held for operator review');
         }
+        // 部分发送失败（sendTextBatch 有 failed 但至少一条成功）不算 isError，
+        // 但同样不能把 finish 提交掉，否则失败的那几条永远没有下一轮补发（复审 P1）。
+        // 技能白名单拦截不是"工具坏了"：不让它把 finish 屏障也一起触发，否则模型被挡住一次
+        // 就再也收不了尾。真正的工具失败仍然照旧挡 finish。
+        if ((result.isError && result.skillBlocked !== true) || result.partialFailure === true) priorFailure = true;
+        if (name === 'send_sticker'
+          && result.isError
+          && (result.errorCode === 'action-cooldown' || /这个动作刚刚用过/.test(contentStr))
+          && session.sent.length === 0
+          && session.visibleReply !== true) {
+          // 表情被冷却拦下且本轮还什么都没有送到：拦住"只 finish 不回复"（PR #65）。
+          // visibleReply（拍一拍/点赞/传相册等）已算"回过"，不必再逼一条文字。
+          unsentDeliveryFailure = true;
+        }
         if (name === 'finish' && !result.isError) finish = true;
       }
       messages.push(...toolResults.map(({ role, tool_call_id, name, content }) => ({ role, tool_call_id, content, name })));
@@ -1896,6 +2662,13 @@ export class Orchestrator {
     }
 
     signal.throwIfAborted();
+    // 该回却没发：只有正文、没有 send_message（QQ 里看不到）。一次纠正 + 固定兜底。
+    // 放在轮数判定之前：跑满轮数且一条没发，同样属于"该回未发"，兜底文案会区分这两种原因。
+    await this.#ensureDirectedReply({
+      session, messages, ctx, toolDefs, persona, kind, triggerEntries,
+      proactive, manual, signal, runLimits,
+      roundsExhausted: !finish && !completed
+    });
     // 轮次用尽是"干不完活"的护栏，不是"需要人工核对"的故障：与 token 预算同口径，
     // 当作本轮正常收尾（已经说的话照常发出、消息正常 ack），并在会话里标注原因。
     // 不能标成可重试去重跑整轮：一条跑满 maxRounds 的会话重跑同样会跑满，成本放大且无解。
@@ -1962,7 +2735,10 @@ export class Orchestrator {
   startScheduledWakeTicker() {
     if (this.scheduledWakeTicker) return;
     this.scheduledWakeTicker = setInterval(() => {
-      try { this.fireDueScheduledWakes(); } catch { /* 调度失败不影响主流程 */ }
+      // 不空吞：这条链路会碰 sqlite（SQLITE_BUSY/库锁）——静默抛每 30 秒一次，运维从日志里
+      // 看不出"机器人不说话了"和"本来就没到点"的区别（2026-10-03 全量审查）。
+      try { this.fireDueScheduledWakes(); }
+      catch (error) { log.error('[wake] 自安排唤醒调度出错（不影响下一轮）:', error?.message ?? error); }
     }, 30000);
     if (this.scheduledWakeTicker.unref) this.scheduledWakeTicker.unref();
   }
@@ -1980,6 +2756,28 @@ export class Orchestrator {
       if (item.timer) clearTimeout(item.timer);
       if (blocked) {
         log.info(`[wake] ${chatKey} 跳过：${kind === 'followUp' ? '补话' : '自安排唤醒'}开关已关闭，这次安排作废`);
+        continue;
+      }
+      // 会话被移出允许列表（allow.groups/private 改动）后不该再唤醒：显式作废并记日志，
+      // 不能放任它走到 #wake 被 canRun 静默拒掉 —— 那时安排已删、留言无声消失（2026-10-12 审查）。
+      // 与静默时段不同：白名单不会自己恢复，顺延只会无限重排，所以直接作废。
+      if (!item.paced && !chatAllowed(chatKey)) {
+        log.info(`[wake] ${chatKey} 不在允许列表里，这次唤醒作废（留言不再保留）：${String(item.note || '').slice(0, 60)}`);
+        continue;
+      }
+      // 时间/模式维（2026-10-10 补，与 fireDueReminders 同款）：#wakePreflight 的 canRun 会
+      // 静默拒掉这次唤醒而安排已删 —— 静默段顺延到窗口恢复（留言原样保留）；观察模式无法
+      // 兑现，作废并记日志，避免留下每分钟重排的空转。
+      if (this.#wakeTimeBlocked(chatKey)) {
+        if (getConfig().runtime?.mode !== 'active') {
+          log.info(`[wake] ${chatKey} 观察模式下自安排唤醒无法兑现，留言作废（切回 active 后可重新安排）`);
+          continue;
+        }
+        const wait = timeUntilActive(chatKey);
+        const at = Date.now() + Math.min(Math.max(wait, 60 * 1000), 24 * 60 * 60 * 1000);
+        const timer = setTimeout(() => { try { this.fireDueScheduledWakes(); } catch { /* 忽略 */ } }, (at - Date.now()) + 50);
+        if (timer.unref) timer.unref();
+        this.scheduledWakes.set(chatKey, { ...item, at, timer });
         continue;
       }
       // 系统提醒的补话：等待期间有人说话了（正常流程已经在处理），这次就不必再唤一次
@@ -2021,6 +2819,14 @@ export class Orchestrator {
     if (!this.#chatRuntimeDecision(chatKey).allowed) return true;
     if (!String(cfg.api?.model || '').trim()) return true;
     return this.runningChats.size >= Math.max(1, Number(cfg.maxConcurrentRuns) || 2);
+  }
+
+  // 派发预检的时间/模式维：#wakePreflight 的 canRun（src/core/access.js）还含
+  // runtime.mode==='active' 与 isTimeActive —— 预算维 2026-10-04 已对齐，时间/模式维
+  // 2026-10-10 补上同款：漏了就会出现"先 markFired/销毁安排、唤醒却被 canRun 静默拒掉"。
+  #wakeTimeBlocked(chatKey) {
+    if (getConfig().runtime?.mode !== 'active') return true;   // observe：派不出去
+    return !isTimeActive(chatKey);
   }
 
   /** 安排一次稍后的主动发言（模型调用 schedule_wake / 补话 / 自主节奏唤醒共用）。 */
@@ -2069,32 +2875,39 @@ export class Orchestrator {
     // 逐条排会互相覆盖：先排的被顶掉，却已经标记 fired，内容就永久丢了（2026-09-28 审查 P2）。
     const byChat = new Map();
     for (const item of this.reminders.due(now)) {
-      if (this.aborted || !canRun(item.chatKey)) continue;
+      if (this.aborted) continue;
+      if (this.#remindersInFlight.has(item.id)) continue;
+      if (!canRun(item.chatKey)) {
+        // canRun 含 isTimeActive 与 runtime.mode（access.js）：静默段/观察模式下派不出去。
+        // 这里必须顺延而不是干等 —— 干等的话，持续静默超过 12 小时会被上面的 expired()
+        // 静默作废（deferTo 重置作废时钟；2026-10-10 审查）。白名单被清空等其它原因不值得
+        // 动到点时间，保持原样每 tick 重试。只在"新到点时间确实更晚"时才写，避免每 tick 落盘。
+        if (this.#wakeTimeBlocked(item.chatKey)) {
+          const wait = timeUntilActive(item.chatKey);
+          const later = now + (wait > 0 ? Math.min(wait, 24 * 60 * 60 * 1000) : 30 * 60 * 1000);
+          if (later > item.at + 60 * 1000) this.reminders.deferTo(item.id, later);
+        }
+        continue;
+      }
       if (!byChat.has(item.chatKey)) byChat.set(item.chatKey, []);
       byChat.get(item.chatKey).push(item);
     }
     for (const [chatKey, items] of byChat) {
-      const first = items[0];
-      const late = now - first.at;
-      const at = new Date(first.at).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, hour: '2-digit', minute: '2-digit' });
       // 一次只合并"能完整写进 note"的条目：note 在 #wake 里被 safeSlice(…, 600) 截断，
       // 而下面会对合并进来的每一条 markFired。无限合并（单条正文 200 字 × 每会话最多 10 条）
       // 会让第 4 条起的内容被截掉却照样标记已触发 —— 内容永久丢失（2026-09-29 审查 P1）。
       // 第一条无论如何都进（否则会永远卡在同一条上）；放不下的留到下一轮 tick 继续。
+      // 预算口径在 reminderNoteCost（正文 + 归属名 + 引号/分隔开销），与 note 截断同一口径。
       const chosen = [];
       let bodyChars = 0;
       for (const item of items) {
-        const cost = String(item.text || '').length + 4;
+        const cost = reminderNoteCost(item);
         if (chosen.length && bodyChars + cost > REMINDER_NOTE_BODY_MAX) break;
         chosen.push(item);
         bodyChars += cost;
       }
-      // 不再自称（createdBy 是机器人自己的名字，写成"小鲸鱼之前让你…"很怪）
-      const body = chosen.length === 1
-        ? `之前有人让你在 ${at} 提醒：${chosen[0].text}`
-        : `到点了，要提醒的事有 ${chosen.length} 件：${chosen.map((x) => `「${x.text}」`).join('、')}`;
-      const note = `【定时提醒】${body}`
-        + `${late > 3 * 60000 ? '（已经迟到了一点，顺口说明下）' : ''}。现在自然地把这些说出来（一两句，别说"系统提醒"）。`;
+      // 派发话术的唯一真源在 reminders.buildReminderNote（含"谁提的/提醒谁"的归属）
+      const note = buildReminderNote(chosen, { now });
       // **直接唤醒**，不走 scheduledWakes：那是"每会话单槽"，两批提醒只要落在相邻 tick
       // （30 秒一轮）就会互相顶掉——先被顶掉的那批已经标记 fired，内容永久丢失。
       // 2026-09-28 服务器实测：相隔 5 秒的两条提醒，第一条"喝水"从未发出。
@@ -2106,21 +2919,98 @@ export class Orchestrator {
       // 留在 due() 里 30 秒后再试 —— 否则提醒被标成已发却永远没人说（2026-09-29 审查 P1）。
       // 最后那条租约闸门对应 #wake 里 claimUnread 取不到租约的静默 return：
       // 硬崩溃（kill -9/OOM）会留下 runs.state='leased' 的残行，recoverExpired 最多 5 秒后回收。
+      const budgetDrop = this.#budgetWouldDrop(chatKey);
       const dispatchable = !this.#wakeBlockedNow(chatKey)
-        && !this.store.hasLeasedRun(chatKey);
-      if (!dispatchable) continue;
+        && !this.store.hasLeasedRun(chatKey)
+        && !budgetDrop;
+      if (!dispatchable) {
+        // ⚠️ 只有"预算会丢"这一类才顺延（瞬时的在跑/断线不值得动到点时间）：
+        // 上面注释说"明天预算重置后自然补发"，但 reminders 的 expired() 对迟到满
+        // 12 小时的条目会静默作废 —— 持续超预算一整天，到点的提醒照样丢。
+        // 显式把到点时间顺延 24 小时（作废窗口 12 小时 → 充分错开），
+        // deferTo 只改 at、不动 status，作废时钟随新 at 重新起算（2026-10-04 复审 P2）。
+        if (budgetDrop) {
+          const later = Date.now() + 24 * 60 * 60 * 1000;
+          for (const it of chosen) this.reminders.deferTo(it.id, later);
+          log.info(`[reminder] 预算超限，${chosen.length} 条顺延 24 小时后补发`);
+        }
+        continue;
+      }
+      const dispatchedAt = Date.now();
+      // 只把**本次唤醒新产生**的 unknown 当成本轮结果不确定：历史遗留的 unknown/sending
+      // （上次硬崩溃、别的 run 的残行）不该让每条提醒一上来就放弃重试。
+      const unknownBefore = new Set(this.store.listUnknownOperations(chatKey).map((op) => op.id));
+      for (const it of chosen) this.#remindersInFlight.add(it.id);
       this.wake(chatKey, { manual: true, paced: true, wakeNote: note })
-        .catch((error) => log.error('[reminder] 唤醒出错:', error?.message ?? error));
-      for (const it of chosen) this.reminders.markFired(it.id, now);
+        .then(() => {
+          // #wake 不会因为模型请求失败而 reject；用"本轮之后有没有自己的消息落库"
+          // 判断提醒是否真的播报出去。没播报就顺延 5 分钟重试，别直接 markFired
+          //（模型网关故障时提醒会永久丢失，2026-10-20 审查）。
+          const delivered = this.store.hasSelfSince(chatKey, dispatchedAt);
+          if (delivered) {
+            for (const it of chosen) this.reminders.markFired(it.id, now);
+            log.info(`[reminder] 已播报 ${chosen.length} 条：${chatKey} ${chosen.map((x) => String(x.text)).join(' / ')}`);
+            return;
+          }
+          // 发送结果不确定（outbox unknown）时绝不自动重试：换一轮 lease 后
+          // 原来的 hasUncertainEffects 看不到这批副作用，重说一遍就会重复提醒。
+          const uncertain = this.store.listUnknownOperations(chatKey)
+            .some((op) => !unknownBefore.has(op.id));
+          if (uncertain) {
+            for (const it of chosen) this.reminders.failDelivery(it.id, '发送结果未知，已停止自动重试，请人工核对');
+            log.error(`[reminder] 有未确认的外发，${chosen.length} 条提醒停止自动重试：${chatKey}`);
+            return;
+          }
+          const later = Date.now() + 5 * 60 * 1000;
+          let exhausted = 0;
+          for (const it of chosen) {
+            const retry = this.reminders.retryLater(it.id, later, { maxAttempts: 3 });
+            if (retry.exhausted) exhausted += 1;
+          }
+          if (exhausted) {
+            const retried = chosen.length - exhausted;
+            log.error(`[reminder] ${exhausted} 条连续未确认播报，已停止自动重试`
+              + (retried ? `；另外 ${retried} 条 5 分钟后重试` : '') + `：${chatKey}`);
+          } else {
+            log.warn(`[reminder] 本轮未检测到发送，${chosen.length} 条 5 分钟后重试：${chatKey}`);
+          }
+        })
+        .catch((error) => {
+          const later = Date.now() + 5 * 60 * 1000;
+          let exhausted = 0;
+          for (const it of chosen) {
+            const retry = this.reminders.retryLater(it.id, later, { maxAttempts: 3 });
+            if (retry.exhausted) exhausted += 1;
+          }
+          const retried = chosen.length - exhausted;
+          log.error(`[reminder] 唤醒出错，`
+            + (exhausted ? `${exhausted} 条已停止重试` : '')
+            + (exhausted && retried ? '，' : '')
+            + (retried ? `${retried} 条 5 分钟后重试` : '')
+            + ':', error?.message ?? error);
+        })
+        .finally(() => {
+          for (const it of chosen) this.#remindersInFlight.delete(it.id);
+        });
       const deferred = items.length - chosen.length;
-      log.info(`[reminder] 到点派发 ${chosen.length} 条：${chatKey} ${chosen.map((x) => String(x.text).slice(0, 20)).join(' / ')}`
+      // 全文进日志（单条正文 ≤200 字）：先记下派发内容，播报结果在 then/catch 里补。
+      log.info(`[reminder] 到点派发 ${chosen.length} 条：${chatKey} ${chosen.map((x) => String(x.text)).join(' / ')}`
         + (deferred > 0 ? `（另有 ${deferred} 条本轮装不进提示词，30 秒后继续派发）` : ''));
     }
   }
 
   startProactiveLoop() {
     this.stopProactiveLoop();
-    const tick = async () => {
+    const epoch = ++this.proactiveEpoch;
+    const scopeLabel = (scope) => (scope === 'private' ? '私聊' : '群聊');
+    const schedule = (scope, delay) => {
+      if (epoch !== this.proactiveEpoch) return;   // 这一轮已被 stop/restart 作废
+      const timer = setTimeout(() => { tick(scope).catch(() => {}); }, delay);
+      timer.unref?.();
+      this.proactiveTimers.set(scope, timer);
+    };
+    const tick = async (scope) => {
+      if (epoch !== this.proactiveEpoch) return;   // stop/restart 后旧 tick 直接作废
       const cfg = getConfig();
       const nowTick = Date.now();
       const window = proactiveWindowState(cfg.proactive?.activeHours, nowTick);
@@ -2131,63 +3021,93 @@ export class Orchestrator {
           Math.max(120000, Number(cfg.proactive?.checkIntervalMaxMs) || 5400000)
         )
         : Math.max(60000, window.nextActiveAt - nowTick + 1000);
-      this.proactiveTimer = setTimeout(() => { tick().catch(() => {}); }, next);
+      schedule(scope, next);
       if (this.aborted || this.paused || cfg.proactive?.enabled !== true) return;
       if (!window.active) return;
-      // 距上次判定不足一个间隔（例如刚重启过）就跳过：重启不额外换来一次开话题的机会
+      const scopes = proactiveScopes(cfg);
+      if (scope === 'group' ? !scopes.groups : !scopes.private) return;
+      // 距该范围上次判定不足一个间隔就跳过：重启/另一个范围判定都不额外换来一次机会
       const minGapMs = Math.max(60000, Number(cfg.proactive?.checkIntervalMinMs) || 1800000);
-      if (nowTick - readProactiveLastAttempt() < minGapMs * 0.8) {
-        log.info('[proactive] 跳过：距上次判定不足一个间隔');
+      const attempts = readProactiveAttempts(PROACTIVE_STATE_FILE);
+      if (nowTick - attempts[scope] < minGapMs) {
+        log.info(`[proactive] 跳过（${scopeLabel(scope)}）：距上次判定不足一个间隔`);
         return;
       }
       if (this.proactiveSuppressions.size > 0) {
-        log.info('[proactive] 跳过：有后台任务在跑');
+        log.info(`[proactive] 跳过（${scopeLabel(scope)}）：有后台任务在跑`);
         return;
       }
       if (this.runningChats.size >= Math.max(1, Number(cfg.maxConcurrentRuns) || 2)) {
-        log.info('[proactive] 跳过：并发任务已满');
+        log.info(`[proactive] 跳过（${scopeLabel(scope)}）：并发任务已满`);
         return;
       }
-      if (Math.random() > proactiveProbability(cfg.proactive?.probability)) {
-        log.info('[proactive] 跳过：这次摇到了不发言');
-        // 摇了不发言也算把这一轮用掉
-        writeProactiveLastAttempt(nowTick);
+      if (cfg.proactive?.scopeMode === 'perChat') {
+        // perChat：每个群/私聊各自判定；概率仍按会话独立掷，但每轮最多开 maxPerTick 个，
+        // 避免几十个群同时命中造成刷屏。
+        const candidates = this.#proactiveCandidates(cfg, scope);
+        if (!candidates.length) {
+          log.info(`[proactive] 跳过（${scopeLabel(scope)}）：没有安静下来的会话，45 分钟后再看`);
+          clearTimeout(this.proactiveTimers.get(scope));
+          schedule(scope, 45 * 60 * 1000);
+          return;
+        }
+        const state = readProactiveState(PROACTIVE_STATE_FILE);
+        const minGapMs = Math.max(60000, Number(cfg.proactive?.checkIntervalMinMs) || 1800000);
+        const maxPerTick = Math.max(1, Math.min(10, Number(cfg.proactive?.perChatMaxPerTick) || 2));
+        const chance = proactiveProbability(cfg.proactive?.probability);
+        let sent = 0;
+        const touched = [];
+        for (const chatKey of candidates) {
+          if (sent >= maxPerTick) break;
+          if (nowTick - Number(state.chats[chatKey] || 0) < minGapMs) continue;
+          touched.push(chatKey);
+          if (this.random() > chance) continue;
+          if (this.runningChats.size >= Math.max(1, Number(cfg.maxConcurrentRuns) || 2)) break;
+          sent += 1;
+          log.info(`[proactive] 主动开话题（${scopeLabel(scope)}·独立） → ${chatKey}`);
+          this.wake(chatKey, { proactive: true }).catch((error) => log.error('[orchestrator] proactive 出错:', error));
+        }
+        // 一轮只落盘一次：群多时不要为每个候选读/写整份状态文件。
+        writeProactiveChatAttempts(PROACTIVE_STATE_FILE, touched, nowTick);
+        if (!sent) log.info(`[proactive] 跳过（${scopeLabel(scope)}）：本轮独立判定没有命中`);
         return;
       }
-      // 挑一个"安静且允许"的群
-      const candidates = this.#proactiveCandidates(cfg);
+      if (this.random() > proactiveProbability(cfg.proactive?.probability)) {
+        // 摇了不发言也算把这个范围这一轮用掉；另一个范围的机会不受影响
+        log.info(`[proactive] 跳过（${scopeLabel(scope)}）：这次摇到了不发言`);
+        writeProactiveAttempt(PROACTIVE_STATE_FILE, scope, nowTick);
+        return;
+      }
+      // 只在该范围里挑一个"安静且允许"的会话
+      const candidates = this.#proactiveCandidates(cfg, scope);
       if (!candidates.length) {
-        // 群里正热闹、或都在忙：这不算消耗，45 分钟后再看，别白瞎一个间隔
-        log.info('[proactive] 跳过：没有安静下来的群，45 分钟后再看');
-        clearTimeout(this.proactiveTimer);
-        this.proactiveTimer = setTimeout(() => { tick().catch(() => {}); }, 45 * 60 * 1000);
+        // 选中的会话都正热闹、或都在忙：这不算消耗，45 分钟后再看，别白瞎一个间隔
+        log.info(`[proactive] 跳过（${scopeLabel(scope)}）：没有安静下来的会话，45 分钟后再看`);
+        clearTimeout(this.proactiveTimers.get(scope));
+        schedule(scope, 45 * 60 * 1000);
         return;
       }
-      // 真要开口了，才把这一轮用掉（本间隔内不再判定）
-      writeProactiveLastAttempt(nowTick);
-      const chatKey = candidates[Math.floor(Math.random() * candidates.length)];
-      log.info('[proactive] 主动开话题 → ' + chatKey);
+      // 真要开口了，才把该范围这一轮用掉（另一个范围仍有自己的机会）
+      writeProactiveAttempt(PROACTIVE_STATE_FILE, scope, nowTick);
+      const chatKey = candidates[Math.floor(this.random() * candidates.length)];
+      log.info(`[proactive] 主动开话题（${scopeLabel(scope)}） → ${chatKey}`);
       this.wake(chatKey, { proactive: true }).catch((error) => log.error('[orchestrator] proactive 出错:', error));
     };
-    this.proactiveTimer = setTimeout(() => { tick().catch(() => {}); }, 15000);
+    const scopes = proactiveScopes(getConfig());
+    // 两个范围错开启动，避免重启/保存配置后同一秒同时判定、同时开口。
+    if (scopes.groups) schedule('group', 15000);
+    if (scopes.private) schedule('private', 45000);
   }
 
-  #proactiveCandidates(cfg) {
-    const idleMs = Math.max(300000, Number(cfg.proactive?.idleThresholdMs) || 1800000);
-    const allowGroups = (cfg.allow?.groups ?? []).map(String);
-    const out = [];
-    for (const chatKey of this.store.listChats()) {
-      const [kind, id] = chatKey.split(':');
-      if (kind !== 'group') continue;
-      if (!canRun(chatKey)) continue;
-      if (allowGroups.length > 0 ? !allowGroups.includes(id) : !cfg.allowAllWhenEmpty) continue;
-      const meta = this.store.getChatMeta(chatKey);
-      if (meta.unread > 0) continue;
-      if (Date.now() - meta.lastTs < idleMs) continue;
-      if (this.runningChats.has(chatKey)) continue;
-      out.push(chatKey);
-    }
-    return out;
+  #proactiveCandidates(cfg, scope) {
+    const prefix = scope === 'private' ? 'private:' : 'group:';
+    return proactiveCandidates({
+      chatKeys: this.store.listChats().filter((key) => String(key).startsWith(prefix)),
+      cfg,
+      metaOf: (chatKey) => this.store.getChatMeta(chatKey),
+      canWake: (chatKey) => canRun(chatKey),
+      isRunning: (chatKey) => this.runningChats.has(chatKey)
+    });
   }
 
   // ── 群友印象自动整理 ──
@@ -2210,6 +3130,10 @@ export class Orchestrator {
       if (!canRun(chatKey)) return;
       if (cfg.memory?.consolidateEnabled === false) return;
       if (this.paused || this.aborted) return;
+      // 整理是后台付费模型调用，不是"回 @ 的那一句"；当日预算用尽后也要停，
+      // 否则 block/degrade 只是挡住了聊天，整理仍会继续花钱（2026-10-20 审查）。
+      const budget = budgetStatus(cfg, this.sessions?.todayUsage?.(todayKey()) || {});
+      if (budget.enabled && budget.exceeded) return;
       if (!cfg.api?.model || !cfg.api?.baseUrl) return;   // 没选模型就不整理
       if (this.consolidating.has(chatKey)) return;
       const st = this.memory.consolidationState(chatKey);
@@ -2271,19 +3195,47 @@ export class Orchestrator {
       : null;
 
     const stats = this.#scanChatActivity(chatKey);
-    const existing = this.memory.members(chatKey);
+    const vis = memoryVisibilityOf(cfg);
+    // 只要这个人的任何一条印象在当前会话不可见（私聊来源/perChat），就跳过整理：
+    // 整理模型看到的是全量印象、写回也会整份替换，混着整理会把不可见内容带进群或删掉。
+    const invisibleMembers = [];
+    const existing = this.memory.members(chatKey).filter((member) => {
+      const impressions = Array.isArray(member.impressions) ? member.impressions : [];
+      if (visibleImpressions(impressions, chatKey, vis).length === impressions.length) return true;
+      invisibleMembers.push(member);
+      return false;
+    });
+    // 被可见性排除不等于没有记忆，不能在指定目标或发现新人时重新纳入。
+    const invisibleUserIds = new Set(invisibleMembers.map((member) => String(member.userId || '')));
 
     // ── 选出要整理的人 ──
     const targets = [];
-    const skipped = [];
+    const skipped = invisibleMembers
+      .filter((member) => !only || only.has(String(member.userId || '')))
+      .map((member) => ({
+        userId: member.userId,
+        name: member.name,
+        reason: '存在当前会话不可见的印象，跳过整理'
+      }));
+    const skippedUserIds = new Set(skipped.map((item) => String(item.userId || '')));
+    // 名字反查可能把一条"可见的遗留名字记录"指到已经进 invisibleUserIds 的 QQ 号上：
+    // 这种目标同样不能整理，否则 #resolveIdentity 会把该人的隐藏来源印象一并读出来。
+    const skipInvisible = (member) => {
+      const uid = String(member.userId || '');
+      if (skippedUserIds.has(uid)) return;
+      skippedUserIds.add(uid);
+      skipped.push({ userId: member.userId, name: member.name, reason: '存在当前会话不可见的印象，跳过整理' });
+    };
 
     // 指定群友但记忆里还没有 → 也要能"新建"印象（这是本功能的关键价值：
     // 聊了 200 条却零印象的人，可以手动让他被分析一次）
     if (only) {
       for (const uid of only) {
+        if (invisibleUserIds.has(uid)) continue;
         const found = existing.find((m) => String(m.userId || '') === uid);
         if (found) {
           const resolved = this.#resolveIdentity(chatKey, found, stats, notes);
+          if (invisibleUserIds.has(String(resolved.userId || ''))) { skipInvisible(resolved); continue; }
           targets.push({ ...resolved, isNew: false });
           continue;
         }
@@ -2302,13 +3254,14 @@ export class Orchestrator {
       }
     } else {
       // 先整理记忆里已有的人
-      const knownUserIds = new Set();
+      const knownUserIds = new Set(invisibleUserIds);
       // 反查之后，同一个人的两条记录（"只有名字的遗留条目" + 本人的记录）会指向同一个 QQ 号：
       // 必须并成一条再送给模型 —— 分开整理的话，后写回的那条会把前一条的并集结果覆盖掉。
       const targetByUid = new Map();
       for (const mem of existing) {
         const resolved = this.#resolveIdentity(chatKey, mem, stats, notes);
         const uid = String(resolved.userId || '');
+        if (uid && invisibleUserIds.has(uid)) { skipInvisible(resolved); continue; }
         if (uid) knownUserIds.add(uid);
         if (this.#shouldSkip(resolved, force)) {
           skipped.push({
@@ -2412,7 +3365,8 @@ export class Orchestrator {
     const nameToUserId = new Map();
     const nameToUids = new Map();   // 名字 → 出现过的 QQ 号集合：nameToUserId 是"先见到先赢"，看不出重名
     const uidToName = new Map();
-    for (const m of this.store.recent(chatKey, { limit: 2000 })) {
+    // 与提示词/工具结果同一口径：屏蔽名单生效前存档的消息也不能作为整理材料。
+    for (const m of filterBlockedHistory(this.store.recent(chatKey, { limit: 2000 }), chatKey)) {
       if (m.self || !m.senderId) continue;
       const uid = String(m.senderId);
       memberMsgCount.set(uid, (memberMsgCount.get(uid) || 0) + 1);
@@ -2556,13 +3510,73 @@ export class Orchestrator {
       return null;
     }
 
+    // 整理期间控制台可能改了记忆：写回前必须重读当前值，不能拿 await 之前的快照写回。
+    // 这样"整理中途删掉/改掉手工条目"不会被旧快照复活（复审 P2）。
+    const snapshotTexts = new Set(existing.map((e) => String(e?.content ?? '').trim()));
+    const currentRow = (this.memory.members(chatKey) || [])
+      .find((m) => String(m?.userId || '') === String(mem.userId || ''));
+    const currentImpressions = currentRow?.impressions || existing;
+    // 控制台手写的（origin=manual）条目是用户的明确输入，模型无权改写/删除。
+    // 不依赖模型"听话"：写回前强制把**当前**手工条目并进结果，且不占模型输出的配额。
+    // replace 对正文逐字相同的条目会沿用旧 origin，所以 manual 来源不会丢（issue #55）。
+    const manualContents = [...new Set(currentImpressions
+      .filter((e) => String(e?.origin || '') === 'manual')
+      .map((e) => String(e?.content ?? '').trim())
+      .filter(Boolean))];
+    // 存储层单次 replace 上限跟 memory.maxImpressionsPerPerson（默认 50）走；
+    // 手工条目已经占满时无法再塞自动条目，宁可跳过本轮整理，也不能让 replace 把用户写的尾部静默截掉（复审 P2）。
+    const manualLimit = Math.max(5, Math.min(200, Math.round(Number(getConfig().memory?.maxImpressionsPerPerson) || 50)));
+    if (manualContents.length >= manualLimit) {
+      log.warn(`[memory] 整理 ${chatKey}/${mem.userId} 跳过：手工印象已有 ${manualContents.length} 条（存储上限 ${manualLimit}），先人工清理再整理`);
+      return null;
+    }
+    // 模型有时会把整理前看到的 "（记于 …）" 尾注一起抄回来；不归一化就会在手工条目旁边
+    // 多出一条"内容相同但来源是 consolidated"的副本（issue #55 的第 4 条）。
+    const impressionKey = (text) => String(text ?? '')
+      .replace(/（记于[^）]*）\s*$/, '')
+      .replace(/\(记于[^)]*\)\s*$/, '')
+      .trim();
+    const manualKeys = new Set(manualContents.map(impressionKey));
+    // 整理期间被删/改掉的手工条目：模型可能把旧正文抄回来，按旧 key 一并挡掉，避免复活。
+    const staleManualKeys = new Set(existing
+      .filter((e) => String(e?.origin || '') === 'manual')
+      .map((e) => impressionKey(String(e?.content ?? '').trim()))
+      .filter((key) => key && !manualKeys.has(key)));
+    const blockedManualKeys = new Set([...manualKeys, ...staleManualKeys]);
     const clean = raw
       .map((s) => String(s ?? '').trim())
       .filter(Boolean)
+      .filter((content) => !blockedManualKeys.has(impressionKey(content)))
       .slice(0, maxKeep)
       .map((content) => safeSlice(content, 120));
 
-    return this.memory.replaceMember(chatKey, mem.userId, mem.name, clean);
+    // ⚠️ 整理期间的 `memory_append` 不能被这次写回整表覆盖（2026-10-04 全面复审 P2 实测：
+    // 快照是上面 await 之前取的，模型跑完这一分钟里新写进去的印象会被 replaceMember 静默抹掉）。
+    // 写回前重读一次当前值，把「快照里没有、现在有」的条目并回去；模型对已有条目的
+    // 增删改照旧生效（那正是整理要做的事），只补它看不见的那部分。
+    const appendedDuring = currentImpressions
+      .map((e) => String(e?.content ?? '').trim())
+      .filter((t) => t && !snapshotTexts.has(t) && !blockedManualKeys.has(impressionKey(t)));
+    // 配额顺序：手工条目 > 整理期间新增 > 模型输出。手工条目超过 maxKeep 时也全保留
+    // （用户明确写下的内容比"每人最多 5 条"的软上限优先；存储层上限见 memory.maxImpressionsPerPerson）。
+    const fixed = [...manualContents];
+    let mergedCount = 0;
+    for (const text of appendedDuring) {
+      if (fixed.length >= maxKeep) break;
+      if (fixed.includes(text)) continue;
+      fixed.push(safeSlice(text, 120));
+      mergedCount += 1;
+    }
+    const room = Math.max(0, maxKeep - fixed.length);
+    const merged = [...fixed, ...clean.slice(0, room)];
+    if (mergedCount) {
+      log.info(`[memory] 整理 ${chatKey}/${mem.userId}：并回整理期间新增的 ${mergedCount} 条印象`);
+    }
+    if (manualContents.length) {
+      log.info(`[memory] 整理 ${chatKey}/${mem.userId}：保留 ${manualContents.length} 条手工印象`);
+    }
+
+    return this.memory.replaceMember(chatKey, mem.userId, mem.name, merged);
   }
 
   /** 整理模式：合并/删减已有印象。 */
@@ -2587,12 +3601,22 @@ export class Orchestrator {
     const isOwner = Boolean(ownerUin) && ownerUin === String(mem.userId || '').trim();
     // 要算"90 天前"就得知道今天，整理这次调用看不到别的时间来源
     const today = todayKey();
-    const lines = [`群友 QQ：${mem.userId}`, `当前名字：${mem.name}`, `今天：${today}（Asia/Shanghai）`];
+    const lines = [`群友 QQ：${sanitizeUserText(String(mem.userId || ''))}`, `当前名字：${sanitizeUserText(String(mem.name || ''))}`, `今天：${today}（Asia/Shanghai）`];
     if (isOwner) lines.push('身份：这是机器人管理员本人（设置角色卡、管这台机器人的人）');
-    for (const e of mem.impressions) {
+    const manual = (mem.impressions || []).filter((e) => String(e?.origin || '') === 'manual');
+    const automatic = (mem.impressions || []).filter((e) => String(e?.origin || '') !== 'manual');
+    const pushEntry = (e) => {
       const created = clampTs(e.createdAt);
       const observed = clampTs(e.lastObservedAt);
-      lines.push(`- ${e.content}（记于 ${fmtTs(created)}${observed && observed !== created ? `，最近观察到 ${fmtTs(observed)}` : ''}）`);
+      lines.push(`- ${sanitizeUserText(e.content)}（记于 ${fmtTs(created)}${observed && observed !== created ? `，最近观察到 ${fmtTs(observed)}` : ''}）`);
+    };
+    if (manual.length) {
+      lines.push('', '【手工印象：用户亲自写的，必须原样逐字保留，不得改写、合并或删除】');
+      manual.forEach(pushEntry);
+    }
+    if (automatic.length) {
+      lines.push('', '【自动积累的印象：可以按下面的规则合并、改写或删除】');
+      automatic.forEach(pushEntry);
     }
     const maxKeep = Number(cfg.memory?.maxImpressionsPerMember) || 5;
     return {
@@ -2607,6 +3631,7 @@ export class Orchestrator {
         '6. 只写可观察的事实与偏好（爱聊什么、什么口气、玩什么梗、有哪些雷点），不写评价、不揣测动机：',
         '   写"会反复问人设、爱逗人表演"，不要写"想掌控设定""扬言改人设""喜欢试探规则"这类带立场的说法。',
         '7. 如果写的是管理员本人：他改人设、问人设、逗你玩都是本职，不是"试探"或"施压"，照事实记就行。',
+        '8. 【手工印象】段里的每一条都必须原样逐字出现在输出里：不得改写、合并、删除，也不受第 1-7 条约束；输出时只写正文，不要带段标题。',
         '原则：所有信息只能来自原文，语义不变，宁少勿错；没有可保留的时输出空数组。',
         '',
         ...lines
@@ -2618,7 +3643,7 @@ export class Orchestrator {
   #buildNewImpressionPrompt(chatKey, mem) {
     const maxKeep = Number(getConfig().memory?.maxImpressionsPerMember) || 5;
     const uid = String(mem.userId || '');
-    const sample = (this.store.recent(chatKey, { limit: 2000 }) || [])
+    const sample = filterBlockedHistory(this.store.recent(chatKey, { limit: 2000 }), chatKey)
       .filter((m) => !m.self && String(m.senderId) === uid)
       .slice(-40)
       .map((m) => safeSlice(String(m.text || ''), 200))
@@ -2651,23 +3676,39 @@ export class Orchestrator {
     const mem = cfg.memory || {};
     if (mem.useChatModel !== false) {
       // 记忆整理 = 判断/总结类任务（与聊天、写作可各自设思考档位）。
-      return chatCompletion({ messages, temperature: 0.2, purpose: 'judge' });
-    }    const providers = currentProviders();
+      const response = await chatCompletion({ messages, temperature: 0.2, purpose: 'judge' });
+      this.#recordExternalUsage(response);
+      return response;
+    }
+    const providers = currentProviders();
     const p = providers.find((x) => x.id === mem.provider);
     if (!p?.baseURL || !p?.apiKey || !mem.model) {
       throw new Error('记忆整理专用模型未配置：请在设置 → 记忆里选择提供商与模型');
     }
-    return chatCompletion({
+    const response = await chatCompletion({
       messages,
       temperature: 0.2,
       purpose: 'judge',
       overrides: { baseUrl: p.baseURL, apiKey: p.apiKey, model: mem.model, timeoutMs: 180000 }
     });
+    this.#recordExternalUsage(response, mem.model);
+    return response;
+  }
+
+  /** 非会话模型调用（记忆整理）计入今日台账：此前整条链路对用量完全透明（2026-10-07 复审 P3）。 */
+  #recordExternalUsage(response, model = '') {
+    try {
+      const usage = emptyUsage();
+      addUsage(usage, response?.usage);
+      usage.calls = 1;
+      this.sessions?.recordExternalUsage?.(usage, { model: model || response?.model || '' });
+    } catch { /* 记账失败不影响主流程 */ }
   }
 
   stopProactiveLoop() {
-    clearTimeout(this.proactiveTimer);
-    this.proactiveTimer = null;
+    this.proactiveEpoch = (this.proactiveEpoch || 0) + 1;
+    for (const timer of this.proactiveTimers.values()) clearTimeout(timer);
+    this.proactiveTimers.clear();
   }
 
   // ── 控制接口 ───────────────────────────────────────────────────────────
@@ -2693,6 +3734,13 @@ export class Orchestrator {
     for (const sessionId of this.pendingSessions.values()) this.#finishWaiting(sessionId, 'aborted');
     this.pendingSessions.clear();
     this.stopProactiveLoop();
+    // 提醒循环与自安排唤醒 ticker 也是常驻 interval：不停掉的话 abortAll 之后它们还在跑
+    //（测试里表现为进程被定时器吊着、状态被悄悄推进；2026-10-12 审查）。
+    this.stopReminderLoop();
+    if (this.scheduledWakeTicker) clearInterval(this.scheduledWakeTicker);
+    this.scheduledWakeTicker = null;
+    for (const item of this.scheduledWakes.values()) item?.timer && clearTimeout(item.timer);
+    this.scheduledWakes.clear();
     await Promise.allSettled([...this.runTasks]);
   }
 

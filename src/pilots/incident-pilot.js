@@ -98,8 +98,30 @@ function normalizedSeverity(value) {
   return Object.hasOwn(SEVERITY_ORDER, value) ? value : 'error';
 }
 
+/**
+ * 错误消息 + cause 链。undici 一类网络库的外层 message 恒为 "fetch failed"，真因嵌在
+ * error.cause 里 —— 落库只存外层的话，面板上永远只剩一句无法定位的 "fetch failed"
+ *（Issue #21 实测：报告者能看到异常却看不到 ECONNRESET，排查被卡死在第一步）。
+ * 这里最多解 3 层 cause 拼在后面，每层与外层走同一套 redactText 脱敏。
+ */
+function errorMessageWithCauses(error) {
+  const base = cleanText(error?.message ?? error ?? '未知异常');
+  const causes = [];
+  let cursor = error && typeof error === 'object' ? error.cause : null;
+  for (let hop = 0; cursor != null && hop < 3; hop += 1) {
+    const text = cleanText(
+      String(cursor?.code ? `${cursor.code} ${cursor.message ?? ''}` : (cursor?.message ?? cursor))
+    ).trim();
+    if (text && text !== base && !causes.includes(text)) causes.push(text);
+    cursor = cursor && typeof cursor === 'object' ? cursor.cause : null;
+  }
+  return causes.length
+    ? `${base}（真因: ${causes.join(' ← ')}）`.slice(0, 2000)
+    : base;
+}
+
 function classifyError(error, context = {}) {
-  const message = cleanText(error?.message ?? error ?? '未知异常');
+  const message = errorMessageWithCauses(error);
   const outcome = String(context.outcome || error?.outcome || '');
   let severity = normalizedSeverity(context.severity);
   let category = cleanText(context.category || 'internal', 80);
@@ -223,13 +245,7 @@ export class IncidentPilotManager {
         version=version+1
       WHERE notify_state='sending'
     `).run();
-    const retentionDays = Math.min(
-      3650,
-      Math.max(1, Number(this.config()?.incidentPilot?.retentionDays) || 90)
-    );
-    this.db.prepare(`
-      DELETE FROM incidents WHERE state='resolved' AND resolved_at>0 AND resolved_at<?
-    `).run(this.now() - retentionDays * 86400000);
+    this.pruneResolvedIncidents();
     // 库文件（含 safe_message/chat_key 等内部数据）与 WAL/SHM 收敛到 0600。
     // 必须放在 exec(journal_mode=WAL) 之后：-wal/-shm 是这时才落盘的，放在
     // new DatabaseSync 紧后面会因文件不存在被静默跳过，落回 umask 0644。
@@ -239,6 +255,25 @@ export class IncidentPilotManager {
     this.lastError = '';
     this.resumeNotifications();
     return this.status();
+  }
+
+  /**
+   * 已了结事件的保留期清理：删掉 retentionDays 之前 resolved 的 incidents。
+   * 抽成方法（原来这段只在 start() 里内联跑一次）是为了让**常驻进程**也能周期调用 ——
+   * 服务不重启时那段 DELETE 永远不执行，表会无界增长（2026-10-09 复审）。
+   * 保留期继续按 incidentPilot.retentionDays 配置读，与原来完全一致。
+   */
+  pruneResolvedIncidents() {
+    if (!this.db) return;
+    const retentionDays = Math.min(
+      3650,
+      Math.max(1, Number(this.config()?.incidentPilot?.retentionDays) || 90)
+    );
+    try {
+      this.db.prepare(`
+        DELETE FROM incidents WHERE state='resolved' AND resolved_at>0 AND resolved_at<?
+      `).run(this.now() - retentionDays * 86400000);
+    } catch { /* 清理失败不影响运行 */ }
   }
 
   openExisting() {

@@ -5,6 +5,57 @@
 
 ## 待修问题
 
+### 插件写操作在宿主硬崩时的一致性（2026-10-24 审查）
+
+批准与配额在调用插件**之前**消费；`kill -9` 落在消费与结算之间时，退款收据只在内存里，重启后
+无法退还，也不会留下写审计（与"超时已改为不退款"方向相反，但同样是确定的错账）。
+另外两处相关缺口：60 秒写间隔 `lastWriteAt` 是内存态，重启清零；`approvePendingApproval`
+先从待批队列移除再写通行证，两步之间崩溃会让管理员的批准静默丢失。
+修法方向：调用前把在途写（插件/动作/目标/当天/收据）持久化成 journal，启动时把未结算记为
+`unknown`（保守策略：不自动退款）；审批改为先写通行证再出队；写地板落盘。
+
+### `read` 的语音转写可能超过工具超时（2026-10-24 审查）
+
+`bilibili.read` 声明 `timeoutMs: 300000`（5 分钟），但宿主 ASR 允许 ffmpeg 15 分钟、默认允许
+20 分钟视频走转写。无字幕的长视频遇上慢 ASR 时，会在转写中途被宿主判超时，结果被丢弃。
+修法方向：把媒体类工具的超时上限放宽（manifest 目前最大 300 秒）并与 ASR 上限对齐，
+或按视频时长分段转写、每段独立超时。
+
+### 提醒的播报确认是"该会话有没有新自述"，不是"这条提醒有没有发出去"（2026-10-20 审查）
+
+`reminders` 派发后，`orchestrator` 用 `store.hasSelfSince(chatKey, dispatchedAt)` 判断是否播报成功：
+只要这次唤醒期间机器人在该会话发出**任意一条**消息（哪怕是在回复别的群友），就按已播报处理。
+风险是模型收到了提醒备注却没提这件事、只在回答别的消息 —— 提醒被标记 fired，不会重试。
+反方向（改为校验提醒正文）会被模型改写措辞误判成未发送 → 重复提醒，因此当前保留宽松判据；
+真要做准，需要让 `send_message` 把"本次运行携带了哪条 reminder"记进 outbox 并按 run 核对。
+失败路径已有保护：发送结果 unknown 时不自动重试、连续多次未确认（最多 4 次尝试）即停止并记日志。
+
+### 只读挂载的数据目录无法用在线 backup API 备份（2026-10-21 复查记录）
+
+`manage.sh backup` 对所有 `*.sqlite` 走 SQLite 在线备份。SQLite 3.22+ 在"文件可读、目录不可写"
+时要求 WAL 库存在可读的 `-shm`，否则打开失败；把数据盘 `mount -o ro` 后做灾难恢复备份时，
+若库已 checkpoint 且 `-shm/-wal` 不存在，这一步会失败（旧实现对其他库是 `cpSync`，这种场景能拷）。
+正常可写数据目录不受影响。需要只读备份时，先确认 `-wal` 为空或临时以可写方式挂载再备份。
+
+### 协议端一键更新不走镜像兜底（2026-10-13 登记）
+
+`deploy-all.sh` 拉镜像已有内置公共加速站兜底（`docs/LINUX.md`），但**控制台「一键更新协议端」
+与「随智能体版本对齐」**走的是 `src/core/snowluma-update.js`：它只把 `snowluma/.env` 的
+`SNOWLUMA_IMAGE` 改成目标 tag 再 `compose pull`，没有镜像站回退 —— 国内/受限网络直连
+Docker Hub 失败时，这条更新路径仍会报拉取失败（首次全栈安装不受影响）。临时办法：先把
+`snowluma/.env` 里的 `SNOWLUMA_IMAGE` 改成带可信镜像前缀的引用
+（如 `<mirror>/motricseven7/snowluma:<tag>`，重启容器后生效），再点控制台更新。根因修法
+（把部署脚本的兜底列表接进 `snowluma-update`）留下一批。
+
+### 主动运行期间的「核对」会清掉在途 outbox 证据（2026-10-13 审查，窄竞态）
+
+`store.resolveHeld` 判断"哪些 run 还活跃"只看 `runs` 表；**主动唤醒没有 runs 行**
+（`session.leaseId = lease?.id || session.id`，工具发送用 leaseId 当 runId）。于是管理员恰好
+在某会话的主动唤醒**正在运行**时点「核对」，会把该次在途的 `sending/unknown` 行一并清掉，
+`hasUncertainEffects(session.leaseId)` 的兜底不再触发 —— 一次结果未知的发送可能被当干净收尾
+（后续轮次理论上可重发）。触发需人工操作与运行同刻，影响面小。修法方向：把活跃主动会话的
+id 集合（`activeRuns` 的 sessionId）传入 store，清理时排除。留待下一批处理。
+
 ### 2026-09-22 全量审查确认、本轮不修的问题
 
 **5 秒兜底重试 ticker 不检查自主节奏（pacing）开关。** `orchestrator.js` 的 5 秒 ticker
@@ -15,7 +66,25 @@
 `initPriceFeed` 的关闭分支现在会 `setRemotePrices({})` 当场回落到内置表，
 磁盘缓存仍按设计保留，重新启用时先顶上。）
 
+### 直连协议端的写入工具不走发送队列的 outbox（2026-10-08 复审记录）
+
+`react_to_message` / `set_my_signature` / `set_my_status` / `set_remark` / `group_sign` /
+`set_group_todo` 这类**直接调用协议端**的写入工具不经过 `SendQueue` 的 `#deliver`，因此传输结果
+"不确定"（超时、5xx、连接重置）不会记进 outbox 的 `unknown`，工具循环的 `hasUncertainEffects`
+也看不到它们 —— `sender.js` 那套「不确定就不许重复」目前只覆盖走队列的文本/贴纸/语音/表情/
+戳一戳/文件/相册。
+
+后果：这类调用在超时后若被重试，理论上可能把同一个动作做两遍。影响有限 —— 它们大体幂等
+（重复贴一次表情、重复设一次签名，结果相同），且各自有 24h 闸门配额封顶。
+真要收口需要让这些工具也走发送队列（或明确"哪些动作允许不确定地重复"），涉及写路径重构，
+单独排期。
+
 ### 控制台 `?token=` 在所有已认证路由被接受（已知搁置项，2026-09-24 评估）
+
+**已修复（2026-10-06，见 v0.7.8 后的复审批次）**：`authorize()` 已把查询串令牌收窄到
+`/api/events`（EventSource 不能自定义请求头，是唯一有正当理由的消费方）；其余路由只认
+cookie 与 `x-console-token` 头，`src/ops.js` 的两处调用方也已改为传请求头。
+下面保留当初的评估记录备查。
 
 `docs/LINUX.md` 写的是"`?token=` 只有自动登录捷径接受"，实际 `authorize()` 对**所有** /api/*
 路由都接受查询串令牌（与 cookie、`x-console-token` 并列的第三条通道）。要收窄就得改
@@ -23,6 +92,19 @@
 缓解现状：控制台自动登录成功后会从地址栏剥掉明文令牌；控制台默认只监听本机/内网，且令牌本就是
 完全管理凭据（拿到它的人可以直接读明文 Key）。在修掉之前，**不要把带 `?token=` 的控制台链接
 发给不受信任的聊天对象或贴到公开场合**。
+
+- **非 Linux 平台拦不住插件网络**：Node 的权限模型覆盖 fs / child_process / worker / addons，但
+  **不覆盖网络**（`--allow-net` 在本机 v24 与生产 v22.23.2 上都是 `bad option`）。Linux 上用网络命名空间
+  （`unshare -n`）真正断网，默认开启；Windows / macOS 没有等价能力，控制台与巡检会明确标注
+  "网络未隔离"。在这些平台上，"插件读不到 config.json"成立，"插件不能外发"不成立 ——
+  `docs/PLUGINS.md` 的信任声明与控制台都如实写明，不假装拦住了。
+- **插件工具的 Token 开销取决于挂载方式**：默认 `plugins.toolMounting: "meta"`，每轮只常驻一个
+  `plugin_call`（工具清单在调用时展开），装多少个插件都不增加固定底；改成 `"direct"` 后每个插件工具
+  各占一条工具定义，装得多时上下文会明显变大。控制台能看到每个插件声明了多少工具，但不显示 token 影响。
+- **插件工具名含双下划线**：`<插件id>__<工具名>` —— 用双下划线而不是点号，是因为 OpenAI 的 function name
+  只允许 `[a-zA-Z0-9_-]`（点号会让严格校验的兼容端点整个请求 400）。若将来要换分隔符，属破坏性变更，
+  需按 `apiVersion` 升版本处理。
+
 
 ## 历史问题（已全部修复）
 
@@ -61,15 +143,16 @@ v0.6.0..v0.6.4 之间复审成本口径时记录的 6 项“不影响主链路�
 
 ## 环境相关（不属于项目问题）
 
-在 Windows 上执行 `npm run test:unit` 会有 43 个用例失败（2026-10-01 实测基线，仅 Windows 本机特有：
-docker/systemd/linux 集成类）；
-在 Linux 服务器与 CI（ubuntu-latest）上全量通过。判断"有没有新增失败"的办法：把 `✖` 用例名
-（去掉耗时）排序后与上一份日志做差集，失败集合逐条一致 = 零回归。
+**Windows 团队**：历史上 `npm run test:unit` 在 Windows 上会固定红 43 条（docker/systemd/linux 集成类）。
+2026-10 起改为：跨平台可修的断言直接修（PATH 分隔符、POSIX 权限位断言、句柄未释放时的清理重试），
+真正依赖 POSIX/Linux 的用例用 `test/helpers/platform.mjs` 显式 skip 并写明原因。
+`test/baseline-failures.json` 应为空；`npm run test:unit:win` 用 spec 报告与基线比对，
+**任何未预期失败都会红**，CI 有独立 `windows` job 守住这个口径。Linux 与 CI（ubuntu-latest）
+仍是全量通过的权威结论。
 
-`test/usage-e2e.mjs` 起的真服务用的是配置里的控制台端口（`app.start()` 不收参数，
-文件里那个 40995 不起作用），所以机器上已经跑着机器人时它会以 `EADDRINUSE` 退出 ——
-只有在本机没有实例占用该端口时才能跑。它不在更新器的部署前测试集里
-（那一集只跑 `test/*.test.mjs`），因此不影响「立即更新」。
+`test/usage-e2e.mjs` 已改用隔离端口（写进临时配置），机器上跑着机器人也不会 EADDRINUSE；
+自 2026-10-09 起它与另外三个回归脚本都在更新器的部署前预检里（`scripts/test-suite.mjs` 的
+regression 集），在部署机上执行 `npm test` 时也在其中。
 
 ## 主动好友候选功能已退役（2026-09-25）
 
@@ -127,3 +210,24 @@ docker/systemd/linux 集成类）；
 > 接管走 `.takeover` 互斥文件（互斥本身也带 5 分钟陈旧兜底）、拿到互斥后**再判一次**
 > 才删锁，errno 非 ESRCH 一律按"进程还在"处理（busy 按 0 退出，不会连累 `disableOnFailure`）。
 > 即：**"两个进程同时读改写同一个 json"未修，"两个 updater 同时部署"已加固**。
+
+## 2026-10-13 全项目审查：未修的几条（需产品口径 / 上游前提）
+
+- **反向代理部署下，`POST /api/config` 的 `server` 整节替换会把令牌清成空**（守卫只看"绑定是否回环"）。
+  需两个条件同时成立：持令牌者主动整节替换 + 反代不注入 `x-forwarded-for/x-real-ip/forwarded`；属"管理员
+  自伤"而非越权提升。最小改法：把守卫从"绑定非回环"改成"当前存在令牌就一律 409"。
+- **`get_group_profile` 的 honors 没有显式体积上限**：同一函数里 files/albums/notices/messages 都有截断。
+  上游 `get_group_honor_info` 各 list 通常自带上限，故未实测到爆量；换适配器时建议按字段截断。
+- **群游戏在观察/暂停、非活跃时段仍推进状态机**（`#tickOnce` 只看 `cfg.enabled`）：播报被 `assertCanSend`
+  挡下只记日志，恢复时局已悄悄结束，中间播报（天亮了/投票结果）永久丢失。修法是加 `canRun(chatKey)` 闸门；
+  **若产品口径是"暂停也继续推"，请把该行为写进文档**并让丢掉的播报可见，在此之前维持现状。
+- **`ops scan --strict` 的覆盖边界**：只覆盖"同行裸标识符调用"，`this.store.missingMethod()` 这类属性调用
+  不扫，且行首的裸调用会被误当成"定义"（见 `docs/OPS.md`）。
+- **好友管理页缺页内序号守卫**（`loadFriendFeaturePageImpl`）：该页无筛选/搜索状态，乱序到达通常覆盖成同
+  内容，可观测影响极小。
+- **部署脚本收尾段的 `"$USER"`**：`set -u` 下若环境未注入 `USER`，会在**部署成功之后**报 unbound variable
+  并被更新器记成失败；标准路径（systemd 用户服务）应已注入，未构造出复现。建议统一改成 `"$(id -un)"`。
+- **合并转发里的「聊天记录卡片」读不到**（2026-10-14 实测）：卡片是 `json` 段，SnowLuma 给它的
+  负载里**没有资源 id**（`resid` 之类），而 `get_forward_msg({ message_id })` 对这类记录返回空 —— 所以
+  只能看到卡片自带的标题摘要。代码已能识别 resid（上游一旦提供就自动展开），入站也留了一行诊断日志；
+  在协议端支持之前，被问到时应当照实说"卡片内容看不到"（提示词已写明这一点）。

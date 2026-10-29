@@ -43,7 +43,8 @@ function context(patch = {}) {
       chatKey: 'group:1',
       session: { id: 'session', leaseId: 'lease', sent: [], feedbacks: [] },
       sender: {
-        sendSticker: async (...args) => { sends.push(args); return { message_id: 7 }; }
+        sendSticker: async (...args) => { sends.push({ mode: 'sticker', args }); return { message_id: 7 }; },
+        sendImage: async (...args) => { sends.push({ mode: 'image', args }); return { message_id: 8 }; }
       },
       stickers: manager,
       store: { activeMembers: () => [], recent: () => [], findByMid: () => null },
@@ -54,7 +55,7 @@ function context(patch = {}) {
   };
 }
 
-test('端到端：拿到 b64_json → 真落库（addManual）→ send_sticker 能取到并发出 base64 内联', async () => {
+test('端到端：拿到 b64_json → 真落库（addManual）→ 自动发到当前会话', async () => {
   // 用真实的 fetch 桩替换全局 fetch：工具内部直接调 generateImage（默认 fetchFn=fetch）
   const realFetch = globalThis.fetch;
   const calls = [];
@@ -87,12 +88,36 @@ test('端到端：拿到 b64_json → 真落库（addManual）→ send_sticker �
     assert.ok(entry.localNote.includes('一只橘猫戴着草帽'), 'localNote 要记下提示词，便于 list_stickers 认');
     assert.ok(fs.existsSync(path.join(dataDir, entry.localFile)), '图片文件要真的落盘');
 
-    // ③ 发得出去：findForSend 走本地文件 → base64 内联（这条路径已有 P0 回归守卫）
+    // ③ 自动发送：不等模型再调 send_sticker（Issue #41）
+    assert.equal(saved.sent, true);
+    assert.equal(saved.messageId, 7);
+    assert.equal(f.sends.length, 1, '生成成功后必须已经发出去一次');
+    assert.equal(f.sends[0].mode, 'sticker', '默认仍按表情发送（旧行为不变）');
+    assert.equal(f.ctx.session.sent.length, 1, '会话记录里要有这条图片');
     const forSend = await f.manager.findForSend(saved.id);
     assert.ok(forSend?.url?.startsWith('base64://'), '有 localFile 的条目要能给 base64 内联地址');
-    const sent = await tool('send_sticker').execute(f.ctx, { stickerId: saved.id });
-    assert.equal(sent.isError, undefined, `发送失败：${sent.content}`);
-    assert.equal(f.sends.length, 1);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('generate_image 传 send:false 时只落库、不发消息', async () => {
+  resetImageQuotaForTest();
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify({ data: [{ b64_json: PNG.toString('base64') }] })
+  });
+  try {
+    const f = context();
+    const res = await tool('generate_image').execute(f.ctx, { prompt: '先存着', send: false });
+    assert.equal(res.isError, undefined, res.content);
+    const body = JSON.parse(res.content);
+    assert.equal(body.sent, false);
+    assert.ok(f.manager.entries.find((e) => e.id === body.id), '图片仍要进表情库');
+    assert.equal(f.sends.length, 0, 'send:false 不该发消息');
+    assert.equal(f.ctx.session.sent.length, 0);
   } finally {
     globalThis.fetch = realFetch;
   }
@@ -236,5 +261,58 @@ test('生成失败会把预扣的额度退回来（失败不白花额度）', as
   } finally {
     globalThis.fetch = realFetch;
     updateConfig({ imageGen: { enabled: true, model: 'gpt-image-1', baseUrl: '', maxPerHour: 1 } });
+  }
+});
+
+test('系统提示词不再教「生成后再调 send_sticker」（否则一次生图发两张）', () => {
+  const prompt = fs.readFileSync(path.resolve('src/llm/prompt.js'), 'utf8');
+  assert.doesNotMatch(prompt, /再用 send_sticker 发出去/);
+  assert.match(prompt, /生成后会自动发到当前会话/);
+});
+
+test('imageGen.sendAs=image 时生成图按普通图片发送（issue #67）', async () => {
+  resetImageQuotaForTest();
+  const { updateConfig } = await import('../src/core/config.js');
+  updateConfig({ imageGen: { sendAs: 'image', autoSend: true } });
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify({ data: [{ b64_json: PNG.toString('base64') }] })
+  });
+  try {
+    const f = context();
+    const res = await tool('generate_image').execute(f.ctx, { prompt: '发普通图片' });
+    assert.equal(res.isError, undefined, res.content);
+    assert.equal(f.sends.length, 1);
+    assert.equal(f.sends[0].mode, 'image', 'sendAs=image 必须走 sendImage，不能带表情标记');
+    assert.equal(f.ctx.session.sent[0].type, 'image');
+  } finally {
+    globalThis.fetch = realFetch;
+    updateConfig({ imageGen: { sendAs: 'sticker' } });
+  }
+});
+
+test('imageGen.autoSend=false 时只入库、不自动发送', async () => {
+  resetImageQuotaForTest();
+  const { updateConfig } = await import('../src/core/config.js');
+  updateConfig({ imageGen: { autoSend: false } });
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify({ data: [{ b64_json: PNG.toString('base64') }] })
+  });
+  try {
+    const f = context();
+    const res = await tool('generate_image').execute(f.ctx, { prompt: '只存不发' });
+    assert.equal(res.isError, undefined, res.content);
+    const body = JSON.parse(res.content);
+    assert.equal(body.sent, false);
+    assert.ok(f.manager.entries.find((e) => e.id === body.id));
+    assert.equal(f.sends.length, 0, '全局关闭自动发送后不该发消息');
+  } finally {
+    globalThis.fetch = realFetch;
+    updateConfig({ imageGen: { autoSend: true } });
   }
 });

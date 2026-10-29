@@ -163,4 +163,47 @@ describe('LLM client', () => {
     assert.equal(isRetryableError(new Error('HTTP 503')), true);
     assert.equal(isRetryableError(new Error('HTTP 400')), false);
   });
+  it('兜底地址换了主机却没配 api.fallback.apiKey：不切兜底（绝不把主渠道那把发过去）', async (t) => {
+    const original = globalThis.fetch;
+    t.after(() => { globalThis.fetch = original; });
+    const seen = [];
+    // 主渠道一律失败 → 才会走兜底那条路（否则断言根本走不到）
+    globalThis.fetch = async (url, request) => {
+      const href = String(url);
+      seen.push({ href, auth: String(request?.headers?.authorization || request?.headers?.Authorization || '') });
+      if (href.includes('primary.example.com')) return Response.json({ error: { message: 'overloaded' } }, { status: 503 });
+      return Response.json({ choices: [{ message: { content: 'from-backup' } }] });
+    };
+    const config = await import('../src/core/config.js');
+    const cfg = JSON.parse(JSON.stringify(config.DEFAULT_CONFIG));
+    cfg.api.baseUrl = 'https://primary.example.com/v1';
+    cfg.api.apiKey = 'PRIMARY-KEY';
+    cfg.api.model = 'primary-model';
+    cfg.api.fallback = { enabled: true, baseUrl: 'https://backup.example.com/v1', model: 'backup-model' };
+    config.setRuntimeConfig(cfg);
+    await assert.rejects(
+      chatCompletionWithRetry({ messages: [{ role: 'user', content: 'hi' }] }, 0),
+      /503/,
+      '不切兜底时主渠道的错要如实抛出来'
+    );
+    assert.ok(!seen.some((s) => s.href.includes('backup.example.com')),
+      '备用主机与主渠道不同、却没给备用 Key 时就不该往它发请求');
+    assert.ok(!seen.some((s) => s.auth.includes('PRIMARY-KEY') && !s.href.includes('primary.example.com')),
+      '更不能把主渠道那把发到别的主机');
+    config.setRuntimeConfig(config.DEFAULT_CONFIG);
+  })
+  it('审核拦截恰好落在最后一轮：返回拦截结果而不是 null（曾经 throw null → 调用方 TypeError）', async (t) => {
+    const original = globalThis.fetch;
+    t.after(() => { globalThis.fetch = original; });
+    let calls = 0;
+    // isModerationRefusal 认的是 message.content 命中 high risk
+    globalThis.fetch = async () => {
+      calls += 1;
+      return Response.json({ choices: [{ message: { content: 'This request was considered high risk.' } }] });
+    };
+    const response = await chatCompletionWithRetry({ messages: [{ role: 'user', content: 'hi' }] }, 0);
+    assert.ok(response, '绝不能返回 null（调用方会直接读 response.model 而崩）');
+    assert.equal(calls, 1, 'retries=0 时不该再重试');
+    assert.match(String(response.message?.content || ''), /high risk/i, '如实返回服务商的拦截文案');
+  })
 });

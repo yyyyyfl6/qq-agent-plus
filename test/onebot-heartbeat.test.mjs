@@ -53,8 +53,10 @@ async function startOneBotServer({ poke = false } = {}) {
   await new Promise((resolve) => wss.once('listening', resolve));
   const pingsPerConnection = [];
   let connections = 0;
+  const sockets = [];
   wss.on('connection', (socket) => {
     const index = connections++;
+    sockets.push(socket);
     pingsPerConnection[index] = 0;
     socket.on('ping', () => {
       pingsPerConnection[index] += 1;
@@ -65,6 +67,7 @@ async function startOneBotServer({ poke = false } = {}) {
     port: wss.address().port,
     pingsPerConnection,
     connections: () => connections,
+    sockets,
     close: () => new Promise((resolve) => wss.close(resolve))
   };
 }
@@ -155,4 +158,29 @@ test('显式 on / off 覆盖自适应：on 被断开也继续发；off 从不发
     assert.equal(bot.heartbeatMode, 'auto');
     bot.close();
   }
+});
+
+test('入站新鲜度：收到事件/心跳就记时间（连接还在但事件停了要能被发现）', async () => {
+  const server = await startOneBotServer();
+  const bot = new OneBotClient({
+    wsUrl: `ws://127.0.0.1:${server.port}`, httpUrl: 'http://127.0.0.1:1',
+    heartbeat: 'off'
+  });
+  await bot.connect();
+  assert.equal(await waitFor(() => server.sockets.length > 0), true, '应该有连接');
+  assert.equal(bot.lastEventAt, 0, '还没收到事件时是 0（控制台据此显示"尚未收到"）');
+  assert.equal(bot.lastHeartbeatAt, 0);
+
+  const socket = server.sockets[0];
+  socket.send(JSON.stringify({ post_type: 'meta_event', meta_event_type: 'heartbeat', time: 1, self_id: 100 }));
+  assert.equal(await waitFor(() => bot.lastHeartbeatAt > 0), true, '心跳应记进 lastHeartbeatAt');
+  assert.equal(bot.lastHeartbeatAt, bot.lastEventAt, '心跳也算入站事件');
+
+  const before = bot.lastEventAt;
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  socket.send(JSON.stringify({ post_type: 'message', message_type: 'private', time: 2, self_id: 100, user_id: 1, message: [] }));
+  assert.equal(await waitFor(() => bot.lastEventAt > before), true, '普通消息也要刷新 lastEventAt');
+  assert.equal(bot.lastHeartbeatAt < bot.lastEventAt, true, '普通消息不该改心跳时间');
+  bot.close();
+  await server.close();
 });

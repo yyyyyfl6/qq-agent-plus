@@ -182,7 +182,10 @@ export class IdentityPilotManager {
       } catch (error) {
         this.friendSyncError = String(error?.message ?? error);
         this.friendSnapshotAt = 0;
-        this.log(`[identity-pilot] 好友列表读取失败，先按消息与旧记忆建库：${this.friendSyncError}`);
+        // 与 reindex 同款兜底：拉不到好友列表就沿用库里已知的好友，别拿空表去 rebuild
+        // —— is_friend 标注是慢慢积累的，一次协议端抖动就全表清零（2026-10-10 审查 D1）
+        friends = db.listKnownFriends();
+        this.log(`[identity-pilot] 好友列表读取失败，先按消息与旧库已知好友（${friends.length} 个）建库：${this.friendSyncError}`, error);
       }
       // 远程好友请求可能等待数秒；最后再截取本地消息，避免等待期间的新消息漏索引。
       const activityRows = this.store.identityActivityRows()
@@ -198,7 +201,14 @@ export class IdentityPilotManager {
       this.lastError = '';
       const queuedIncoming = this.pendingIncomingEvents.splice(0);
       for (const request of queuedIncoming) {
-        await this.receiveIncomingFriendRequest(request);
+        // 2026-10-06 复审 P2：启动冲刷里单条请求失败（如待审批积压到上限时 createIncoming
+        // 抛错）不能带崩整个 start() —— catch 会关掉 db 但 identityStore 仍指向已关闭句柄，
+        // start() 又被 `if (this.identityStore)` 短路，身份功能整体瘫痪到重启且无法自愈。
+        try {
+          await this.receiveIncomingFriendRequest(request);
+        } catch (error) {
+          this.log(`[identity-pilot] 启动冲刷入站好友请求失败（跳过该条，继续启动）：${error?.message ?? error}`, error);
+        }
       }
       if (incomingFriendRequestEnabled(this.config())) {
         const pendingIncoming = this.identityStore.listIncomingFriendRequests({
@@ -206,10 +216,15 @@ export class IdentityPilotManager {
           limit: 100
         }).filter((request) => !request.notifiedAt);
         await Promise.all(pendingIncoming.map((request) =>
-          this.#notifyIncomingFriendRequest(request)));
+          this.#notifyIncomingFriendRequest(request).catch((error) => {
+            this.log(`[identity-pilot] 待审批请求通知失败（不阻塞启动）：${error?.message ?? error}`, error);
+          })));
       }
       return this.status();
     } catch (error) {
+      // 关库的同时必须把 identityStore 摘干净：active getter、start() 短路、status()/observe
+      // 全都认这个字段 —— 留着已关闭句柄比 null 更糟（null 还能重新 start 重建）。
+      if (this.identityStore === db) this.identityStore = null;
       try { db?.close(); } catch { /* ignore */ }
       this.lastError = String(error?.message ?? error);
       throw error;
@@ -277,7 +292,7 @@ export class IdentityPilotManager {
       return this.identityStore.observe(chatKey, message);
     } catch (error) {
       this.lastError = String(error?.message ?? error);
-      this.log(`[identity-pilot] 增量索引失败：${this.lastError}`);
+      this.log(`[identity-pilot] 增量索引失败：${this.lastError}`, error);
       return false;
     }
   }
@@ -510,7 +525,7 @@ export class IdentityPilotManager {
         { repliedThisRun }
       ))
       .catch((error) => {
-        this.log(`[identity-pilot] 好友评估 ${created.opportunity.id} 失败：${error?.message ?? error}`);
+        this.log(`[identity-pilot] 好友评估 ${created.opportunity.id} 失败：${error?.message ?? error}`, error);
       });
     this.friendReviewChain = task;
     this.friendReviewTasks.add(task);
@@ -725,7 +740,8 @@ export class IdentityPilotManager {
       }
       this.log(
         `[identity-pilot] 好友候选 ${proposal.id} 主动发送`
-        + `${definiteFailure ? '失败' : '结果未知'}：${String(error?.message ?? error)}`
+        + `${definiteFailure ? '失败' : '结果未知'}：${String(error?.message ?? error)}`,
+        error
       );
       return {
         proposal: updated,

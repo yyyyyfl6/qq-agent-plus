@@ -8,6 +8,7 @@ import { closeModelModal, loadSettings, modelModalShell } from '../app.js';
 import { api } from '../core/api.js';
 import { TOOL_CAT_ORDER, TOOL_META, USAGE_RANGES } from '../core/constants.js';
 import { $, $$, esc } from '../core/dom.js';
+import { closeDialog } from '../core/dom-util.js';
 import {
   chatNameOf, effectivePriceFor, fmtTime, fmtTok, fmtTokens, fmtYuan, formatChatTitle, hasOwnPrice,
   matchPriceTable, mulOf, priceTxt
@@ -24,7 +25,7 @@ function renderChannelFeeds() {
   if (!box) return;
   const feeds = state.modelPrices?.channelFeeds || [];
   if (!feeds.length) {
-    box.innerHTML = '<div class="muted" style="font-size:12px">还没有配置渠道价目表。用下面的「从渠道自动拉价」探测一次，或直接填 URL。</div>';
+    box.innerHTML = '<div class="muted" style="font-size: var(--fs-sm)">还没有配置渠道价目表。用下面的「从渠道自动拉价」探测一次，或直接填 URL。</div>';
     return;
   }
   box.innerHTML = feeds.map((f) => {
@@ -239,7 +240,7 @@ function refreshModelPriceCard() {
       + '用下面的「给这个模型定价」填一条就行。';
   } else {
     const tag = eff.src === 'official' ? '厂商官方定价页直取' : '二手折算，仅供参考';
-    sourceTxt = `内置官方价格表已匹配到「${eff.matched || model}」（${tag}）。这是**估算**口径，不是你的账单；`
+    sourceTxt = `内置官方价格表已匹配到「${eff.matched || model}」（${tag}）。这是估算口径，不是你的账单；`
       + '要按实付价算，用下面的「给这个模型定价」。';
     if (eff.confidence === 'alias') {
       sourceTxt += `　按别名映射：${eff.via}。`;
@@ -332,7 +333,7 @@ async function savePriceDialog() {
       state.config.api.modelPrices = { ...(state.config.api.modelPrices || {}), [key]: entry };
     }
     if (result) { result.textContent = `已保存：${key}`; result.className = 'control-result success'; }
-    $('#price-dialog')?.close();
+    closeDialog($('#price-dialog'));
     refreshModelPriceCard();
     // 用量页正在看的话，让它重算（价格变了）
     if (state.tab === 'usage') loadUsageView({ force: true });
@@ -366,7 +367,7 @@ async function deletePriceDialog() {
       state.config.api.modelPrices = next;
     }
     if (result) { result.textContent = `已删除：${key}`; result.className = 'control-result success'; }
-    $('#price-dialog')?.close();
+    closeDialog($('#price-dialog'));
     refreshModelPriceCard();
     if (state.tab === 'usage') loadUsageView({ force: true });
   } catch (error) {
@@ -422,13 +423,13 @@ function openBatchPriceModal() {
     body: `
       <div class="ma-toolbar">
         <input type="text" id="bp-search" placeholder="搜索模型…" autocomplete="off" />
-        <span class="muted" style="font-size:12px;white-space:nowrap">留空 = 不自定义（走官方表/兜底）</span>
+        <span class="muted" style="font-size: var(--fs-sm);white-space:nowrap">留空 = 不自定义（走官方表/兜底）</span>
       </div>
       <div class="ma-body dual">
         <div class="model-modal-left" id="bp-left"></div>
         <div class="model-modal-right" id="bp-right"></div>
       </div>
-      <div id="bp-hint" class="muted" style="font-size:12px;flex-shrink:0;margin-top:8px">
+      <div id="bp-hint" class="muted" style="font-size: var(--fs-sm);flex-shrink:0;margin-top:8px">
         输入框占位符与模型名悬停提示均为官方价（元/百万 token）；修改只写入你的配置，不会改动官方价格表。
       </div>`,
     foot: `<button class="btn" id="bp-cancel">取消</button>
@@ -460,7 +461,7 @@ function openBatchPriceModal() {
       : (c.billing === 'none' ? '<span class="uc-chip" title="本地/自建模型：只统计 token，不计费">本地</span>' : '');
     return `
       <tr data-model="${esc(m)}">
-        <td title="${esc(offTitle)}">${esc(p.names[m] || m)}${billBadge}<div class="muted" style="font-size:11px">${esc(m)}</div></td>
+        <td title="${esc(offTitle)}">${esc(p.names[m] || m)}${billBadge}<div class="muted" style="font-size: var(--fs-xs)">${esc(m)}</div></td>
         <td><input type="number" step="0.01" min="0" class="bp-in" value="${esc(c.in ?? '')}" placeholder="${off ? off.in : 0}" /></td>
         <td><input type="number" step="0.01" min="0" class="bp-out" value="${esc(c.out ?? '')}" placeholder="${off ? off.out : 0}" /></td>
         <td><input type="number" step="0.01" min="0" class="bp-cached" value="${esc(c.cached ?? '')}" placeholder="${off ? (off.cached ?? 0) : 0}" /></td>
@@ -684,18 +685,30 @@ function renderUsagePage(stats, st, prices) {
   });
   $('#usage-refresh-btn')?.addEventListener('click', () => loadUsageView({ force: true }));
 
-  // 行点击 → 弹明细
-  box.querySelector('[data-table="days"]')?.addEventListener('click', (e) => {
-    const tr = e.target.closest('tr[data-key]');
-    if (tr) openUsageBreakdown('day', tr.dataset.key);
-  });
-  box.querySelector('[data-table="chats"]')?.addEventListener('click', (e) => {
-    const tr = e.target.closest('tr[data-key]');
-    if (tr) openUsageBreakdown('chat', tr.dataset.key);
-  });
-  box.querySelector('[data-table="models"]')?.addEventListener('click', (e) => {
-    const tr = e.target.closest('tr[data-key]');
-    if (tr) openUsageBreakdown('model', tr.dataset.key);
+  // 行点击 → 弹明细（键盘同样：Enter/Space）
+  for (const [table, kind] of [['days', 'day'], ['chats', 'chat'], ['models', 'model']]) {
+    const host = box.querySelector(`[data-table="${table}"]`);
+    if (!host) continue;
+    host.addEventListener('click', (e) => {
+      const tr = e.target.closest('tr[data-key]');
+      if (tr) openUsageBreakdown(kind, tr.dataset.key);
+    });
+    host.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      const tr = e.target.closest('tr[data-key]');
+      if (!tr) return;
+      e.preventDefault();
+      openUsageBreakdown(kind, tr.dataset.key);
+    });
+  }
+
+  // 「按模型」表的展开/收起（超过 20 行才显示）。2026-10-09 审查：这个按钮原先只被
+  // fill() 改文案，全仓没有点击监听、也没有地方置 expanded —— 是死的，模型多时永远看不全。
+  box.querySelector('#models-expand')?.addEventListener('click', () => {
+    const tbody = box.querySelector('[data-table="models"] tbody');
+    if (!tbody) return;
+    tbody.dataset.expanded = tbody.dataset.expanded === '1' ? '0' : '1';
+    updateUsagePage(stats, st, prices);
   });
 
   // 未定价提示条：每个模型一个按钮，点开就是定价弹窗（填完立即重算）
@@ -903,7 +916,15 @@ function updateUsagePage(stats, st, prices) {
     }
     tbody.dataset.empty = '0';
     const html = shown.map(build).join('');
-    if (tbody.dataset.sig !== html) { tbody.innerHTML = html; tbody.dataset.sig = html; }
+    if (tbody.dataset.sig !== html) {
+      tbody.innerHTML = html;
+      tbody.dataset.sig = html;
+      // 明细是"点这一行"打开的，键盘也要能开：<tr> 不是原生可聚焦元素，得自己补 tabindex/role
+      for (const tr of tbody.querySelectorAll('tr[data-key]')) {
+        tr.tabIndex = 0;
+        tr.setAttribute('role', 'button');
+      }
+    }
   };
 
   // 成本单元格：整行都没有价格时不能显示成 ¥0.00（会被读成"免费"）
@@ -1019,6 +1040,9 @@ async function loadUsageView({ force = false } = {}) {
 
   // ── 轮询刷新：只更新数值，不重建 DOM ──
   if (!force) {
+    // 首载失败过的话，错误页里没有 [data-field] 骨架：轮询只改数值会永远停在"加载失败"
+    // （切走再回来才自愈）。发现没有骨架就直接走一次强制重建（2026-10-12 审查）。
+    if (!$('#usage-page [data-field="runs"]')) return loadUsageView({ force: true });
     try {
       const [stats, st] = await Promise.all([
         api(`/api/usage/stats?range=${state.usageRange}`),
@@ -1131,7 +1155,8 @@ function openUsageBreakdown(dim, key) {
   let activeBy = tabs[0][0];
 
   const overlay = modelModalShell({
-    head: `明细：${dimLabel} ${esc(key)}`,
+    // head 由 modelModalShell 统一 esc：这里再 esc 一次会双重转义（& 显示成 &amp;）
+    head: `明细：${dimLabel} ${key}`,
     body: `
       <div class="ub-wrap">
         <div class="ub-tabs" id="ub-tabs">${tabs.map(([v, l]) => `<button class="btn btn-small" data-by="${v}">${l}</button>`).join('')}</div>
@@ -1150,12 +1175,19 @@ function openUsageBreakdown(dim, key) {
   const peakEl = overlay.querySelector('#ub-peak');
   const colEl = overlay.querySelector('#ub-col');
 
+  // 2026-10-09 审查：快速切换维度时两个请求会并发 —— 先发的后到会覆盖新视图，
+  // 且 URL 里的 by 在发起时求值、列名/表体用的是 await 之后的 activeBy（表头与数据错位）。
+  // 用递增令牌丢弃过期响应，并把 by 在发起时快照，两者都同一口径。
+  let loadToken = 0;
   async function load() {
+    const myToken = ++loadToken;
+    const by = activeBy;
     bodyEl.innerHTML = '<tr><td colspan="6" class="muted">加载中…</td></tr>';
     try {
-      const r = await api(`/api/usage/breakdown?range=${encodeURIComponent(state.usageRange)}&dim=${dim}&key=${encodeURIComponent(key)}&by=${activeBy}`);
+      const r = await api(`/api/usage/breakdown?range=${encodeURIComponent(state.usageRange)}&dim=${dim}&key=${encodeURIComponent(key)}&by=${by}`);
+      if (myToken !== loadToken) return;   // 已有更新的请求在途：这次响应作废
       peakEl.innerHTML = peakSplitHtml(r.totals);
-      colEl.textContent = { model: '模型', chat: '会话', day: '日期' }[activeBy] || '项目';
+      colEl.textContent = { model: '模型', chat: '会话', day: '日期' }[by] || '项目';
       // 成本列：包月/本地/未定价不能只显示 ¥0.00（会被读成免费）
       const costCell = (x) => {
         const items = Array.isArray(x.flatItems) ? x.flatItems : [];
@@ -1175,7 +1207,7 @@ function openUsageBreakdown(dim, key) {
       bodyEl.innerHTML = (r.rows || []).length
         ? r.rows.map((x) => `
             <tr>
-              <td>${esc(activeBy === 'chat'
+              <td>${esc(by === 'chat'
                 ? formatChatTitle(x.key, chatNameOf(x.key))
                 : (x.vendor ? `${x.vendor}：${x.model}` : (x.model ?? x.key)))}</td>
               <td class="r">${x.runs}</td>
@@ -1186,6 +1218,7 @@ function openUsageBreakdown(dim, key) {
             </tr>`).join('')
         : '<tr><td colspan="6" class="muted">无数据</td></tr>';
     } catch (e) {
+      if (myToken !== loadToken) return;   // 过期请求的失败同样不许覆盖新视图
       bodyEl.innerHTML = `<tr><td colspan="6" class="muted">加载失败：${esc(e.message)}</td></tr>`;
     }
   }
@@ -1214,13 +1247,15 @@ async function renderProbeResult(res) {
     }
     if (Array.isArray(res?.tried) && res.tried.length) {
       resultEl.classList.remove('hidden');
-      resultEl.innerHTML = `<div class="muted" style="font-size:12px">试过的地址：<br>${res.tried.map((u) => esc(u)).join('<br>')}</div>`;
+      resultEl.innerHTML = `<div class="muted" style="font-size: var(--fs-sm)">试过的地址：<br>${res.tried.map((u) => esc(u)).join('<br>')}</div>`;
     }
     return;
   }
   const entries = Object.entries(res.prices || {});
+  // 这段最终进 textContent（下面 statusEl.textContent）—— 写 textContent 不需要转义，
+  // esc 会把 & 之类显示成实体（2026-10-09 审查）。
   const kindTxt = res.kind === 'one-api'
-    ? `按 one-api/new-api 倍率换算（分组 ${esc(res.group || 'default')} ×${res.groupRatio} · 汇率 ${res.usdRate}）`
+    ? `按 one-api/new-api 倍率换算（分组 ${res.group || 'default'} ×${res.groupRatio} · 汇率 ${res.usdRate}）`
     : '直接读到的价目表（元/百万 token）';
   const vendor = String(res.vendor || state.modelPrices?.currentVendor || '');
   if (statusEl) {
@@ -1249,7 +1284,7 @@ async function renderProbeResult(res) {
       <thead><tr><th>模型</th><th class="r">输入</th><th class="r">输出</th><th class="r">缓存命中</th></tr></thead>
       <tbody>${preview}</tbody>
     </table>
-    ${entries.length > 12 ? `<div class="muted" style="font-size:12px;margin-top:4px">…等共 ${entries.length} 个模型</div>` : ''}
+    ${entries.length > 12 ? `<div class="muted" style="font-size: var(--fs-sm);margin-top:4px">…等共 ${entries.length} 个模型</div>` : ''}
     <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
       <button class="btn btn-primary btn-small" id="probe-apply-used"
         ${usedHits.length ? '' : 'disabled'}>写入在用的 ${usedHits.length} 个</button>
@@ -1354,7 +1389,7 @@ function openToolBreakdown() {
         <div class="tb-lead">这段时间里，机器人${say}${poke}${sticker}${searchTxt}。</div>
         ${rows}
       </div>`,
-    foot: '<div class="muted" style="font-size:11.5px">工具调用本身不额外计费，成本来自它们消耗的 token。</div>'
+    foot: '<div class="muted" style="font-size: var(--fs-xs)">工具调用本身不额外计费，成本来自它们消耗的 token。</div>'
   });
 }
 

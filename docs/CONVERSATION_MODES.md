@@ -1,7 +1,9 @@
 # Conversation Modes
 
 The conversation engine has three runtime-selectable modes. The global default
-can be overridden for each allow-listed group; private chats use the global mode.
+can be overridden for each allow-listed group — turn off `conversation.unifiedMode`
+(the「统一设置响应概率」checkbox in the console) first; with it on, per-group
+overrides are ignored. Private chats use the global mode.
 Changing a mode does not require a restart.
 
 ## Modes
@@ -154,6 +156,24 @@ The request snapshot omits inline image bytes to avoid duplicating large base64
 payloads in every Session file. The message structure, MIME type and original
 request character count remain visible. Token values come from provider usage
 instead of being estimated from character counts.
+
+## Directed Reply Guard
+
+When a run is triggered by a private message, an @mention, a reply/quote of the
+bot, or a message that names it, and the model ends the run without calling
+`send_message`, the text it produced is never visible in QQ. The orchestrator
+then makes one correction request with `send_message` as the only available
+tool. If that still produces no send, it sends a fixed fallback message instead
+of forwarding the draft.
+
+The guard never runs for proactive or manual runs, never sends when the outbox
+may already contain a delivery, and leaves ordinary group conversations free to
+stay silent. Disable it with `conversation.replyGuardEnabled: false`.
+
+A poke aimed at the bot counts as a directed interaction: it is treated as an
+@mention for tier selection, pacing bypass, the budget degrade gate and this
+reply guard. Set `conversation.pokeReplyEnabled: false` to process pokes like
+ordinary group messages instead. Pokes between other members are unaffected.
 
 ## Operational Guidance
 

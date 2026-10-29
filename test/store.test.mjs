@@ -7,9 +7,9 @@ import { DatabaseSync } from 'node:sqlite';
 import { ChatStore } from '../src/core/store.js';
 
 describe('ChatStore', () => {
-  function fixture(t, cap = 0) {
+  function fixture(t, cap = 0, opts = {}) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-store-'));
-    const store = new ChatStore(cap, { dataDir: dir });
+    const store = new ChatStore(cap, { dataDir: dir, ...opts });
     t.after(() => { store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
     return { store, dir };
   }
@@ -61,6 +61,65 @@ describe('ChatStore', () => {
     assert.equal(store.getChatMeta('group:1').held, 1);
     assert.equal(store.retryFailed('group:1'), 0);
     assert.equal(store.resolveHeld('group:1'), 1);
+  });
+
+  it('recoverExpired 跳过 live 集合里仍在跑的租约：不把在跑批次放回队列（2026-10-09 审查）', (t) => {
+    const { store } = fixture(t);
+    append(store, 1);
+    const batch = store.claimUnread('group:1');
+    // 租约已到期、但执行还在跑（liveLeases 带着它）→ 回收必须跳过：
+    // 放回 pending 会被下一个 drain 再处理一遍 = 群里重复回复（线上真实发生过）。
+    assert.equal(store.recoverExpired(Date.now() + 300000, { live: new Set([batch.id]) }), 0);
+    assert.equal(store.unreadCount('group:1'), 0, '在跑批次不能被放回 pending');
+    assert.equal(store.claimUnread('group:1'), null, '也不能被重复领取（one_lease_per_chat）');
+    // 执行收尾、live 清空后，过期租约才允许被回收
+    assert.equal(store.recoverExpired(Date.now() + 300000, { live: new Set() }), 1);
+  });
+
+  it('pruneRuns：清超期终态行、留未过期与 leased 行（启动与每日调度共用同一口径）', (t) => {
+    const { store } = fixture(t);
+    append(store, 1);
+    const done = store.claimUnread('group:1');
+    store.ackLease(done.id);
+    append(store, 2);
+    const failed = store.claimUnread('group:1');
+    store.failLease(failed.id, 'boom', { retryable: false });
+
+    const insert = store.db.prepare('INSERT INTO runs(id,chat_key,state,expires_at) VALUES (?,?,?,?)');
+    const old = Date.now() - 100 * 24 * 3600 * 1000;
+    const recent = Date.now() + 60 * 1000;
+    insert.run('old-acked', 'group:9', 'acked', old);
+    insert.run('old-held', 'group:9', 'held', old);
+    insert.run('old-failed', 'group:9', 'failed', old);
+    insert.run('recent-acked', 'group:9', 'acked', recent);
+    insert.run('old-but-leased', 'group:9', 'leased', old);
+    assert.equal(store.pruneRuns(), 3, '三条超期终态行被清掉');
+    const left = store.db.prepare('SELECT id FROM runs ORDER BY id').all().map((r) => r.id);
+    assert.ok(!left.includes('old-acked') && !left.includes('old-held') && !left.includes('old-failed'));
+    assert.ok(left.includes('recent-acked'), '未过期行保留');
+    assert.ok(left.includes('old-but-leased'), 'leased 行不归保留期管（回收是 recoverExpired 的职责）');
+    assert.ok(left.includes(done.id) && left.includes(failed.id), '本次启动建的行（expires_at 在未来）不能被清');
+    assert.equal(store.pruneRuns(1), 0, '再清一遍是幂等的');
+  });
+
+  it('resolveHeld 清残骸但绝不碰在途租约的证据，也不漏掉主动唤醒的孤儿残骸', (t) => {
+    const { store } = fixture(t);
+    // 在途租约：claimUnread 建的 runs 行是 'leased'，它的 outbox 行是 failLease 判
+    // hasEffects 的证据 —— 删掉它，这次收尾就会被当成"没发出去"，整批消息回队重跑。
+    append(store, 1);
+    const batch = store.claimUnread('group:1');
+    const live = store.beginSend('group:1', batch.id, { text: 'in flight' });
+    const orphan = store.beginSend('group:1', 'proactive-synthetic-run', { text: 'lost' });
+    store.finishSend(orphan, { error: 'response lost' });
+    assert.equal(store.getChatMeta('group:1').held, 2, '前提：一条在途 + 一条主动唤醒的未知残骸');
+    assert.equal(store.resolveHeld('group:1'), 1, '清掉的是残骸数，不是把在途那条也算进去');
+    assert.equal(store.hasEffects(batch.id), true, '在途租约的 sending 行被删了：收尾会当成没发过');
+    assert.ok(store.listUnknownOperations('group:1').some((op) => op.id === live), '在途证据仍在库里');
+    // 主动唤醒没有 runs 行（runId 是合成值），残骸 run_id 在 runs 里查无此人 ——
+    // 只按终态 run 取交集的写法会永远清不掉它，控制台一直显示"待核对"。
+    assert.equal(store.listUnknownOperations('group:1').some((op) => op.id === orphan), false,
+      '主动唤醒的未知残骸要能清掉，否则人工核对永远点不干净');
+    assert.equal(store.getChatMeta('group:1').held, 1, '清完之后只剩在途那条');
   });
 
   it('reconciles unknown operations individually without deleting business history', (t) => {
@@ -405,5 +464,17 @@ describe('ChatStore', () => {
     store.ackLease(lease.id);
     assert.equal(store.hasLeasedRun('group:1'), false);
     assert.equal(store.hasLeasedRun('group:2'), false, '只作用于指定会话');
+  });
+
+  it('honours store.sqliteSynchronous and can switch it at runtime (Issue #45)', (t) => {
+    const sync = (store) => store.db.prepare('PRAGMA synchronous').get().synchronous;
+    const { store } = fixture(t);
+    assert.equal(sync(store), 2, '默认 FULL');
+    store.setSynchronous('NORMAL');
+    assert.equal(sync(store), 1, '切到 NORMAL 后即时生效');
+    store.setSynchronous('not-a-mode');
+    assert.equal(sync(store), 2, '非法值回到 FULL');
+    const { store: normal } = fixture(t, 0, { synchronous: 'NORMAL' });
+    assert.equal(sync(normal), 1, '构造参数也生效');
   });
 });

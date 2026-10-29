@@ -43,7 +43,9 @@ function fixture(patch = {}) {
     botName: 'Mori', selfNickname: 'Mori', roleText: 'Reserved and literal. No forced jokes.',
     customRules: 'Do not use a signature catchphrase.', participation: 'low'
   };
-  cfg.dailyMoments.minMessagesPerGroup = 1;
+  cfg.dailyMoments.source = 'group';
+cfg.dailyMoments.autoPublish = true;
+cfg.dailyMoments.minMessagesPerGroup = 1;
   cfg.dailyMoments.enabled = true;
   cfg.dailyMoments.maxRounds = 3;
   cfg.dailyMoments.allowImages = false;

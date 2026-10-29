@@ -66,22 +66,28 @@ function check() {
     'Agent service/runtime metadata does not match this stack');
 
   const config = readObject(path.join(data, 'config.json'));
+  const allowRotation = process.env.QQ_AGENT_ALLOW_CREDENTIAL_ROTATION === '1';
   const expectedHttp = `http://127.0.0.1:${env.ONEBOT_HTTP_PORT}`;
   const expectedWs = `ws://127.0.0.1:${env.ONEBOT_WS_PORT}`;
   requireMatch(config.onebot?.httpUrl === expectedHttp && config.onebot?.wsUrl === expectedWs,
     'Agent uses different OneBot endpoints; refusing to replace them');
-  requireMatch(config.onebot?.accessToken === env.ONEBOT_TOKEN
-    && (config.onebot?.httpAccessToken || config.onebot?.accessToken) === env.ONEBOT_TOKEN,
-  'OneBot credentials have changed outside the installer; refusing to overwrite them.'
-    + ' 修法：把 snowluma/.env 里的 ONEBOT_TOKEN 改成 data/config.json 里 onebot.accessToken 的当前值'
-    + '（或重跑时带 --rotate-credentials 换一套新凭据），再执行本命令。');
-  requireMatch(config.server?.token === env.QQ_AGENT_CONSOLE_TOKEN,
-    'Console credentials have changed outside the installer; refusing to overwrite them.'
-      + ' 最常见的原因是在控制台「设置 → 系统 → 控制台安全」里轮换过令牌（README 支持这种改法，'
-      + '但 snowluma/.env 里还是旧值）。修法：把 snowluma/.env 的 QQ_AGENT_CONSOLE_TOKEN 改成'
-      + ' data/config.json 里 server.token 的当前值，再重跑。');
-  requireMatch(config.server?.host === '0.0.0.0' && config.server?.port === Number(env.AGENT_PORT),
-    'Console binding has changed outside the installer; refusing to overwrite it');
+  if (!allowRotation) {
+    requireMatch(config.onebot?.accessToken === env.ONEBOT_TOKEN
+      && (config.onebot?.httpAccessToken || config.onebot?.accessToken) === env.ONEBOT_TOKEN,
+    'OneBot credentials have changed outside the installer; refusing to overwrite them.'
+      + ' 修法：把 snowluma/.env 里的 ONEBOT_TOKEN 改成 data/config.json 里 onebot.accessToken 的当前值，'
+      + '再执行本命令。');
+    requireMatch(config.server?.token === env.QQ_AGENT_CONSOLE_TOKEN,
+      'Console credentials have changed outside the installer; refusing to overwrite them.'
+        + ' 最常见的原因是在控制台「设置 → 系统 → 控制台安全」里轮换过令牌（README 支持这种改法，'
+        + '但 snowluma/.env 里还是旧值）。修法：把 snowluma/.env 的 QQ_AGENT_CONSOLE_TOKEN 改成'
+        + ' data/config.json 里 server.token 的当前值，再重跑。');
+  }
+  // 允许用户在控制台把监听地址收紧到 127.0.0.1/::1；端口仍要与 .env 的映射一致，
+  // 否则 compose 的端口转发会指向错误端口。
+  requireMatch(['0.0.0.0', '127.0.0.1', '::', '::1'].includes(config.server?.host)
+    && config.server?.port === Number(env.AGENT_PORT),
+  'Console binding/port does not match the saved stack; refusing to overwrite it');
 
   const mounts = new Map([
     ['/app/data', path.join(snowluma, 'data')],

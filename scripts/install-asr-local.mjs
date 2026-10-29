@@ -7,6 +7,7 @@
 // 但模型与二进制没法塞进仓库，
 // 装一次就没后面的事了（离线、无按量费用、音频不出机器）。
 import { spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -208,20 +209,47 @@ async function main() {
     console.log(`· 模型已存在，跳过下载：${modelPath}`);
   } else {
     fs.mkdirSync(target, { recursive: true, mode: 0o700 });
+    // 2026-10-06 复审 P3：ggml 模型会被 whisper-cli 长期解析（解析器有内存安全前科），
+    // 而两个镜像的产物原先不做任何一致性比对。这里从候选镜像各下一份、sha256 互校：
+    // 两份都在且哈希不一致 → 拒绝安装（疑似镜像被污染）；只有一份成功 → 沿用原行为接受，
+    // 但明说未做交叉校验（镜像挂掉是常态，不能因校验把可用性砍没）。
+    const sha256Of = (file) => new Promise((resolve, reject) => {
+      const hash = crypto.createHash('sha256');
+      fs.createReadStream(file)
+        .on('data', (chunk) => hash.update(chunk))
+        .on('end', () => resolve(hash.digest('hex')))
+        .on('error', reject);
+    });
+    const fetched = [];   // [{ mirror, dest, bytes }]，最多留两份用于互校
     let lastError = null;
-    for (const mirror of mirrors) {
+    for (const [mirrorIndex, mirror] of mirrors.entries()) {
+      const dest = `${modelPath}.dl${mirrorIndex}`;
       try {
         console.log(`· 下载模型（${mirror}）…`);
-        const bytes = await download(modelUrl(mirror, opts.model), modelPath);
+        const bytes = await download(modelUrl(mirror, opts.model), dest);
         console.log(`  完成：${(bytes / 1048576).toFixed(1)}MB`);
-        lastError = null;
-        break;
+        fetched.push({ mirror, dest, bytes });
+        if (fetched.length >= 2) break;   // 拿到两份就够互校
       } catch (error) {
         lastError = error;
+        try { fs.rmSync(dest, { force: true }); } catch { /* 尽力清理 */ }
         console.warn(`  这个源不行（${String(error?.message ?? error)}），换下一个`);
       }
     }
-    if (lastError) throw new Error(`模型下载失败：${String(lastError?.message ?? lastError)}；可以用 --mirror 指定别的源`);
+    if (!fetched.length) throw new Error(`模型下载失败：${String(lastError?.message ?? lastError)}；可以用 --mirror 指定别的源`);
+    if (fetched.length >= 2) {
+      const [first, second] = fetched;
+      const [hashA, hashB] = [await sha256Of(first.dest), await sha256Of(second.dest)];
+      if (hashA !== hashB) {
+        for (const item of fetched) { try { fs.rmSync(item.dest, { force: true }); } catch { /* 尽力清理 */ } }
+        throw new Error(`两个镜像的模型文件 sha256 不一致（${first.mirror} 与 ${second.mirror}），疑似镜像被污染，已拒绝安装；可用 --mirror 指定可信源后重试`);
+      }
+      fs.rmSync(second.dest, { force: true });
+      console.log(`· 双镜像 sha256 一致（${hashA.slice(0, 16)}…），交叉校验通过`);
+    } else {
+      console.warn('· 仅一个镜像可用，未做交叉校验（模型完整性依赖该镜像的 HTTPS）');
+    }
+    fs.renameSync(fetched[0].dest, modelPath);
   }
 
   // 4) 写回配置（默认开；--no-write-config 只打印）

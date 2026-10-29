@@ -4,6 +4,7 @@
 // 预设里必须带 shape（请求形状），因为两种形状差很多：
 //   · openai       —— POST {base}/images/generations（主流网关与自建都收敛到这个形状）
 //   · pollinations —— GET  {base}/prompt/<提示词>?width=&height=（免 Key 的公共服务）
+//   · modelscope   —— POST 任务后轮询 GET {base}/tasks/{task_id}（原生异步接口）
 // 2026-10-01 实测的坑：pollinations 还有个长得像 OpenAI 的 POST /openai/images/generations，
 // 但它**不看 body** —— 两个完全不同的提示词返回逐字节相同的图。照那个接，机器人会"不管你要
 // 什么、都画同一张"。所以只认 GET 那条。
@@ -66,9 +67,26 @@ export const IMAGEGEN_SERVICES = [
       + '地址填到 /v1 这一层，Key 用硅基流动的 API Key（与语音转写可以是同一把）。'
   },
   {
+    id: 'moss',
+    label: 'Moss Image（moss-image-base / sft）',
+    shape: 'openai',
+    creds: ['key'],
+    baseUrl: 'https://api.mosi.cn/v1',
+    hosts: ['api.mosi.cn'],
+    keyUrl: 'https://platform.mosi.cn',
+    models: [
+      { id: 'moss-image-base-1.0' },
+      { id: 'moss-image-sft-1.0' }
+    ],
+    note: '服务地址填到 /v1，不要带 /images/generations（适配器会自己拼）。'
+      + '官方文档：response_format 只支持 url（不支持 b64_json），n 只能 1，'
+      + '请求示例超时给到 900 秒；生成慢时把 imageGen.timeoutMs 调大。'
+      + '去水印在「自定义请求参数」填 {"output_watermark": {"enabled": false}}（官方是嵌套对象）。'
+  },
+  {
     id: 'modelscope',
     label: '魔搭 ModelScope API-Inference（有每日免费额度，需 Token）',
-    shape: 'openai',
+    shape: 'modelscope',
     creds: ['key'],
     baseUrl: 'https://api-inference.modelscope.cn/v1',
     hosts: ['api-inference.modelscope.cn'],

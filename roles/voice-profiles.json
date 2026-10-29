@@ -1,0 +1,66 @@
+{
+  "xiaojingyu": {
+    "maxChars": 30,
+    "maxBubbles": 3,
+    "pauseMs": [
+      600,
+      1800
+    ]
+  },
+  "duzui_sunyou": {
+    "maxChars": 18,
+    "maxBubbles": 3,
+    "pauseMs": [
+      400,
+      1200
+    ]
+  },
+  "wenrou_peiliao": {
+    "maxChars": 40,
+    "maxBubbles": 3,
+    "pauseMs": [
+      800,
+      2200
+    ]
+  },
+  "jishu_zhai": {
+    "maxChars": 60,
+    "maxBubbles": 3,
+    "pauseMs": [
+      600,
+      1800
+    ]
+  },
+  "maoniang": {
+    "maxChars": 24,
+    "maxBubbles": 3,
+    "pauseMs": [
+      500,
+      1500
+    ]
+  },
+  "lezi_ren": {
+    "maxChars": 24,
+    "maxBubbles": 3,
+    "pauseMs": [
+      400,
+      1200
+    ]
+  },
+  "xuexi_dazi": {
+    "maxChars": 60,
+    "maxBubbles": 3,
+    "pauseMs": [
+      700,
+      2000
+    ]
+  },
+  "sunba": {
+    "maxChars": 14,
+    "maxBubbles": 3,
+    "pauseMs": [
+      300,
+      900
+    ]
+  }
+}

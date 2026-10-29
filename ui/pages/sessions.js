@@ -9,7 +9,7 @@ import { api } from '../core/api.js';
 import {
   CONVERSATION_MODE_LABEL, SESSION_PAGE, STATUS_LABEL, THREAD_STATE_LABEL
 } from '../core/constants.js';
-import { patchKeyedList } from '../core/dom-util.js';
+import { patchKeyedList, initSessionScrollLoader } from '../core/dom-util.js';
 import { $, $$, esc } from '../core/dom.js';
 import {
   chatNameOf, fmtClock, fmtRate, fmtTime, fmtTok, fmtTokens, fmtWaitRemain, fmtYuan, formatChatTitle,
@@ -233,7 +233,7 @@ function renderSessionList() {
           <span class="session-chat">${esc(chatName)}</span>
           <span class="session-time">${fmtTime(s.startedAt)}</span>
         </div>
-        <div class="session-trigger"><span class="trigger-method">${esc(triggerLabel)}</span><span>${esc(s.trigger || '')}${runLabel ? ` · ${runLabel}` : ''}</span></div>
+        <div class="session-trigger" title="${esc(`${triggerLabel}：${s.trigger || ''}`)}"><span class="trigger-method">${esc(triggerLabel)}</span><span>${esc(s.trigger || '')}${runLabel ? ` · ${runLabel}` : ''}</span></div>
         <div class="session-meta">
           <span class="status-badge status-${s.status}">${esc(sessionStatusText(s))}</span>
           <span class="mode-chip mode-${mode}">${esc(conversationStatusText(s))}</span>
@@ -245,7 +245,8 @@ function renderSessionList() {
         </div>
       </div>`;
   }).map((html, index) => ({ key: String(shown[index].displayKey), html }));
-  patchKeyedList(box, sessionRows, 'data-display-key');
+  // exit: true —— 会话行被筛掉时先塔缩再移除（见 ui/core/dom-util.js 与 style.css 的 rowOut）
+  patchKeyedList(box, sessionRows, 'data-display-key', { exit: true });
   // 底部提示：还有多少条没显示 / 已全部显示
   const more = $('#session-more');
   if (more) {
@@ -275,6 +276,12 @@ function renderSessionList() {
   // 等待中会话的剩余时间按 0.1s 本地刷新（不重新拉列表）
   if ($$('.session-wait[data-until]', box).length) startWaitTicker();
   if ($$('.lifecycle-remaining[data-deadline]').length) startLifecycleTicker();
+  // 「滚到底加载更多」的监听挂在这里，而不是 app.js 的 init 末尾：**首次启动时配置还没填好**
+  // （没模型 / 没白名单）时 init 会提前 return 带去设置页，那一刻 #session-list 还不存在，
+  // 监听就挂空了 —— 列表永远停在 50 条，底部却写着"还有 N 条"。
+  // 渲染完就挂，与 init 走哪条分支无关；attachScrollLoader 自带防重复绑定。
+  // （与 chat.js 里 initChatScrollLoader 的处理方式一致。）
+  initSessionScrollLoader();
 }
 
 function updateSessionListSelection() {

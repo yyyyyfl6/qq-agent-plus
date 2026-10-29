@@ -6,12 +6,12 @@
 
 
 import {
-  closeModelModal, currentThinkingRaw, getThemePref, loadSettings, modelModalShell, refreshStatus,
+  closeModelModal, currentThinkingRaw, loadSettings, modelModalShell, refreshStatus,
   renderExperimentalSettingsSection, renderSettings, renderThinkingSeg, thinkingStops
 } from '../app.js';
 import { api } from '../core/api.js';
 import {
-  MODEL_SERVICES_UI, THEME_ICON, THEME_LABEL, THEME_VALUES, TIME_DAYS, TIME_RULE_LABELS
+  MODEL_SERVICES_UI, THEME_VALUES, TIME_DAYS, TIME_RULE_LABELS
 } from '../core/constants.js';
 import { askForConfirmation, extraBodyText, splitRowsHtml } from '../core/dom-util.js';
 import { $, $$, esc } from '../core/dom.js';
@@ -25,11 +25,49 @@ import {
   renderDailyMomentsSection, renderGroupGameSection, renderQzoneInteractionSection, renderRemindersSection
 } from './moments.js';
 import { renderPersonaSection } from './persona.js';
+import { renderLifeFeedSection } from './life-feed.js';
+import { hydratePlatformGates, hydratePlatformVoiceSelect, renderPlatformSection } from './platform.js';
+import { bindSnowlumaActions, hydrateSnowlumaPanel } from './snowluma.js';
+import { applyIcons } from '../core/icons.js';
+// 分区菜单的"选中块滑过去"与主导航共用同一份实现（2026-10-08）
+import { positionNavPill } from '../core/nav-pill.js';
+import { enhanceSeg } from '../core/segment.js';
+import { bindAppearanceControls, renderAppearanceBlock } from './settings-appearance.js';
 import { loadSessions } from './sessions.js';
 import { bindCrossSectionControls, bindSettingsEvents, isSplitThinking } from './settings-bind.js';
 import { renderAsrSection } from './settings-voice.js';
+import {
+  bindExtensionSettings, hydrateExtensionStatus, renderKnowledgeSection, renderMcpSection, renderMemesSection, renderModerationSection
+} from './settings-extensions.js';
 import { refreshAutoUpdateStatus, timeControlTargetOptions } from './status.js';
 import { loadUsageView } from './usage.js';
+/** 设置分区搜索词：菜单标签之外，补上该分区里的常用说法。 */
+const SECTION_SEARCH_TERMS = {
+  persona: '人设 角色卡 语气 口吻 规则 附加规则',
+  chat: '聊天 回复 主动 话题 拟人化 自然 活跃 安静 陪聊 预设 风格 延迟 状态 关系 表情 发送 节奏 数据 保留 冷场',
+  messageTypes: '消息 类型 图片 视频 语音 合并转发',
+  allow: '白名单 群 私聊 屏蔽 黑名单',
+  memory: '记忆 印象 交接 人物',
+  api: '模型 API Key 温度 上下文 预算 提供商',
+  search: '搜索 联网 Key',
+  asr: '语音 转文字 识别 转写',
+  'token-saver': 'Token 节省 上下文 预算',
+  moments: '每日 动态 说说 日报 早报',
+  'qzone-interactions': '动态 互动 点赞 评论 空间',
+  reminders: '提醒 定时',
+  groupGame: '群游戏 游戏 数字炸弹 狼人杀 卧底',
+  'time-control': '时间 控制 时段 峰谷 活跃',
+  experiments: '实验 功能 试点',
+  platform: '平台 能力 权限 工具',
+  mcp: 'MCP 工具 server 外部 协议',
+  knowledge: '知识库 文档 FAQ 群规 检索',
+  memes: '梗 黑话 外号 群梗库 梗百科',
+  moderation: '群管理 禁言 踢人 撤回 管理员',
+  onebot: 'OneBot 连接 协议 端 WS WebSocket',
+  appearance: '外观 主题 字体 颜色',
+  desktop: '系统 备份 更新 部署'
+};
+
 /** 把设置解析成实际要应用的主题名。 */
 function resolveTheme(pref) {
   if (THEME_VALUES.includes(pref) && pref !== 'system') return pref;
@@ -59,40 +97,211 @@ function renderSettingsSidebar() {
   const s = state.status;
   const sidebar = $('#settings-sidebar');
   if (!sidebar) return;
+  // 分组（2026-10-08）：分区平铺一长条最劝退，按"对话 / 记忆与人设 / 运行 / 平台 /
+  // 系统"五组归位，每组一个小标题。分组只影响侧栏观感，分区 id 与行为一个都没动
+  // （ui-smoke 断言 .settings-menu-item[data-section=...] 仍在，锚点不受影响）。
   const menu = [
-    ['api', '模型 API'],
-    ['search', '搜索服务'],
-    ['asr', '语音转文字'],
-    ['memory', '记忆'],
-    ['experiments', '实验功能'],
-    ['groupGame', '群游戏'],
-    ['moments', '每日动态'],
-    ['reminders', '定时提醒'],
-    ['qzone-interactions', '动态互动'],
-    ['time-control', '时间控制'],
-    ['token-saver', '省 Token'],
-    ['persona', '人设'],
-    ['allow', '聊天白名单'],
-    ['chat', '聊天设置'],
-    ['desktop', '系统'],
-    ['onebot', 'OneBot']
+    ['对话与人格', [['persona', '人设'], ['chat', '聊天设置'], ['messageTypes', '消息类型'], ['allow', '聊天白名单'], ['memory', '记忆']]],
+    ['模型与服务', [['api', '模型 API'], ['search', '搜索服务'], ['asr', '语音转文字'], ['token-saver', 'Token 节省']]],
+    ['自动行为', [['moments', '每日动态'], ['qzone-interactions', '动态互动'], ['reminders', '定时提醒'], ['life-feed', '见闻'], ['groupGame', '群游戏'], ['time-control', '时间控制'], ['experiments', '实验功能']]],
+    ['平台', [['platform', '平台能力'], ['onebot', 'OneBot'], ['mcp', 'MCP'], ['knowledge', '知识库'], ['memes', '梗库'], ['moderation', '群管理']]],
+    ['系统', [['appearance', '外观'], ['desktop', '系统']]]
   ];
   sidebar.innerHTML = `
     <div class="settings-runstate">
       <div class="rs-title">机器人运行状态</div>
       <div class="rs-row" ${s?.onebot?.connected ? '' : `title="${esc(onebotIssueText(s?.onebot) || '正在等待首次连接')}"`}><span class="dot ${s?.onebot?.connected ? 'dot-on' : 'dot-off'}"></span><span>${s?.onebot?.connected ? '运行中' : '未就绪'}</span></div>
-      <div class="rs-row muted">${state.paused ? '⏸ 已暂停' : (s?.orchestrator?.model ? `模型：${esc(s.orchestrator.model)}` : '模型：未设置')}</div>
+      <div class="rs-row muted">${state.paused ? '已暂停' : (s?.orchestrator?.model ? `模型：${esc(s.orchestrator.model)}` : '模型：未设置')}</div>
+    </div>
+    <div class="settings-search">
+      <input type="search" id="settings-search" placeholder="搜索设置…" aria-label="搜索设置" value="${esc(state.settingsQuery || '')}" />
     </div>
     <div class="settings-menu">
-      ${menu.map(([id, label]) => `<button class="settings-menu-item ${state.settingsSection === id ? 'active' : ''}" data-section="${id}">${label}</button>`).join('')}
-    </div>`;
+      ${menu.map(([group, items]) => `
+        <div class="settings-menu-group">${esc(group)}</div>
+        ${items.map(([id, label]) => {
+          const on = state.settingsSection === id;
+          // aria-current="page"：一组同类元素里只标一个"当前项"（Primer/MDN 的口径）
+          return `<button class="settings-menu-item ${on ? 'active' : ''}" data-section="${id}"${on ? ' aria-current="page"' : ''}>${label}</button>`;
+        }).join('')}
+      `).join('')}
+    </div>
+    <div class="hint" id="settings-search-empty" hidden>没有匹配的设置</div>`;
   sidebar.querySelectorAll('.settings-menu-item').forEach((el) => {
     el.addEventListener('click', () => {
       state.settingsSection = el.dataset.section;
+      state.settingsDirty = false;
       renderSettingsSidebar();
       renderSettings();
     });
   });
+  const search = $('#settings-search');
+  if (search) {
+    search.addEventListener('input', () => {
+      state.settingsQuery = search.value.trim();
+      filterSettingsMenu();
+    });
+  }
+  filterSettingsMenu();
+  syncMenuPill();
+  // 窄屏（≤600px）的分区菜单是横排滚动条：重建 DOM 会把 scrollLeft 归零，
+  // 刚点的分区被甩到屏幕外，看着像"没选中"。用 scrollWidth 判断是否横排可滚
+  //（不能查 getComputedStyle：无 devDeps 的渲染测试环境里没有这个全局）。
+  const menuEl = sidebar.querySelector('.settings-menu');
+  const activeItem = menuEl?.querySelector('.settings-menu-item.active');
+  if (menuEl && activeItem && menuEl.scrollWidth > menuEl.clientWidth + 1) {
+    menuEl.scrollLeft = Math.max(0, activeItem.offsetLeft - (menuEl.clientWidth - activeItem.offsetWidth) / 2);
+  }
+  bindMenuPillResync();
+  revealActiveMenuItem();
+}
+
+/** 侧栏菜单按关键词过滤；分组标题在没有可见子项时一起隐藏。 */
+function filterSettingsMenu() {
+  const menu = document.querySelector('#settings-sidebar .settings-menu');
+  if (!menu) return;
+  const query = String(state.settingsQuery || '').trim().toLowerCase();
+  let visibleCount = 0;
+  for (const item of menu.querySelectorAll('.settings-menu-item')) {
+    const label = String(item.textContent || '').toLowerCase();
+    const terms = String(SECTION_SEARCH_TERMS[item.dataset.section] || '').toLowerCase();
+    const hit = !query || label.includes(query) || terms.includes(query);
+    item.hidden = !hit;
+    if (hit) visibleCount += 1;
+  }
+  const empty = document.querySelector('#settings-search-empty');
+  if (empty) empty.hidden = !query || visibleCount > 0;
+  for (const group of menu.querySelectorAll('.settings-menu-group')) {
+    let node = group.nextElementSibling;
+    let visible = false;
+    while (node && !node.classList.contains('settings-menu-group')) {
+      if (node.classList.contains('settings-menu-item') && !node.hidden) visible = true;
+      node = node.nextElementSibling;
+    }
+    group.hidden = !visible;
+  }
+  syncMenuPill();
+  const active = menu.querySelector('.settings-menu-item.active');
+  const pill = menu.querySelector('.side-pill');
+  if (pill) pill.hidden = Boolean(query) && Boolean(active?.hidden);
+}
+
+/**
+ * 分区菜单的滑块。与主导航同一份实现（ui/core/nav-pill.js），这里多一步：把**上一个滑块节点**
+ * 接回来 —— 这个菜单每次点击都会重建整块 DOM，节点若不回收，动画就变成"直接出现在终点"。
+ */
+let menuPill = null;
+function syncMenuPill() {
+  const menu = document.querySelector('#settings-sidebar .settings-menu');
+  if (!menu) return;
+  menuPill = positionNavPill(menu, {
+    activeSelector: ':scope > .settings-menu-item.active',
+    previous: menuPill
+  });
+}
+
+/** 外观一变（换字体/密度 → 菜单行高变了）滑块要重新对位，与主导航同一口径。只注册一次。 */
+let menuPillResyncBound = false;
+function bindMenuPillResync() {
+  if (menuPillResyncBound) return;
+  menuPillResyncBound = true;
+  document.addEventListener('qqa:appearance', () => {
+    try { syncMenuPill(); } catch { /* 菜单不在这一页，忽略 */ }
+  });
+}
+
+/**
+ * 把当前分区带进视野，只滚这根侧栏自己（不动外面那层表单的滚动位置）。
+ * 语义对齐 scrollIntoView({ block: 'nearest' })：只在跑出视野时滚、且滚最小距离 ——
+ * 不给它加这一步时，点「外观」「系统」这种靠后的分区，高亮会落在折叠线以下，等于没有指示。
+ * 只在"分区真的换了"时执行一次：否则每次保存/外观变更都会把用户手动滚到的位置拽回来。
+ */
+let revealedSection = null;
+/** 进设置页时清掉"这个分区已经露过脸"的记忆：用户手动把菜单滚走、离开再回来时，
+ *  当前项可能又跑到折叠线外了 —— 那种情况下应该再带一次进视野。 */
+function resetMenuReveal() {
+  revealedSection = null;
+}
+function revealActiveMenuItem() {
+  const sec = state.settingsSection || 'api';
+  if (sec === revealedSection) return;
+  revealedSection = sec;
+  const sidebar = $('#settings-sidebar');
+  const item = sidebar?.querySelector('.settings-menu-item.active');
+  if (!sidebar || !item) return;
+  sidebar.scrollTop += revealDelta(sidebar.getBoundingClientRect(), item.getBoundingClientRect());
+}
+
+/**
+ * "把 item 带进 box 的视野"要滚多少像素（0 ＝ 已经在视野里，正数往下滚、负数往上）。
+ * 抽成纯函数是为了能测：happy-dom 没有布局引擎，只能用假几何喂它（见 test/console-side-nav）。
+ * 语义与 scrollIntoView({ block: 'nearest' }) 一致：只在跑出视野时滚、且滚最小距离。
+ */
+function revealDelta(box, item, pad = 8) {
+  if (item.top < box.top + pad) return -(box.top + pad - item.top);
+  if (item.bottom > box.bottom - pad) return item.bottom - box.bottom + pad;
+  return 0;
+}
+
+/**
+ * 把一个分区的 `<h3>` 组包成卡片。只改外层结构，不动任何 id/控件：
+ * 设置页的保存与大量事件都按 id 查找，包一层不影响它们；动态重画也每次重新包。
+ */
+function cardifySettings(box) {
+  const children = [...box.children];
+  let card = null;
+  for (const node of children) {
+    if (node.classList.contains('save-bar') || node.classList.contains('settings-divider')) {
+      card = null;
+      continue;
+    }
+    // 平台能力/时间控制等分区自己就是 <section>（甚至已有 .plat-card 卡片样式）：
+    // 再包一层会变成卡片套卡片。h3 在里层，交给原样式。
+    if (node.tagName === 'SECTION') {
+      card = null;
+      continue;
+    }
+    if (node.tagName === 'H3') {
+      card = document.createElement('section');
+      card.className = 'settings-card';
+      node.replaceWith(card);
+      card.appendChild(node);
+      continue;
+    }
+    if (!card) {
+      card = document.createElement('section');
+      card.className = 'settings-card settings-card-intro';
+      node.replaceWith(card);
+      card.appendChild(node);
+      continue;
+    }
+    card.appendChild(node);
+  }
+}
+
+/** 单勾选 + 单标签的行改成右侧开关；多选列表/带额外说明的行保持原样。 */
+function markSwitchRows(box) {
+  for (const row of box.querySelectorAll('.checkbox-row')) {
+    const inputs = row.querySelectorAll('input[type=checkbox]');
+    const labels = row.querySelectorAll(':scope > label');
+    if (inputs.length === 1 && labels.length === 1 && row.children.length === 2) {
+      row.classList.add('switch-row');
+    }
+  }
+}
+
+/** 任意输入变化 → 保存条显示"有未保存改动"；只绑一次（#settings-form 本身不随 innerHTML 替换）。 */
+function bindDirtyTracking() {
+  const box = $('#settings-form');
+  if (!box || box.dataset.dirtyBound === '1') return;
+  box.dataset.dirtyBound = '1';
+  const mark = () => {
+    state.settingsDirty = true;
+    const note = $('#cfg-dirty-note');
+    if (note) note.textContent = '有未保存改动';
+  };
+  box.addEventListener('input', mark);
+  box.addEventListener('change', mark);
 }
 
 function renderSettingsImpl() {
@@ -101,8 +310,25 @@ function renderSettingsImpl() {
   renderSettingsSidebar();
   box.innerHTML = `
     ${renderSettingsSection(c)}`;
+  cardifySettings(box);
+  markSwitchRows(box);
+  bindDirtyTracking();
+  // 主题选择器等静态节点上的 data-icon 在这里注入 SVG（幂等）
+  applyIcons(box);
+  // 分段控件（思考档位、外观页的十来组）：插滑块并定位到当前档
+  enhanceSeg(box);
+  bindAppearanceControls();
   bindSettingsEvents(c);
   bindCrossSectionControls();
+  bindExtensionSettings();
+  hydrateExtensionStatus();
+  // 「平台能力」页的异步补全：语音音色目录、每项的工具清单、闸门用量、按群覆盖编辑器
+  // （不在这一页时各自 no-op）
+  hydratePlatformVoiceSelect();
+  hydratePlatformGates();
+  // OneBot 页的「协议端（SnowLuma）」面板：读版本 + 绑按钮（不在这一页时各自 no-op）
+  hydrateSnowlumaPanel();
+  bindSnowlumaActions();
 }
 
 function renderSettingsSection(c) {
@@ -117,11 +343,19 @@ function renderSettingsSection(c) {
     moments: () => renderDailyMomentsSection(c),
     reminders: () => renderRemindersSection(c),
     'qzone-interactions': () => renderQzoneInteractionSection(c),
+    'life-feed': () => renderLifeFeedSection(c),
     'time-control': () => renderTimeControlSection(c),
     'token-saver': () => renderTokenSaverSection(c),
     persona: () => renderPersonaSection(c),
     allow: () => renderAllowSection(c),
     chat: () => renderChatSection(c),
+    messageTypes: () => renderMessageTypesSection(c),
+    platform: () => renderPlatformSection(c),
+    mcp: () => renderMcpSection(c),
+    knowledge: () => renderKnowledgeSection(c),
+    memes: () => renderMemesSection(c),
+    moderation: () => renderModerationSection(c),
+    appearance: () => renderAppearanceBlock(c),
     desktop: () => renderDesktopSection(c),
     onebot: () => renderOnebotSection(c)
   };
@@ -133,6 +367,7 @@ function renderSettingsSection(c) {
     ${render()}
     <div class="save-bar">
       <button class="btn btn-primary" id="save-cfg-btn">保存设置</button>
+      <span id="cfg-dirty-note" class="muted">${state.settingsDirty ? '有未保存改动' : ''}</span>
       <span id="cfg-save-result" class="muted"></span>
     </div>`;
 }
@@ -189,7 +424,7 @@ function renderApiSection(c) {
     </div>
     <div class="checkbox-row"><input type="checkbox" id="cfg-vision" ${c.api.vision !== false ? 'checked' : ''} />
       <label for="cfg-vision">图片输入（关闭则移除看图工具，模型只会看到 [图片] 占位符）</label>
-      <span id="vision-switch-hint" class="muted" style="font-size:12px;align-self:center"></span></div>
+      <span id="vision-switch-hint" class="muted" style="font-size: var(--fs-sm);align-self:center"></span></div>
     <details class="collapsible settings-advanced" id="thinking-advanced">
       <summary>高级：思考模式${esc(thinkingAdvancedSummary(c))}</summary>
       <div style="padding-top:8px">
@@ -198,12 +433,12 @@ function renderApiSection(c) {
           <div id="thinking-seg-slot">${isSplitThinking(c) ? splitRowsHtml(c).inner : thinkingSegHtml(c)}</div>
           <div id="thinking-split-note">${isSplitThinking(c) ? splitRowsHtml(c).note : ''}</div>
           <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:6px;flex-wrap:wrap">
-            <label style="display:flex;align-items:center;gap:6px;font-size:13px;font-weight:normal">
-              <input type="checkbox" id="cfg-thinking-split" ${isSplitThinking(c) ? 'checked' : ''} />
+            <label style="display:flex;align-items:center;gap:6px;font-size: var(--fs-md);font-weight:normal">
+              <input class="sw" type="checkbox" id="cfg-thinking-split" ${isSplitThinking(c) ? 'checked' : ''} />
               <span>按任务分别设档（聊天 / 判断总结 / 写作 / 其他）</span>
             </label>
-            <label id="cfg-thinking-default-row" style="display:${isSplitThinking(c) ? 'none' : 'flex'};align-items:center;gap:6px;font-size:13px;font-weight:normal">
-              <input type="checkbox" id="cfg-thinking-default" ${thinkingIsDefault(c) ? 'checked' : ''} />
+            <label id="cfg-thinking-default-row" style="display:${isSplitThinking(c) ? 'none' : 'flex'};align-items:center;gap:6px;font-size: var(--fs-md);font-weight:normal">
+              <input class="sw" type="checkbox" id="cfg-thinking-default" ${thinkingIsDefault(c) ? 'checked' : ''} />
               <span>跟随服务商默认（不干预）</span>
             </label>
             <button class="btn btn-small" id="probe-thinking-btn" type="button" style="flex:none">测试思考能力</button>
@@ -214,12 +449,12 @@ function renderApiSection(c) {
         <div class="field">
           <label>自定义档位映射（JSON，表外/自定义渠道用）</label>
           <textarea id="cfg-thinking-params" rows="3" style="width:100%" placeholder='例如 {"low":{"reasoning_effort":"low"},"high":{"reasoning_effort":"high"}}。填了这里，档位条就会按这些键出现（仅对表外/自定义渠道生效）。'>${esc(extraBodyText(c.api?.thinkingParams))}</textarea>
-          <div class="hint" id="cfg-thinking-params-hint">键是档位（off/low/medium/high/max），值是请求里要带的字段；内置预设渠道走内置形状，不受这里影响。</div>
+          <div class="hint" id="cfg-thinking-params-hint">键是档位（off/low/medium/high/max），值是请求里要带的字段；内置预设渠道走内置形状，不受这里影响。　<strong>密钥类字段（如 authorization）在下面显示为 hasXxx 占位，明文不下发；不改这两个框＝原样保留，动了就会按你看到的存。</strong></div>
         </div>
         <div class="field">
           <label>额外请求参数（JSON）</label>
           <textarea id="cfg-extra-body" rows="3" style="width:100%" placeholder='例如 {"reasoning":{"enabled":false}}。留空 = 不附加。'>${esc(extraBodyText(c.api?.extraBody))}</textarea>
-          <div class="hint" id="cfg-extra-body-hint">填了就以最高优先级合并进每次请求（JSON 对象）；服务商文档里的怪参数都填这里，不用等适配。注意 stream 会被强制回非流式；model / messages / tools 会整段替换对应字段，排查异常时先清空这里。</div>
+          <div class="hint" id="cfg-extra-body-hint">填了就以最高优先级合并进每次请求（JSON 对象）；服务商文档里的怪参数都填这里，不用等适配。注意 stream 会被强制回非流式；model / messages / tools 会整段替换对应字段，排查异常时先清空这里。　<strong>密钥类字段（如 authorization）在下面显示为 hasXxx 占位，明文不下发；不改这两个框＝原样保留，动了就会按你看到的存。</strong></div>
         </div>
       </div>
     </details>
@@ -239,7 +474,9 @@ function renderApiSection(c) {
           <option value="block" ${c.api?.budget?.onExceed === 'block' ? 'selected' : ''}>停止：新消息不处理</option>
         </select></div>
     </div>
-    <div class="hint">超限当天私聊通知管理员一次（需配好管理员 QQ）；跨日自动重置。未定价的运行不计入金额，但会在用量状态里标出次数，避免"没价＝永远不超限"。</div>
+    <div class="hint">通知需要先配好管理员 QQ；跨日自动重置。未定价的运行不计入金额，但会在用量状态里标出次数，避免"没价＝永远不超限"。</div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-budget-notify" ${c.api?.budget?.notify !== false ? 'checked' : ''} />
+      <label for="cfg-budget-notify">超限时私聊通知管理员一次</label></div>
 
     <div class="settings-divider"></div>
 
@@ -282,7 +519,7 @@ function renderApiSection(c) {
       <div class="settings-divider"></div>
       <h3>从渠道自动拉价</h3>
     <div class="field">
-      <label>渠道地址（默认用上面的 Base URL；one-api / new-api 站会读它的 /api/pricing 倍率）</label>
+      <label>渠道地址（默认使用上方 Base URL；one-api / new-api 会读取该地址的 /api/pricing 倍率）</label>
       <div style="display:flex;gap:8px">
         <input type="text" id="probe-url" placeholder="https://api.example.com/provider/v1"
           value="${esc(c.api.baseUrl || '')}" style="flex:1" />
@@ -329,7 +566,7 @@ function renderApiSection(c) {
     <div style="display:flex;gap:8px;margin:8px 0">
       <button class="btn btn-small" id="pc-price-btn">给这个模型定价</button>
       <button class="btn btn-small" id="batch-price-btn">批量自定义价格编辑</button>
-      <span class="muted" style="font-size:12px;align-self:center">填你的渠道实付价（覆盖官方价）；也可为多个模型分别设定</span>
+      <span class="muted" style="font-size: var(--fs-sm);align-self:center">填你的渠道实付价（覆盖官方价）；也可为多个模型分别设定</span>
     </div>
     </details>
 
@@ -341,6 +578,20 @@ function renderSearchSection(c) {
   const prov = String(c.webSearch?.provider || 'bing');
   // 自定义搜索提供商列表（可多个），用于动态生成下拉框选项
   const customProvs = Array.isArray(c.webSearch?.providers) ? c.webSearch.providers : [];
+  const providerLabel = {
+    bing: 'Bing 网页解析', deepseek: 'DeepSeek 原生搜索', zhipu: '智谱 Web Search',
+    bocha: '博查 AI Search', baidu: '百度千帆 AI Search', metaso: '秘塔 AI 搜索',
+    doubao: '豆包搜索', tavily: 'Tavily', so360: '360 网页解析', sogou: '搜狗网页解析',
+    bilibili: 'B 站搜索', aggregate: '聚合搜索'
+  }[prov] || (prov.startsWith('custom:')
+    ? (customProvs.find((p) => `custom:${p.id}` === prov)?.name || prov)
+    : prov);
+  const supplementText = prov === 'bing'
+    ? '搜狗 → B 站 → Bing 站内限定 → 360'
+    : (prov === 'aggregate' ? '按下方聚合源列表并发（不再叠加梗补充）' : '不启用（只有主源是 Bing 时自动补）');
+  const supplementHint = prov === 'bing'
+    ? '只有含“梗 / 抖音 / 什么意思 / 出处 / 热梗”或很短的中文词的查询才会补；普通查询只走主搜索。补充源不需要 Key；搜狗和 360 可能被出口 IP 风控，失败会自动换下一个。'
+    : '当前主源不是 Bing：梗查询不会走自动补充链；自测按钮仍按当前配置执行。';
   return `
     <h3 id="settings-search">搜索服务</h3>
     <div class="checkbox-row"><input type="checkbox" id="cfg-websearch" ${c.webSearch?.enabled !== false ? 'checked' : ''} />
@@ -348,6 +599,9 @@ function renderSearchSection(c) {
     <div class="field"><label>搜索提供方</label>
       <select id="cfg-searchprovider">
         <option value="bing" ${prov === 'bing' ? 'selected' : ''}>Bing 网页解析</option>
+        <option value="so360" ${prov === 'so360' ? 'selected' : ''}>360 网页解析（中文/抖音梗）</option>
+        <option value="sogou" ${prov === 'sogou' ? 'selected' : ''}>搜狗网页解析（中文/抖音梗）</option>
+        <option value="bilibili" ${prov === 'bilibili' ? 'selected' : ''}>B 站搜索（梗知识/解释视频）</option>
         <option value="deepseek" ${prov === 'deepseek' ? 'selected' : ''}>DeepSeek 原生搜索</option>
         <option value="zhipu" ${prov === 'zhipu' ? 'selected' : ''}>智谱 Web Search</option>
         <option value="bocha" ${prov === 'bocha' ? 'selected' : ''}>博查 AI Search</option>
@@ -358,11 +612,31 @@ function renderSearchSection(c) {
         <option value="aggregate" ${prov === 'aggregate' ? 'selected' : ''}>聚合搜索（多源并发）</option>
         ${customProvs.map((p) => `<option value="custom:${esc(p.id)}" ${prov === `custom:${p.id}` ? 'selected' : ''}>${esc(p.name || p.baseUrl)}（自定义 · ${p.type === 'bing' ? '网页解析' : 'JSON 接口'}）</option>`).join('')}
       </select></div>
+    <div class="field" id="search-chain-summary">
+      <label>实际搜索方式</label>
+      <div class="hint">
+        <div><b>主搜索：</b>${esc(providerLabel)}</div>
+        <div><b>普通查询：</b>实时信息、新闻、价格、教程、文档、产品参数、事实核查都走主搜索，只有梗查询才走下面的补充链。</div>
+        <div><b>梗查询自动补充：</b>${esc(supplementText)}</div>
+        <div>${esc(supplementHint)}</div>
+        <div>模型拿不准一个词是不是梗/外号时，会显式开启梗补充（meme=true），不依赖查询里出现“梗/抖音”。</div>
+      </div>
+    </div>
+    <div class="field">
+      <label for="cfg-search-test-query">测试搜索（普通查询或梗词都行，看实际走了哪些源）</label>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input type="text" id="cfg-search-test-query" placeholder="例如：上海天气 / 某个梗" style="flex:1" maxlength="120" />
+        <button class="btn btn-small" id="cfg-search-test-btn" type="button">测试</button>
+      </div>
+      <div class="checkbox-row" style="margin-top:6px"><input type="checkbox" id="cfg-search-test-meme" checked />
+        <label for="cfg-search-test-meme">按梗查询强制补充（即使查询里没有“梗/抖音”也走 B 站/搜狗/站内限定）</label></div>
+      <div class="hint" id="cfg-search-test-result">还没有测试。</div>
+    </div>
     <div class="field" id="custom-provider-manage" style="${prov.startsWith('custom:') ? '' : 'display:none'}">
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <button class="btn btn-small" id="test-search-provider-btn">测试这个搜索服务</button>
         <button class="btn btn-small btn-danger" id="del-search-provider-btn">删除这个搜索服务</button>
-        <span id="search-provider-action-hint" class="muted" style="font-size:12px"></span>
+        <span id="search-provider-action-hint" class="muted" style="font-size: var(--fs-sm)"></span>
       </div>
     </div>
     <div class="field" id="bing-search-fields" style="${prov === 'bing' ? '' : 'display:none'}"><label>搜索地址（高级：可替换为兼容 Bing 结果格式的引擎）</label><input type="text" id="cfg-searchurl" value="${esc(c.webSearch?.searchUrl || 'https://cn.bing.com/search')}" /></div>
@@ -372,7 +646,8 @@ function renderSearchSection(c) {
           <input type="password" id="cfg-ds-searchkey" value="${esc(c.webSearch?.deepseek?.hasApiKey ? '******' : '')}" placeholder="输入新 Key 可替换；留空保持不变" autocomplete="new-password" style="flex:1" />
           <button class="btn btn-small" id="cfg-ds-searchkey-toggle" type="button">显示</button>
         </div></div>
-      <div class="field"><label>模型</label><input type="text" id="cfg-ds-searchmodel" value="${esc(c.webSearch?.deepseek?.model || 'deepseek-chat')}" /></div>
+      <div class="field"><label>模型（旧 Responses 兜底用）</label><input type="text" id="cfg-ds-searchmodel" value="${esc(c.webSearch?.deepseek?.model || 'deepseek-v4-flash')}" /></div>
+      <div class="field"><label>每次返回条数（1-50）</label><input type="number" id="cfg-ds-searchcount" min="1" max="50" value="${esc(c.webSearch?.deepseek?.count ?? 10)}" /></div>
     </div>
     <div class="field-row" id="zhipu-search-fields" style="${prov === 'zhipu' ? '' : 'display:none'}">
       <div class="field"><label>智谱 API Key（留空用环境变量 ZHIPU_API_KEY）</label>
@@ -419,7 +694,7 @@ function renderSearchSection(c) {
         <button class="btn btn-small" id="cfg-tavily-key-toggle" type="button">显示</button>
       </div></div>
     <div class="field" id="aggregate-search-fields" style="${prov === 'aggregate' ? '' : 'display:none'}">
-      <label>聚合源列表（逗号分隔，按优先级排序；可选 tavily / doubao / bing / baidu / zhipu / bocha / metaso，选中的源需已配好 Key）</label>
+      <label>聚合源列表（逗号分隔，按优先级排序；可选 tavily / doubao / bing / so360 / sogou / bilibili / baidu / zhipu / bocha / metaso，选中的源需已配好 Key，so360/sogou/bilibili/bing 不需要）</label>
       <input type="text" id="cfg-aggregate-sources" value="${esc((c.webSearch?.aggregate?.sources || ['tavily', 'doubao', 'bing']).join(','))}" placeholder="tavily,doubao,bing" style="flex:1" />
       <label>每源结果条数（2~6）</label>
       <input type="number" id="cfg-aggregate-count" min="2" max="6" value="${esc(c.webSearch?.aggregate?.count || 4)}" style="width:100px" />
@@ -448,7 +723,7 @@ function renderSearchSection(c) {
     </div>
     <div style="display:flex;gap:8px;align-items:center;margin:8px 0">
       <button class="btn btn-small" id="add-search-provider-btn">＋ 添加并选中</button>
-      <span id="add-search-provider-hint" class="muted" style="font-size:12px"></span>
+      <span id="add-search-provider-hint" class="muted" style="font-size: var(--fs-sm)"></span>
     </div>
   `;
 }
@@ -464,6 +739,8 @@ function renderMemorySettingsSection(c) {
     <h3 id="settings-memory">记忆整理</h3>
     <div class="checkbox-row"><input type="checkbox" id="cfg-mem-consolidate" ${mem.consolidateEnabled !== false ? 'checked' : ''} />
       <label for="cfg-mem-consolidate">启用记忆自动整理</label></div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-mem-handoff" ${mem.handoffEnabled !== false ? 'checked' : ''} />
+      <label for="cfg-mem-handoff">允许模型自动写「会话交接」（下次唤醒时带上）</label></div>
     <div class="checkbox-row"><input type="checkbox" id="cfg-mem-usechat" ${useChat ? 'checked' : ''} />
       <label for="cfg-mem-usechat">使用与聊天机器人相同的模型</label></div>
     <div id="mem-model-box" style="${useChat ? 'display:none' : ''}">
@@ -493,7 +770,21 @@ function renderMemorySettingsSection(c) {
       <div class="hint">改成「仅本会话」后，模型在群里只看得到这个群里观察到的印象；控制台人物记忆页仍可查全部（来源不交给模型）。</div>
     </div>
     <div class="checkbox-row"><input type="checkbox" id="cfg-mem-hideprivate" ${vis.hidePrivateInGroup ? 'checked' : ''} />
-      <label for="cfg-mem-hideprivate">群聊里隐藏「私聊来源」的印象</label></div>`;
+      <label for="cfg-mem-hideprivate">群聊里隐藏「私聊来源」的印象</label></div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-mem-private-shared" ${mem.privateSharedContext === true ? 'checked' : ''} />
+      <label for="cfg-mem-private-shared">所有私聊共用最近消息与交接（默认关）</label></div>
+    <div class="hint">打开后，机器人跟不同好友聊天时会看到彼此的最近私聊内容（消息会标「与 &lt;QQ&gt;」），更像同一个“人”；代价是不同好友的上下文会混在一起、更费 token，也可能把 A 的话带到 B 的对话里。写入和发送目标不变，群聊不受影响。</div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-mem-cross-scope-shared" ${mem.crossScopeSharedContext === true ? 'checked' : ''} />
+      <label for="cfg-mem-cross-scope-shared">群聊与私聊共用最近上下文（默认关）</label></div>
+    <div class="hint">打开后，机器人在任意群或私聊里都能看到其他群/好友的最近消息与最多 3 份交接（消息会标「群 &lt;群号&gt;」或「与 &lt;QQ&gt;」）。这会把 A 群/好友的话带到 B 的对话里，隐私边界最大、也更费 token；写入、发送目标和人物印象可见性都不变。打开这个后，上面的「所有私聊共用」已经包含在内，不必再开。</div>
+    <div class="field-row" style="align-items:start">
+      <div class="field"><label for="cfg-mem-max-per-person">每人最多保留印象（条）</label>
+        <input type="number" id="cfg-mem-max-per-person" min="5" max="200" value="${esc(mem.maxImpressionsPerPerson ?? 50)}" />
+        <div class="hint">5–200，默认 50；控制台手写的印象永远保留，不会被这个上限删掉。</div></div>
+      <div class="field"><label for="cfg-mem-retention-days">自动印象保留（天）</label>
+        <input type="number" id="cfg-mem-retention-days" min="0" max="3650" value="${esc(mem.impressionRetentionDays ?? 0)}" />
+        <div class="hint">0 = 不按时间过期（默认）；可设 1–3650 天。手写印象不受影响。</div></div>
+    </div>`;
 }
 
 function renderTimeControlSection(c) {
@@ -601,7 +892,16 @@ function syncThinkingUi(url, paramsOverride, splitOverride) {
   if (splitCbNow) splitCbNow.checked = split;
   const rows = split ? splitRowsHtml(fake) : null;
   const slot = document.getElementById('thinking-seg-slot');
-  if (slot) slot.innerHTML = split ? rows.inner : thinkingSegHtml(fake);
+  if (slot) {
+    slot.innerHTML = split ? rows.inner : thinkingSegHtml(fake);
+    // 整块 innerHTML 会连**滑块**一起换掉（滑块是 enhanceSeg 插进去的子元素），
+    // 而选中态现在完全靠滑块托底（.seg-item.selected 是"白字 + 透明底"）。
+    // 不补这一次，重画之后选中档就是白字贴浅色轨道 —— 看不见。
+    // 必须用 enhanceSeg（幂等）：它除了插滑块、定位，还会挂上"点击后重新对位"与方向键/Home/End
+    // 两个监听 —— refreshSeg 只定位不挂监听，重建出来的新节点上这些全是缺的（方向键按了没反应、
+    // 点别的档位滑块不动）。2026-10-08 审查修正。
+    enhanceSeg(slot);
+  }
   const splitNote = document.getElementById('thinking-split-note');
   if (splitNote) splitNote.innerHTML = split ? rows.note : '';
   const defRow = document.getElementById('cfg-thinking-default-row');
@@ -688,7 +988,7 @@ function thinkingHintText(c) {
       ? `渠道未识别：档位来自你的「自定义档位映射」（${Object.keys(c.api.thinkingParams).join('/')}）。`
       : '渠道未识别：在下面「自定义档位映射」里填 {\"low\":{\"reasoning_effort\":\"low\"}, …} 就能用档位条；或用「额外请求参数」整体自定义。'));
   bits.push('每个供应商各自一条设置：这里改的只对当前这家生效。');
-  bits.push('勾「按任务分别设档」：聊天（含其中的工具调用）/ 判断·总结（记忆整理、身份与关系评估、收不收表情）/ 写作（每日动态、空间互动文案）/ 其他任务，各选各的档；每行选「默认」= 跟随服务商默认。');
+  bits.push('勾「按任务分别设档」：聊天（含其中的工具调用）/ 判断 · 总结（记忆整理、身份与关系评估、收不收表情）/ 写作（每日动态、空间互动文案）/ 其他任务，各选各的档；每行选「默认」= 跟随服务商默认。');
   if (probe) {
     const when = probe.checkedAt ? new Date(probe.checkedAt).toLocaleDateString() : '';
     bits.push(probe.canDisable === true ? `已实测（${when}）：可关闭。`
@@ -698,6 +998,38 @@ function thinkingHintText(c) {
     bits.push('未实测：点右侧「测试思考能力」按真实请求探明。');
   }
   return bits.join(' ');
+}
+
+// 消息类型：按类型决定机器人读不读这类内容。关掉只是不让内容进提示词/不进模型 ——
+// 消息本身照常进聊天记录，存档、检索、金句墙都不受影响（2026-10-15 issue #34）。
+function renderMessageTypesSection(c) {
+  const mt = c.messageTypes || {};
+  const visionOn = c.api?.vision !== false;
+  return `
+    <h3 id="settings-message-types">消息类型</h3>
+    <div class="hint" style="margin-bottom:8px">按类型决定机器人<b>读不读</b>这类内容。关掉不影响消息进聊天记录，
+      只是不让它进提示词、不进模型 —— 省的是 token 与上下文窗口。
+      （合并转发那条要注意：<b>展开后的文本就是存档里的那一行</b>，关掉后存档与控制台里留的是占位符，
+      等内容被按需读取时才补上。）</div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-expand-forward" ${mt.expandForward !== false ? 'checked' : ''} />
+      <label for="cfg-expand-forward">自动展开合并转发 / 聊天记录卡片</label></div>
+    <div class="hint" style="margin-left:26px">关掉后正文只留一行占位符，模型需要时自己调 read_forward 展开；
+      <b>被 @ 的那条仍会自动展开</b>。一条 20 条的记录展开后是几千字符，还会跟着进存档和之后每一轮的上下文。</div>
+    <div class="checkbox-row" style="margin-top:8px"><input type="checkbox" id="cfg-mt-images" ${mt.images !== false ? 'checked' : ''} />
+      <label for="cfg-mt-images">查看消息里的图片与表情包</label></div>
+    <div class="hint" style="margin-left:26px">关掉后看图工具（get_message_images）从工具表摘掉，提示词改成"看不到图片内容"；
+      消息本身照常存档。<b>视频画面也依赖这个工具</b>，关掉后视频只保留声音。
+      表情包的<b>自动收藏</b>由「聊天设置 → 表情包」里的收藏开关单独控制，不受这里影响。</div>
+    <div class="checkbox-row" style="margin-top:8px"><input type="checkbox" id="cfg-mt-stickers" ${mt.stickers !== false ? 'checked' : ''} />
+      <label for="cfg-mt-stickers">查看表情库里没备注的图</label></div>
+    <div class="hint" style="margin-left:26px">只影响"看"：按备注名发送表情（send_sticker）不受影响；
+      关掉后 get_sticker_image 从工具表摘掉，模型只能按备注名挑选。</div>
+    <div class="hint" style="margin-top:8px">以上两项叠加在「模型 API」页的「图片输入」开关之上 —— 当前<b>${visionOn ? '开' : '关'}</b>
+      （关掉时看图工具会一律摘掉，这里的两项不起作用）。</div>
+    <div class="checkbox-row" style="margin-top:8px"><input type="checkbox" id="cfg-video-frames" ${mt.videoFrames !== false ? 'checked' : ''} />
+      <label for="cfg-video-frames">查看视频画面（抽 4 帧拼 2×2）</label></div>
+    <div class="hint" style="margin-left:26px">关掉后视频只剩声音（get_message_audio 转写），
+      省一次抽帧和一次视觉调用；提示词会同步改成"你只能拿到声音"。</div>`;
 }
 
 function renderTokenSaverSection(c) {
@@ -717,7 +1049,7 @@ function renderTokenSaverSection(c) {
       <td>${row.clamped ? `<strong>${esc(row.effective)}</strong> <span class="muted">（被夹住）</span>` : esc(row.effective)}</td>
     </tr>`).join('');
   return `
-    <h3 id="settings-token-saver">省 Token</h3>
+    <h3 id="settings-token-saver">Token 节省</h3>
     <div class="hint" style="margin-bottom:8px">开启后只给下面这些项<b>夹上限</b>，不改写你在各分区填的值 —— 关掉立刻恢复原样。
       每次模型调用的固定底（系统提示 + 工具定义，约 1.2 万-1.5 万 token）不受此影响，
       想再省就配合「聊天设置」的响应概率与「搜索服务 / 图片输入」开关。</div>
@@ -763,21 +1095,13 @@ function renderDesktopSection(c) {
       <span class="hint" id="console-token-result">更新后旧 Token 和其他已登录会话立即失效。</span>
     </div>
     <h3>界面</h3>
-    <div class="field"><label>主题</label>
-      <div class="theme-picker" id="theme-picker">
-        ${THEME_VALUES.map((t) => `
-          <div class="theme-option${getThemePref() === t ? ' on' : ''}" data-theme-opt="${t}" role="button" tabindex="0">
-            <span class="t-ico">${THEME_ICON[t]}</span>
-            <span>${THEME_LABEL[t]}</span>
-          </div>`).join('')}
-      </div>
-    </div>
     <div class="checkbox-row"><input type="checkbox" id="cfg-showvision" ${c.ui?.showVision !== false ? 'checked' : ''} />
       <label for="cfg-showvision">模型目录显示“支持图片输入/不支持图片输入”徽标</label></div>
     <div class="field"><label>界面刷新间隔（毫秒）</label><input type="number" id="cfg-refreshms" min="1000" step="1000" value="${esc(c.ui?.refreshMs ?? 15000)}" /></div>`;
 }
 
 function renderOnebotSection(c) {
+  const containerMode = c?.runtime?.container === true;
   const hb = ['auto', 'on', 'off'].includes(c.onebot?.wsHeartbeat) ? c.onebot.wsHeartbeat : 'auto';
   const windowMin = Math.max(0, Math.round(Number(c.onebot?.catchupReplyWindowMs ?? 30 * 60 * 1000) / 60000));
   return `
@@ -815,7 +1139,24 @@ function renderOnebotSection(c) {
         填 0 = 一律只补记录。默认 30 分钟。</div></div>
     </div>
     <div id="onebot-status-line">${onebotStatusLineHtml()}</div>
-    <div class="hint">改完 OneBot 地址、令牌或心跳策略后，执行 <code>manage.sh restart</code> 生效（连接只在启动时建立一次，改完不重启还是旧配置）。</div>`;
+    <div class="hint">改完 OneBot 地址、令牌或心跳策略后，执行 <code>${containerMode ? 'docker compose restart agent' : 'manage.sh restart'}</code> 生效（连接只在启动时建立一次，改完不重启还是旧配置）。</div>
+
+    <div class="settings-divider"></div>
+    <h3>协议端（SnowLuma）</h3>
+    <div id="snowluma-version-box" class="hint">正在读取协议端版本…</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 6px">
+      <button type="button" class="btn btn-small" id="snowluma-check-btn">重新检查</button>
+      <button type="button" class="btn btn-primary btn-small" id="snowluma-update-btn">更新协议端</button>
+      <button type="button" class="btn btn-small" id="snowluma-rollback-btn">回滚到上一版</button>
+      <span class="hint muted" id="snowluma-action-note" style="margin:0"></span>
+    </div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-snowluma-auto" ${c.autoUpdate?.snowluma?.enabled === true ? 'checked' : ''} ${containerMode ? 'disabled' : ''} />
+      <label for="cfg-snowluma-auto">自动更新协议端（落后于项目基线就自动升级，每 6 小时检查一次；失败自动回滚）</label></div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-snowluma-follow-baseline" ${c.autoUpdate?.snowluma?.followBaseline === false ? '' : 'checked'} ${containerMode ? 'disabled' : ''} />
+      <label for="cfg-snowluma-follow-baseline">随智能体版本对齐协议端（推荐：更新到新版本时，若新版带的协议端基线更高就自动升级一次；<b>设了自定义镜像的不受影响</b>）</label></div>
+    <div class="hint">${containerMode
+      ? '容器模式：协议端由 compose 管理，上面两个开关不会执行；升级请改 compose 里的镜像 tag 后重建容器。'
+      : '升级只改协议端目录 .env 里的镜像 tag 再重建容器：端口与数据卷都不动，所以 <b>QQ 登录态保留</b>；更新期间机器人会短暂离线（约 10~30 秒）。协议端低于 1.14.20 时，表情包在 QQ 里会显示成图片。'}</div>`;
 }
 
 /** 选择模型：左提供商 / 右模型，点击模型后保存到当前 api 配置并关闭。 */
@@ -851,7 +1192,7 @@ function openModelPicker() {
       <div class="mm-model" data-pid="${esc(p.id)}" data-model="${esc(m)}">
         <span class="mm-check">${m === state.config?.api?.model && p.id === current ? '✓' : ''}</span>
         <span>${esc(names[m] || m)}</span>
-        <span class="muted" style="font-size:11px">${esc(m)}</span>
+        <span class="muted" style="font-size: var(--fs-xs)">${esc(m)}</span>
       </div>`).join('') || '<div class="muted" style="padding:10px">该提供商下没有模型</div>';
     right.querySelectorAll('.mm-model').forEach((el) => {
       el.addEventListener('click', async () => {
@@ -917,7 +1258,7 @@ function openModelAddModal(baseUrl, apiKey, remoteModels) {
     body: `
       <div class="ma-toolbar">
         <input type="text" id="ma-search" placeholder="搜索模型或厂商…" autocomplete="off" />
-        <span class="muted" id="ma-count" style="font-size:12px;white-space:nowrap">${esc(countText)}</span>
+        <span class="muted" id="ma-count" style="font-size: var(--fs-sm);white-space:nowrap">${esc(countText)}</span>
       </div>
       <div class="ma-body ${dual ? 'dual' : 'single'}">
         ${dual ? '<div class="model-modal-left" id="ma-left"></div>' : ''}
@@ -943,7 +1284,7 @@ function openModelAddModal(baseUrl, apiKey, remoteModels) {
       <label class="mm-model">
         <input type="checkbox" class="ma-check" value="${esc(m)}" ${added ? 'checked disabled' : ''} />
         <span class="mm-model-text">${esc(modelPart)}</span>
-        ${added ? '<span class="muted" style="font-size:11px">已添加</span>' : ''}
+        ${added ? '<span class="muted" style="font-size: var(--fs-xs)">已添加</span>' : ''}
       </label>`;
   };
 
@@ -970,7 +1311,7 @@ function openModelAddModal(baseUrl, apiKey, remoteModels) {
     left.innerHTML = vendors.length
       ? vendors.map((v) => `
           <div class="mm-prov ${v === activeVendor ? 'active' : ''}" data-vendor="${esc(v)}">
-            ${esc(v)} <span class="muted" style="font-size:11px">${(groups.get(v) || []).filter(matches).length}</span>
+            ${esc(v)} <span class="muted" style="font-size: var(--fs-xs)">${(groups.get(v) || []).filter(matches).length}</span>
           </div>`).join('')
       : '<div class="muted" style="padding:10px">没有匹配的厂商</div>';
     left.querySelectorAll('.mm-prov').forEach((el) => {
@@ -1054,7 +1395,7 @@ function openModelDeleteModal() {
     right.innerHTML = p.models.map((m) => `
       <div class="mm-model" data-model="${esc(m)}">
         <span>${esc(names[m] || m)}</span>
-        <span class="muted" style="font-size:11px">${esc(m)}</span>
+        <span class="muted" style="font-size: var(--fs-xs)">${esc(m)}</span>
         <button class="mm-del">删除</button>
       </div>`).join('') || '<div class="muted" style="padding:10px">该提供商下没有模型</div>';
     right.querySelectorAll('.mm-model').forEach((el) => {
@@ -1164,10 +1505,10 @@ function openBlocklistModal() {
         <div class="model-modal-left" id="bl-left"></div>
         <div class="model-modal-right" id="bl-right"></div>
       </div>
-      <div class="muted" style="font-size:12px;flex-shrink:0;margin-top:8px">
+      <div class="muted" style="font-size: var(--fs-sm);flex-shrink:0;margin-top:8px">
         勾选 = 屏蔽：被屏蔽群员的消息不存档、不触发回复、不进提示词背景。
       </div>`,
-    foot: `<span class="muted" id="bl-status" style="flex:1;text-align:left;font-size:12px"></span>
+    foot: `<span class="muted" id="bl-status" style="flex:1;text-align:left;font-size: var(--fs-sm)"></span>
            <button class="btn" id="bl-cancel">取消</button>
            <button class="btn btn-primary" id="bl-save">保存设置</button>`
   });
@@ -1178,7 +1519,7 @@ function openBlocklistModal() {
   const groupNames = new Map();   // 异步补群名
   function renderLeft() {
     left.innerHTML = allowIds.map((id) =>
-      `<div class="mm-prov ${id === activeGid ? 'active' : ''}" data-gid="${esc(id)}">${esc(groupNames.get(id) || id)}<div class="muted" style="font-size:11px">${esc(id)}</div></div>`).join('');
+      `<div class="mm-prov ${id === activeGid ? 'active' : ''}" data-gid="${esc(id)}">${esc(groupNames.get(id) || id)}<div class="muted" style="font-size: var(--fs-xs)">${esc(id)}</div></div>`).join('');
     left.querySelectorAll('.mm-prov').forEach((el) => {
       el.addEventListener('click', () => { activeGid = el.dataset.gid; renderLeft(); loadMembers(); });
     });
@@ -1204,7 +1545,7 @@ function openBlocklistModal() {
       return `<label class="bl-member">
         <input type="checkbox" class="bl-chk" data-uid="${esc(m.userId)}" ${isBlocked(m.userId) ? 'checked' : ''} />
         <span class="bl-name">${esc(label)}</span>
-        <span class="muted" style="font-size:11px">${esc(m.userId)}</span>
+        <span class="muted" style="font-size: var(--fs-xs)">${esc(m.userId)}</span>
       </label>`;
     }).join('');
     listEl.innerHTML = rows || '<div class="empty-hint" style="padding:18px">没有匹配的群员</div>';
@@ -1350,6 +1691,6 @@ function openPriceDialog({ model, vendor } = {}) {
 
 export {
   openBlocklistModal, openModelAddModal, openModelDeleteModal, openModelPicker, openPriceDialog,
-  openWhitelistPicker, renderSettingsImpl, renderTimeRuleEditor, resolveTheme, startListPoller,
-  syncPriceDialogBilling, syncThinkingUi
+  openWhitelistPicker, renderSettingsImpl, renderTimeRuleEditor, resetMenuReveal, resolveTheme,
+  startListPoller, syncPriceDialogBilling, syncThinkingUi
 };

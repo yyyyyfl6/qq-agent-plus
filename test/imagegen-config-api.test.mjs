@@ -106,6 +106,47 @@ test('从磁盘读回被污染的配置：残留的派生结论在载入时被�
   assert.equal(got.body.imageGen?.hasApiKey, false, 'Key 没了就不能再说"已存过 Key"');
 });
 
+test('imageGen.extraBody：自定义参数能落盘，清空用 __replace__ 真删键', async (t) => {
+  const { request, disk } = await boot(t);
+  const saved = await request('/api/config', {
+    method: 'POST',
+    body: { imageGen: { extraBody: { __replace__: { output_watermark: false } } } }
+  });
+  assert.equal(saved.status, 200);
+  assert.deepEqual(getConfig().imageGen?.extraBody, { output_watermark: false });
+  assert.deepEqual(disk().imageGen?.extraBody, { output_watermark: false });
+
+  await request('/api/config', { method: 'POST', body: { imageGen: { extraBody: { __replace__: {} } } } });
+  assert.deepEqual(getConfig().imageGen?.extraBody, {}, '清空后不能留下旧参数');
+});
+
+test('imageGen.extraBody 的脱敏占位不会覆盖真值', async (t) => {
+  const secret = { scheme: 'Bearer', value: 'sk-imagegen-secret' };
+  const { request } = await boot(t, (cfg) => {
+    cfg.imageGen = { ...cfg.imageGen, extraBody: { normal: 'ok', authorization: secret } };
+  });
+  const view = (await request('/api/config')).body.imageGen.extraBody;
+  assert.equal(view.normal, 'ok');
+  assert.equal(view.authorization, undefined, '视图里不能出现明文');
+  assert.equal(view.hasAuthorization, true, '脱敏后应留下占位');
+
+  // 原样回传 = 没动过：不能把 hasAuthorization 落盘
+  await request('/api/config', { method: 'POST', body: { imageGen: { extraBody: { __replace__: { ...view } } } } });
+  assert.deepEqual(getConfig().imageGen.extraBody, { normal: 'ok', authorization: secret });
+  assert.equal('hasAuthorization' in getConfig().imageGen.extraBody, false);
+
+  // 改了别的字段：真值要回填，新字段也要生效
+  await request('/api/config', {
+    method: 'POST',
+    body: { imageGen: { extraBody: { __replace__: { ...view, output_watermark: false } } } }
+  });
+  assert.deepEqual(getConfig().imageGen.extraBody, {
+    normal: 'ok',
+    authorization: secret,
+    output_watermark: false
+  });
+});
+
 test('「显示」按钮的端点：回环请求能取回明文 Key；不可信来源被拒', async (t) => {
   const { request } = await boot(t, (cfg) => { cfg.imageGen = { ...cfg.imageGen, apiKey: 'img-secret' }; });
   // 本机控制台：能取回（与 /api/tts/key 同一道守卫）
@@ -116,4 +157,17 @@ test('「显示」按钮的端点：回环请求能取回明文 Key；不可信�
   const evil = await request('/api/imagegen/key', { headers: { origin: 'http://evil.example.com' } });
   assert.notEqual(evil.status, 200, '跨站来源不该拿到明文 Key');
   assert.equal(evil.body?.apiKey, undefined);
+});
+
+test('imageGen.sendAs：默认 sticker，可保存 image，非法值回落 sticker', async (t) => {
+  const { request } = await boot(t);
+  const initial = await request('/api/config');
+  assert.equal(initial.body.imageGen.sendAs, 'sticker', '默认保持旧行为（表情）');
+
+  const saved = await request('/api/config', { method: 'POST', body: { imageGen: { sendAs: 'image' } } });
+  assert.equal(saved.status, 200);
+  assert.equal(getConfig().imageGen.sendAs, 'image');
+
+  await request('/api/config', { method: 'POST', body: { imageGen: { sendAs: 'bogus' } } });
+  assert.equal(getConfig().imageGen.sendAs, 'sticker', '非法值不能落盘成第三种状态');
 });

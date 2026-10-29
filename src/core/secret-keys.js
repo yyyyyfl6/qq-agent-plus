@@ -16,6 +16,14 @@ export const SECRET_KEY_PATTERN = /(^token$|apikey|api_key|accesstoken|access_to
 // 形如 apiKeyFrom 的字段存的是"密钥来源标识"（如 manual），不是密钥本身，不要脱敏
 export const SECRET_KEY_EXCLUDE = /from$/i;
 
+/** 对象/数组里有没有"非空的叶子"：用来判断 `{value:'Bearer sk-…'}` 这种形态算不算"有密钥"。 */
+function containsSomething(value, depth = 0) {
+  if (depth > 4) return Boolean(value);
+  if (value == null) return false;
+  if (typeof value !== 'object') return Boolean(String(value).trim());
+  return Object.values(value).some((v) => containsSomething(v, depth + 1));
+}
+
 // ── 配置形态脱敏（控制台 /api/config 下发用，语义与迁出前逐字一致）────────────────
 /**
  * 凡是字段名命中 SECRET_KEY_PATTERN 的，值一律替换为空串（保留"有/无"的 hasXxx 标记）。
@@ -30,7 +38,11 @@ export function sanitizeConfigSecrets(cfg) {
     seen.add(node);
     for (const key of Object.keys(node)) {
       const value = node[key];
-      if (value && typeof value === 'object') { walk(value); continue; }
+      // ⚠️ 顺序要紧：先判"这个键名是不是密钥"，再决定要不要往里递归。
+      // 反过来（先递归、对象就 continue）的话，**对象/数组形态**的密钥字段会整条漏过去 ——
+      // `api.extraBody.authorization = {value:'Bearer sk-…'}` 里的明文原样下发到浏览器
+      //（2026-10-04 复审 P3 实测：`apiKey:{value:'sk-NESTED'}`、`token:['sk-ARR']` 均明文）。
+      // 键名命中密钥模式时，无论值是字符串还是对象/数组，一律整条删除 + 生成 hasXxx。
       if (SECRET_KEY_EXCLUDE.test(key)) continue;
       // 已生成的 hasXxx 布尔标记本身也会被 apikey 模式匹配到，
       // 不排除就会连锁生成 hasHasXxx
@@ -41,10 +53,16 @@ export function sanitizeConfigSecrets(cfg) {
         // 若这里留一个空串，deepMerge 会拿空串覆盖掉服务端保存的真 Key ——
         // 表现为：用户点一次"保存设置"，所有搜索 Key 就被静默清空。
         // 删掉字段则展开时不会带上该键，服务端原值得以保留。
+        // 对象值要先探一下里面有没有真东西：有就仍算"有密钥"（hasXxx 才有意义）。
+        const hasValue = value && typeof value === 'object'
+          ? containsSomething(value)
+          : Boolean(String(value ?? '').trim());
         delete node[key];
         const flagName = `has${key.charAt(0).toUpperCase()}${key.slice(1)}`;
-        node[flagName] = Boolean(String(value ?? '').trim());
+        node[flagName] = hasValue;
+        continue;
       }
+      if (value && typeof value === 'object') walk(value);
     }
   };
   walk(out);
@@ -80,6 +98,23 @@ export function sanitizeConfigSecrets(cfg) {
   }
   // 顶层 api：walk 已生成 hasApiKey，这里补一个简写的 hasKey 供旧代码读取
   if (out.api) out.api.hasKey = out.api.hasApiKey ?? Boolean(String(cfg?.api?.apiKey ?? '').trim());
+
+  // MCP env/args：第三方 server 的密钥常写在 env 或 --token=… 里。walk 会把 env 里的
+  // API_KEY 整条删掉（前端再保存时就永久丢了），所以这里用原始值重建一份带掩码的副本：
+  // 非空密钥显示 ******，保存时服务端按 server id + key 恢复；非密钥 env 原样保留。
+  if (out.mcp && Array.isArray(out.mcp.servers) && Array.isArray(cfg?.mcp?.servers)) {
+    const byId = new Map(cfg.mcp.servers.map((server) => [String(server?.id || ''), server]));
+    out.mcp.servers = out.mcp.servers.map((server) => {
+      const original = byId.get(String(server?.id || '')) || {};
+      const env = {};
+      for (const [key, value] of Object.entries(original.env || {})) {
+        env[key] = SECRET_KEY_PATTERN.test(key) && String(value ?? '').trim() ? '******' : value;
+      }
+      const args = (Array.isArray(original.args) ? original.args : []).map((arg) =>
+        /(token|key|secret|password)=/i.test(String(arg)) ? '******' : arg);
+      return { ...server, env, args };
+    });
+  }
 
   return out;
 }

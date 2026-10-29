@@ -15,7 +15,13 @@ process.env.QQ_AGENT_DATA_DIR = dataDir;
 process.on('exit', () => { try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch { /* 句柄占用就算了 */ } });
 
 const { DEFAULT_CONFIG, updateConfig } = await import('../src/core/config.js');
-const { OVERSIZE_LIMIT_RE, fetchOversizedImageAsJpeg, resolveFfmpeg } = await import('../src/tools/image-downsample.js');
+const { OVERSIZE_LIMIT_RE, fetchOversizedImageAsJpeg, resolveFfmpeg, convertStillImageToJpeg } = await import('../src/tools/image-downsample.js');
+// 1x1 透明 PNG：内容合法，ffmpeg 解得出
+const PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+  'base64'
+);
+const HAS_FFMPEG = spawnSync('ffmpeg', ['-version'], { stdio: 'ignore' }).status === 0;
 
 const cfg = structuredClone(DEFAULT_CONFIG);
 // safe-fetch 默认拒绝内网地址；测试服务就起在 127.0.0.1，显式放行（仅本测试进程的临时配置）
@@ -132,4 +138,21 @@ test('resolveFfmpeg 探测结果在进程内保持一致（缓存语义）', asy
   const second = await resolveFfmpeg();
   assert.equal(first, second);
   assert.ok(first === null || typeof first === 'string');
+});
+
+test('AVIF/HEIC 这类视觉接口不认的格式：先转 JPEG 再送模型', { skip: !HAS_FFMPEG && '需要 ffmpeg' }, async () => {
+  const { toVisionDataUrl } = await import('../src/tools/tools-core.js');
+  // 内容其实是 PNG，但上游声明的 MIME 是 AVIF —— 走的是"格式不在白名单 → 转码"分支
+  const out = await toVisionDataUrl(PNG, 'image/avif');
+  assert.match(out, /^data:image\/jpeg;base64,/);
+  const bytes = Buffer.from(out.split(',')[1], 'base64');
+  assert.equal(bytes[0], 0xff, 'JPEG SOI 第一字节');
+  assert.equal(bytes[1], 0xd8, 'JPEG SOI 第二字节');
+});
+
+test('convertStillImageToJpeg 直接产出 JPEG 字节', { skip: !HAS_FFMPEG && '需要 ffmpeg' }, async () => {
+  const jpeg = await convertStillImageToJpeg(PNG);
+  assert.ok(Buffer.isBuffer(jpeg) && jpeg.length > 0);
+  assert.equal(jpeg[0], 0xff);
+  assert.equal(jpeg[1], 0xd8);
 });

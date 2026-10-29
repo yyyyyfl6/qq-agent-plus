@@ -209,6 +209,14 @@ function patch() {
     stopIfDisabled(this);
     return startIfNeeded(this)?.relationshipFor(userId) || null;
   };
+
+  // 保留期清理：app.js 的每日调度通过它拿到当前活跃的关系台账 ——
+  // instances 是文件内私有 WeakMap，外部没有别的入口能触到 relationshipStore。
+  // 试点关闭/未启动时静默跳过（getPilot 不创建）。
+  proto.pruneRelationshipHistory = function pruneRelationshipHistory(retentionDays = 90) {
+    try { getPilot(this, false)?.pruneHistory(retentionDays); }
+    catch { /* 清理失败不影响运行 */ }
+  };
 }
 
 patch();

@@ -6,11 +6,33 @@ import { normalizeThinkingIntent, resolveThinkingPatch, modelServiceById, modelS
 import { resolveModelPrice, priceAt } from '../pricing/model-prices.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { assertTimeAllowed, watchTimeWindow } from '../core/time-gate.js';
+import { readJsonBounded, readTextBounded } from '../core/http-body.js';
 import { createLogger } from '../core/logger.js';
 import { imageType } from '../core/image-type.js';
 import { redactText } from '../core/redact.js';
 
 const log = createLogger('llm');
+
+// 聊天响应可能是长文，给宽松但有限的上限：8 MiB 已远超正常回答，
+// 又能拦住畸形上游一口气吐几百 MB 把常驻进程读爆。
+const CHAT_RESPONSE_MAX_BYTES = 8 * 1024 * 1024;
+// /models 只是一串模型 id，2 MiB 绰绰有余。
+const MODELS_JSON_MAX_BYTES = 2 * 1024 * 1024;
+
+/**
+ * 进程内 LLM 计数（低基数，不按会话/用户打标签）。
+ * requests = 外层对话请求；attempts = 真正打出去的 HTTP 次数（含重试/兜底）；
+ * retries = 主动重试次数；failures = 最终失败（重试与兜底都耗尽）；fallbackUses = 切兜底次数。
+ * 控制台 /api/metrics 直接读这份计数，不额外落库。
+ */
+export const llmRuntimeStats = {
+  requests: 0,
+  attempts: 0,
+  retries: 0,
+  failures: 0,
+  primaryErrors: 0,
+  fallbackUses: 0
+};
 
 function joinUrl(base, path) {
   return `${String(base).replace(/\/+$/, '')}${path}`;
@@ -243,8 +265,10 @@ async function runCompletionWithRetries(args, retries) {
       args.signal?.throwIfAborted();
       const response = await chatCompletion(args);
       if (!moderationRetried && isModerationRefusal(response)) {
+        if (attempt >= retries) return response;   // 最后一轮还被拦：把拦截结果如实返回（重试预算已耗尽）
         moderationRetried = true;
         args = { ...args, messages: trimForModerationRetry(args.messages) };
+        llmRuntimeStats.retries += 1;
         log.warn('[llm] 服务商审核拦截整次请求，改用精简上下文重试一次');
         await delay(600, undefined, { signal: args.signal });
         continue;
@@ -254,6 +278,7 @@ async function runCompletionWithRetries(args, retries) {
       lastError = error;
       if (args.signal?.aborted || attempt >= retries || !isRetryableError(error)) throw error;
       const wait = 1000 * Math.pow(2, attempt);   // 1s, 2s
+      llmRuntimeStats.retries += 1;
       log.warn(`[llm] 请求失败（第 ${attempt + 1} 次尝试），${wait}ms 后重试：${error?.message ?? error}`);
       await delay(wait, undefined, { signal: args.signal });
     }
@@ -277,6 +302,14 @@ function pickFallback(args) {
   try { fb = getConfig().api?.fallback; } catch { return null; }
   if (!fb || fb.enabled === false || !String(fb.model || '').trim()) return null;
   const api = effectiveApi();
+  const fbBase = String(fb.baseUrl || '').trim();
+  // 备用地址换了主机、却没单独给 Key 时**绝不沿用主渠道那把** —— 那等于把 A 家的密钥发给 B 家
+  // （这类事故本项目在 asr / 生图 / tts 上都修过，兜底模型是最后一个漏口）。
+  // 文档里 api.fallback.apiKey 本就是"另一个服务商的 key"；留空就当"没配兜底"，退回主渠道的错。
+  if (fbBase && hostOf(fbBase) !== hostOf(api.baseUrl) && !String(fb.apiKey || '').trim()) {
+    log.warn(`[llm] 兜底地址 ${hostOf(fbBase)} 与主渠道不同却没配 api.fallback.apiKey，本次不切兜底`);
+    return null;
+  }
   return {
     ...api,
     baseUrl: fb.baseUrl || api.baseUrl,
@@ -292,12 +325,14 @@ function pickFallback(args) {
  * 自动改用 config.api.fallback 里配置的备用模型再试一次（只切一次，不递归）。
  */
 export async function chatCompletionWithRetry(args, retries = 2) {
+  llmRuntimeStats.requests += 1;
   let response = null;
   let primaryError = null;
   try {
     response = await runCompletionWithRetries(args, retries);
   } catch (error) {
     primaryError = error;
+    llmRuntimeStats.primaryErrors += 1;
   }
 
   const shouldFallback = primaryError
@@ -305,7 +340,13 @@ export async function chatCompletionWithRetry(args, retries = 2) {
     : isModerationRefusal(response);
   const fb = shouldFallback ? pickFallback(args) : null;
   if (!fb || args.signal?.aborted) {
-    if (primaryError) throw primaryError;
+    if (primaryError) {
+      llmRuntimeStats.failures += 1;
+      throw primaryError;
+    }
+    // 兜底不可用时把**本次结果**如实返回；null 只能来自内部异常路径（throw null 已被上面堵死），
+    // 但调用方（orchestrator 等）会直接读 response.model / .message —— 这里显式兜一层，别让它崩在调用方。
+    if (!response) throw new Error('模型请求没有返回结果');
     return response;
   }
 
@@ -313,7 +354,19 @@ export async function chatCompletionWithRetry(args, retries = 2) {
     ? `失败（${String(primaryError?.message ?? primaryError).slice(0, 90)}）`
     : '两轮都被审核拦截';
   log.warn(`[llm] 主模型${why}，改用兜底模型 ${fb.model}`);
-  return await runCompletionWithRetries({ ...args, overrides: fb }, 1);
+  llmRuntimeStats.fallbackUses += 1;
+  try {
+    const fbResponse = await runCompletionWithRetries({ ...args, overrides: fb }, 1);
+    // 2026-10-06 复审 P3：标记本次是否真的换了渠道（兜底端点与主渠道 host 不同）。
+    // 同渠道换模型不算换渠道 —— vendor 不变；跨渠道时调用方把成本记到实际渠道名下。
+    const primaryBase = String(effectiveApi().baseUrl || '');
+    const channelChanged = Boolean(fbResponse.originBaseUrl)
+      && hostOf(fbResponse.originBaseUrl) !== hostOf(primaryBase);
+    return { ...fbResponse, viaFallback: true, channelChanged };
+  } catch (error) {
+    llmRuntimeStats.failures += 1;
+    throw error;
+  }
 }
 
 /**
@@ -368,6 +421,7 @@ export async function chatCompletion({
   thinking: intentOverride = undefined
 }) {
   assertTimeAllowed();
+  llmRuntimeStats.attempts += 1;
   const api = overrides || effectiveApi();
   if (api.requireApiKey && (!api.apiKey || api.apiKey === '******')) throw new Error('人格提供商缺少 API Key，请在提供商设置中保存');
   // 聊天这类"随口回一句"的任务关掉思考：省一半输出 token、少 1~3 秒；
@@ -466,7 +520,7 @@ export async function chatCompletion({
     });
     let res = await send(body);
     if (!res.ok) {
-      let text = await res.text();
+      let text = await readTextBounded(res, CHAT_RESPONSE_MAX_BYTES);
       // 模型级差异：个别模型/网关不认识思考参数会整次 400 —— 一个可选参数不该让消息发不出去。
       // 去掉"我们自己加的"思考参数重试一次（extraBody 是用户显式填的，不动）。
       const patchKeys = thinking.patch ? Object.keys(thinking.patch) : [];
@@ -484,16 +538,18 @@ export async function chatCompletion({
           log.warn('[llm] 模型拒绝思考参数，已去掉后重试（每个模型提示一次）：', api.model, '|', redactText(text, 160));
         }
         res = await send(retryBody);
-        if (!res.ok) text = await res.text();
+        if (!res.ok) text = await readTextBounded(res, CHAT_RESPONSE_MAX_BYTES);
       }
       if (!res.ok) throw new Error(`模型 API HTTP ${res.status}：${redactText(text, 500)}`);
     }
-    const data = await res.json();
+    const data = await readJsonBounded(res, CHAT_RESPONSE_MAX_BYTES);
     const choice = data?.choices?.[0];
     if (!choice) throw new Error('模型 API 响应缺少 choices');
     return {
       message: choice.message ?? {}, finishReason: choice.finish_reason ?? null,
-      usage: data.usage ?? null, model: data.model ?? api.model, raw: data
+      usage: data.usage ?? null, model: data.model ?? api.model, raw: data,
+      // 实际发往的端点（overrides/兜底接管后 ≠ 主渠道）—— 调用方据此把成本记到实际渠道名下
+      originBaseUrl: String(api.baseUrl || '')
     };
   } catch (error) {
     if (controller.signal.reason?.code === 'TIME_CONTROL_INACTIVE') throw controller.signal.reason;
@@ -516,7 +572,7 @@ export async function listModels() {
     signal: AbortSignal.timeout(15000)
   });
   if (!res.ok) throw new Error(`获取模型列表失败：HTTP ${res.status}`);
-  const data = await res.json();
+  const data = await readJsonBounded(res, MODELS_JSON_MAX_BYTES);
   const list = Array.isArray(data?.data) ? data.data : (Array.isArray(data) ? data : []);
   return list.map((m) => ({ id: String(m.id ?? m.model ?? m) })).filter((m) => m.id);
 }
@@ -540,9 +596,9 @@ export function addUsage(target, usage) {
 /** 兼容各供应商返回缓存命中 Token 的字段差异。 */
 export function cachedTokensOfUsage(usage = {}) {
   return Number(
-    usage.prompt_tokens_details?.cached_tokens
-    ?? usage.prompt_cache_hit_tokens
-    ?? usage.cached_tokens
+    usage?.prompt_tokens_details?.cached_tokens
+    ?? usage?.prompt_cache_hit_tokens
+    ?? usage?.cached_tokens
     ?? 0
   ) || 0;
 }

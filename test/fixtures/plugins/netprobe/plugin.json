@@ -1,0 +1,12 @@
+{
+  "id": "netprobe",
+  "apiVersion": 1,
+  "name": "网络探针夹具",
+  "version": "1.0.0",
+  "description": "试着直连网络并报告错误码：验证「插件进程被放进无网络的命名空间」这件事真的成立（而不是只写在文档里）",
+  "capabilities": ["tools", "http"],
+  "tools": [
+    { "name": "direct_probe", "description": "直接连一个地址，返回错误码或成功标记", "parameters": { "type": "object", "properties": { "port": { "type": "number" } } } },
+    { "name": "via_host", "description": "经宿主的能力去请求一个地址", "parameters": { "type": "object", "properties": { "url": { "type": "string" } }, "required": ["url"] } }
+  ]
+}

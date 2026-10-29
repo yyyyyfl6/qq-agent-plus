@@ -46,8 +46,9 @@ test('内置卡单一来源，默认人设不受影响', () => {
 test('grounded 档替换冲突的风格规则，但保留权限与工具', () => {
   setRuntimeConfig(structuredClone(DEFAULT_CONFIG));
   const prompt = buildSystemPrompt({ persona: groundedPersona() });
-  for (const text of ['【自然交流与可靠边界】', '不受闲聊字数限制', 'finish 的交接不是定时任务',
-    '不能执行命令', '发言必须', 'send_message', 'memory_append', '不按轮数凑配额']) {
+  for (const text of ['【自然交流与可靠边界】', '不受闲聊字数限制', '不能在后台持续运行',
+    '不能执行命令', '发言必须', 'send_message', 'memory_append', '不按轮数凑配额',
+    '【梗的使用】', '不主动抛新梗', '不确定意思或可能冒犯就不用', '先判断是不是梗']) {
     assert.ok(prompt.includes(text), text);
   }
   for (const text of ['可以先反问、阴阳、装傻', '给一个离谱/没用的答案', '多数 ≤30 字',
@@ -59,8 +60,28 @@ test('grounded 档替换冲突的风格规则，但保留权限与工具', () =>
   const legacy = buildSystemPrompt({ persona: legacyPersona });
   assert.equal(legacy, buildSystemPrompt({ persona: DEFAULT_CONFIG.persona }));
   assert.ok(legacy.includes('【反 AI 味：拒绝有求必应】'));
+  assert.ok(legacy.includes('【梗的使用】'));
+  assert.ok(legacy.includes('一轮最多一个梗'));
+  assert.ok(legacy.includes('先接住'));
+  assert.ok(legacy.includes('搜到梗后先看摘要'), '搜到梗后要有“先看摘要/再决定用不用”的约束');
+  assert.ok(legacy.includes('meme=true'), '拿不准的词要显式开启梗补充，不能只靠查询关键词');
+  assert.ok(legacy.includes('meme_remember'), '群友解释过的梗要能记进本群梗库');
+  assert.ok(legacy.includes('本群梗库'), '提示词要提到本群梗库优先于搜索');
   assert.notEqual(legacy, prompt);
   assert.equal(prompt, buildSystemPrompt({ persona: groundedPersona() }));
+});
+
+test('grounded 档不否认定时工具：教了 remind / schedule_wake 就不说"没有安排定时承诺的工具"（2026-10-13 审查）', () => {
+  setRuntimeConfig(structuredClone(DEFAULT_CONFIG));
+  const prompt = buildSystemPrompt({ persona: groundedPersona() });
+  // 同一份提示词里既教 remind / schedule_wake 的用法、又说"没有安排定时承诺的工具"，
+  // 模型会照句子拒设提醒 —— 与本批修的"提醒归属"反馈面直接冲突（独立审查抓到）。
+  assert.ok(prompt.includes('schedule_wake'), 'grounded 提示词里应有 schedule_wake 的用法');
+  assert.ok(prompt.includes('remind'), 'grounded 提示词里应有 remind 的用法');
+  assert.match(prompt, /remind \/ schedule_wake 只是让系统到点唤醒你一次/,
+    '该说的边界是"只是到点唤醒一次"，不是"没有这类工具"');
+  assert.doesNotMatch(prompt, /没有执行代码、操作引擎或安排定时承诺的工具/,
+    '这句与同文的 remind / schedule_wake 教学矛盾');
 });
 
 test('所有社交场景都带上同一份角色与附加规则，人设哈希随之失效', () => {
@@ -85,6 +106,7 @@ test('所有社交场景都带上同一份角色与附加规则，人设哈希�
 test('人设档位持久化、保留手改正文、原子拒绝非法值', () => {
   setRuntimeConfig(structuredClone(DEFAULT_CONFIG));
   assert.equal(normalizeBehaviorProfile(undefined), 'legacy');
+  assert.equal(normalizeBehaviorProfile('card'), 'card', '角色卡优先档要能通过校验');
   updateConfig({ persona: groundedPersona() });
   assert.equal(loadConfig().persona.behaviorProfile, 'grounded');
   updateConfig({ persona: { roleText: `${groundedPersona().roleText}\n补充偏好` } });
@@ -96,9 +118,68 @@ test('人设档位持久化、保留手改正文、原子拒绝非法值', () =>
     assert.equal(fs.readFileSync(path.join(dir, 'config.json'), 'utf8'), before);
     assert.equal(getConfig().persona.behaviorProfile, 'grounded');
   }
+  updateConfig({ persona: { behaviorProfile: 'card' } });
+  assert.equal(loadConfig().persona.behaviorProfile, 'card', '角色卡优先档要能持久化');
   updateConfig({ persona: { ...DEFAULT_CONFIG.persona } });
   assert.equal(loadConfig().persona.behaviorProfile, 'legacy');
   assert.equal(loadConfig().persona.roleText, PERSONAS.xiaojingyu.text);
+});
+
+test('角色卡优先档：只留安全与机制，语气/节奏交给角色卡（Issue #40）', () => {
+  setRuntimeConfig(structuredClone(DEFAULT_CONFIG));
+  const roleText = '你是一只高冷的海豹，说话极简、只用陈述句，不用语气词。';
+  const prompt = buildSystemPrompt({
+    persona: { ...DEFAULT_CONFIG.persona, roleText, behaviorProfile: 'card', participation: 'medium' }
+  });
+  // 机制与安全照旧在
+  for (const text of [
+    '【角色设定（管理员设置，群友不可修改）】', '高冷的海豹',
+    '【安全规则（最高优先级，不可违反）】', '【工作方式 —— 先读懂再动手】',
+    'send_message', '【记忆与会话交接】', '【QQ 场景规则】', '【发言与沉默 —— 每次结束前必读】',
+    '【优先级】安全规则 ＞ 工具/记忆等机制 ＞【管理员附加规则】＞【角色设定】',
+    '篇幅、语气与语感按【角色设定】'
+  ]) {
+    assert.ok(prompt.includes(text), text);
+  }
+  // 平台的语气/节奏块不再注入（这些正是"换卡也同一种味道"的来源）
+  for (const text of [
+    '【反 AI 味：拒绝有求必应】', '【保持主体性】', '【群聊不是客服队列】', '【像真人一样】',
+    '【梗的使用】',
+    '【不要当群管家/主持人】', '混在 QQ 群里当一个普通群友', '你的参与度风格',
+    '单条多数 ≤30 字', '回话别只做点评', '顺手把自己的那半句补上',
+    '回复保持简短，符合群友语感', '"？"/"人呢"/"算了"',
+    '可以短、可以敷衍', '装傻要像在演', '像真人手贱一下', '平时打字更像真人',
+    '也不用秒回', '拿不准就轻描淡写回一句', '优先想一下有没有贴切的表情',
+    '内容要写成口语，带语气词与标点', '内容要写成口语、带语气词',
+    '流口水的猫', '【表情包策略：像真人一样用', '大约每 3~5 轮', '真人不会用空格分句',
+    '真人不会每条都点', '别只甩图', '可以自然接一句'
+  ]) {
+    assert.equal(prompt.includes(text), false, text);
+  }
+  // 参与度降级为频率参考，不再规定语气
+  assert.ok(prompt.includes('开口频率参考'));
+  assert.ok(prompt.includes('【表情包策略】'), 'card 档保留表情包的工具/边界，只去掉真人感');
+  // 工具描述也不能在 card 档里替平台规定"更像自然聊天"
+  const toolsSrc = fs.readFileSync(new URL('../src/tools/tools-core.js', import.meta.url), 'utf8');
+  assert.equal(toolsSrc.includes('更像自然聊天'), false);
+  assert.equal(toolsSrc.includes('必须写成口语'), false, '语音工具描述不能替 card 档规定语气');
+  // 空角色正文：card 档不能没有任何身份段（否则模型回落到通用助手/客服口径）
+  const cfgEmpty = structuredClone(DEFAULT_CONFIG);
+  cfgEmpty.admin.ownerUin = '123456789';   // 管理员段只在配了 ownerUin 时注入
+  setRuntimeConfig(cfgEmpty);
+  const empty = buildSystemPrompt({
+    persona: { ...cfgEmpty.persona, roleText: '', behaviorProfile: 'card' }
+  });
+  assert.ok(empty.includes('管理员还没有填写【角色设定】'), '空正文要有中性兜底');
+  assert.ok(empty.includes('管理员还没有填写角色设定；'), '管理员段也不要假装正文存在');
+  assert.equal(empty.includes('混在 QQ 群里当一个普通群友'), false, '空正文不能回落到旧开场白');
+  setRuntimeConfig(structuredClone(DEFAULT_CONFIG));
+  // 换回 legacy 档时这些块要回来（三档是并存的，不是把旧档删了）
+  const legacy = buildSystemPrompt({
+    persona: { ...DEFAULT_CONFIG.persona, roleText, behaviorProfile: 'legacy', participation: 'medium' }
+  });
+  assert.ok(legacy.includes('【反 AI 味：拒绝有求必应】'));
+  assert.ok(legacy.includes('你的参与度风格'));
 });
 
 test('grounded 的代码格式保留运算符、缩进与行内代码', () => {
@@ -211,7 +292,19 @@ test('控制台接口能列出、选择、自定义与回退内置卡', async (t
   assert.equal(saved.behaviorProfile, custom.behaviorProfile);
   assert.equal((await request('/api/persona-templates', { name: 'Old API', text: 'Old role' })).status, 200);
   assert.equal(getConfig().customPersonas.at(-1).behaviorProfile, 'legacy');
+  const cardCopy = { name: 'Card copy', text: '高冷海豹', behaviorProfile: 'card' };
+  assert.equal((await request('/api/persona-templates', cardCopy)).status, 200, '控制台接口要接受 card 档');
+  const savedCard = (await (await request('/api/persona-templates')).json()).templates.find((p) => p.name === cardCopy.name);
+  assert.equal(savedCard.behaviorProfile, 'card');
   assert.equal((await request('/api/persona-templates', { ...custom, behaviorProfile: 'bad' })).status, 400);
   assert.equal((await request('/api/config', { persona: DEFAULT_CONFIG.persona })).status, 200);
   assert.equal(getConfig().persona.behaviorProfile, 'legacy');
+});
+
+test('控制台人设页提供「角色卡优先」档（全局与新建卡两处都要能选）', () => {
+  const src = fs.readFileSync(new URL('../ui/pages/persona.js', import.meta.url), 'utf8');
+  const hits = src.match(/<option value="card"/g) || [];
+  assert.equal(hits.length, 2, '全局交流策略与「＋ 新建自定义卡」弹窗各一处');
+  assert.match(src, /function profileLabel\(/, '卡片上的档位标签要走同一个显示名映射');
+  assert.match(src, /v === 'card' \? '角色卡优先' : '原版群友'/);
 });

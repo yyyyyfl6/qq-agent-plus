@@ -8,8 +8,9 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const here = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
+const here = path.dirname(fileURLToPath(import.meta.url));
 
 // 目录即清单：以前这里是手写数组，新加的用例不改数组就静默不跑（2026-10-01 审查）。
 const CASES = fs.readdirSync(here).filter((f) => f.endsWith('.mjs') && f !== 'run.mjs').sort();

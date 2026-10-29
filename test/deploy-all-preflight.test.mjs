@@ -5,11 +5,16 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { skipUnlessLinux } from './helpers/platform.mjs';
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const shellOptions = { skip: process.getuid?.() === 0 ? 'Installer must run as a non-root service user' : false };
+const shellOptions = {
+  skip: process.getuid?.() === 0
+    ? 'Installer must run as a non-root service user'
+    : skipUnlessLinux('Installer preflight needs bash/systemctl/docker fixtures (Linux only)')
+};
 
-function fixture(t) {
+function fixture(t, { fakeUid = null } = {}) {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'qq-stack-preflight-')));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const root = path.join(dir, 'stack');
@@ -19,14 +24,19 @@ function fixture(t) {
   fs.mkdirSync(bin);
   fs.mkdirSync(home);
   fs.mkdirSync(path.join(source, 'scripts'), { recursive: true });
-  for (const file of ['deploy-all.sh', 'scripts/check-stack-update.mjs', 'scripts/configure-snowluma.mjs']) {
+  for (const file of [
+    'deploy-all.sh',
+    'scripts/check-platform.sh',
+    'scripts/check-stack-update.mjs',
+    'scripts/configure-snowluma.mjs'
+  ]) {
     fs.copyFileSync(path.join(repo, file), path.join(source, file));
   }
   fs.writeFileSync(path.join(source, 'deploy.sh'), '#!/bin/bash\nexit 0\n');
   fs.writeFileSync(path.join(source, 'scripts/rotate-snowluma-password.mjs'), 'throw new Error("Unexpected credential rotation");\n');
   const stateFile = path.join(dir, 'host.json');
   const callsFile = path.join(dir, 'calls.jsonl');
-  const host = { service: 'not-found', workingDirectory: path.join(root, 'app'), containers: [], listeners: [] };
+  const host = { service: 'not-found', workingDirectory: path.join(root, 'app'), containers: [], listeners: [], fakeUid };
   // Host commands never reach the real daemon, package manager or systemd.
   // Write-shaped calls are rejected unless testing an allowed managed update.
   const mock = `#!${process.execPath}
@@ -39,8 +49,14 @@ fs.appendFileSync(process.env.QQ_PREFLIGHT_CALLS, JSON.stringify([name, ...args]
 const out = (value) => console.log(typeof value === 'string' ? value : JSON.stringify(value));
 if (name === 'uname') out('Linux');
 else if (name === 'realpath') out(path.resolve(args.at(-1)));
+else if (name === 'id') {
+  if (args.includes('-un')) out(process.env.USER || process.env.USERNAME || 'qqagent');
+  else if (args.includes('-u')) out(String(state.fakeUid ?? 1000));
+  else if (args.includes('-g')) out('1000');
+  else process.exit(1);
+}
 else if (name === 'systemctl') {
-  if (args.includes('show-environment')) process.exit(0);
+  if (args.includes('show-environment')) process.exit(state.requireRuntimeDir && !process.env.XDG_RUNTIME_DIR ? 1 : 0);
   else if (args.includes('--property=LoadState')) {
     out(state.service);
     if (state.loadFailed) process.exit(1);
@@ -72,7 +88,7 @@ else if (name === 'systemctl') {
 } else if (name === 'curl' && state.allowMockWrites) process.exit(0);
 else process.exit(90);
 `;
-  for (const name of ['uname', 'realpath', 'systemctl', 'docker', 'ss', 'sudo', 'curl']) {
+  for (const name of ['uname', 'realpath', 'systemctl', 'docker', 'ss', 'sudo', 'curl', ...(fakeUid == null ? [] : ['id'])]) {
     fs.writeFileSync(path.join(bin, name), mock, { mode: 0o755 });
   }
   function run(args = ['--check-only']) {
@@ -81,6 +97,9 @@ else process.exit(90);
       cwd: source,
       env: {
         HOME: home, PATH: `${bin}:/usr/bin:/bin`,
+        // 这组用例用 POSIX 桩替代真实 systemd/包管理器；发行版体检由
+        // test/platform-check.test.mjs 单独覆盖，这里不重复跑真实探测。
+        QQ_AGENT_PLATFORM_CHECKED: '1',
         QQ_PREFLIGHT_FIXTURE: stateFile, QQ_PREFLIGHT_CALLS: callsFile
       },
       encoding: 'utf8',
@@ -219,6 +238,43 @@ test('pre-created empty data directories do not count as an existing installatio
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.match(result.stdout, /Environment: fresh installation/);
   assert.deepEqual(snapshot(f.root), before);
+});
+
+// ── 网页终端缺 XDG_RUNTIME_DIR（2026-10-12 报道）：预检必须自动补变量或给可操作指引 ──
+// 真 systemctl 在没有 XDG_RUNTIME_DIR 时固定报 "Failed to connect to bus"，哪怕用户管理器
+// 在跑；这里让 mock 也这样做（requireRuntimeDir 开关），专门覆盖原 fixture 没盖住的情形
+//（原 mock 把 show-environment 恒真，所以"变量没设"从来没被走到）。
+const runtimeDir = process.getuid ? `/run/user/${process.getuid()}` : '';
+const hasRuntimeDir = process.platform !== 'win32' && runtimeDir !== '' && fs.existsSync(runtimeDir);
+// Windows 上本文件整组本就不可运行（spawnSync /bin/bash ENOENT，属既有 Windows 基线）；
+// 新增用例按 skip 处理，别往基线里塞新的红。
+const shellNeedsPosix = process.platform === 'win32'
+  ? 'Windows 上本组用例不可运行（/bin/bash 与 POSIX 桩，见既有 Windows 基线）'
+  : false;
+
+test('a web terminal missing XDG_RUNTIME_DIR is rescued by the backfill when /run/user/<uid> exists', {
+  skip: shellOptions.skip || shellNeedsPosix || (hasRuntimeDir ? false : 'requires a real /run/user/<uid> (Linux user session)')
+}, (t) => {
+  const f = fixture(t);
+  f.host.requireRuntimeDir = true;   // 与真 systemctl 同口径：没有变量就 exit 1
+  const result = f.run();
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /Environment: fresh installation/);
+  const calls = fs.readFileSync(f.callsFile, 'utf8').trim().split('\n').map(JSON.parse);
+  assert.ok(calls.some(([name, ...args]) => name === 'systemctl' && args.includes('show-environment')),
+    '探测仍然要真的发生（不是被跳过）');
+});
+
+test('a web terminal missing XDG_RUNTIME_DIR without /run/user/<uid> fails closed with actionable guidance', {
+  skip: shellOptions.skip || shellNeedsPosix
+}, (t) => {
+  const f = fixture(t, { fakeUid: 59999 });   // id -u 指到一个没有 runtime 目录的 uid
+  f.host.requireRuntimeDir = true;
+  const result = f.run();
+  assert.equal(result.status, 1, result.stdout + result.stderr);
+  assert.match(result.stderr, /XDG_RUNTIME_DIR/, '要告诉用户缺的是这个变量');
+  assert.match(result.stderr, /enable-linger/, '目录不存在时要给出 enable-linger 这一步');
+  assert.equal(snapshot(f.root), null, '拒绝时不得创建栈目录');
 });
 
 test('a not-found service reported with nonzero exit still permits fresh installation', shellOptions, (t) => {

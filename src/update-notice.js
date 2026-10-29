@@ -3,8 +3,12 @@
 // 口径（与部署链路共用，见 scripts/auto-update.mjs）：
 //   - 只有作者发布了 Release（草稿、预发布都不算）才提示；branch 上的日常提交不提示，
 //     避免用户装上未经发布的中间状态。
-//   - 当前部署已经包含 / 领先于最新 Release（compare 结果为 behind / identical）时提示「已是最新」。
-//   - 方向未知（比较接口失败）时既不提示也不部署，等待下次检查。
+//   - 「有没有新版本」以版本号为主判定：本地 package.json 版本 >= Release 版本即视为已是最新，
+//     本地更旧则直接提示有更新。两条路径都不请求 compare —— 跨版本的 compare 响应会超过 1MB
+//     （diff 占大头），既有的 512KB 上限与 10 秒超时会让检查永久失败（2026-10-18 实测）。
+//   - compare 只在版本号解析不了时兜底判方向；方向未知（比较接口失败）时既不提示也不部署。
+//   - 版本号没升、部署提交却领先 Release（手工 dirty 部署）会判「已是最新」，这是有意为之：
+//     宁可漏一次提示，也不能把领先的代码回退成 Release tag。
 //
 // 本模块不做任何部署；「立即更新」仍走既有的 /api/auto-update/run 链路，
 // 由它按这里判定出的 Release tag 部署。
@@ -13,16 +17,91 @@
 // 与自动更新的既有字段互不影响。
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { readAutoUpdateState, writeAutoUpdateState } from './auto-update.js';
+import { readJsonBounded } from './core/http-body.js';
 
 const CHECK_TTL_MS = 30 * 60 * 1000;
 const API_TIMEOUT_MS = 10000;
+// compare 只作版本号解析不了时的兜底：响应含 diff 的 files 数组，跨版本会到 1.3MB 量级，
+// 所以单独给它更大的上限与超时（正常判定路径根本不发这个请求）。
+const COMPARE_TIMEOUT_MS = 60000;
+const COMPARE_BODY_LIMIT = 4 * 1024 * 1024;
 const REVISION_LENGTH = 64;
 const BODY_LIMIT = 8000;
 const API_BASE_DEFAULT = 'https://api.github.com';
 
 function cleanText(value, max = 500) {
   return String(value ?? '').replace(/\0/g, '').trim().slice(0, max);
+}
+
+/**
+ * 解析版本号：接受 `v0.9.1`、`0.9.1`、`0.9.1-beta.1`（构建元数据忽略）。
+ * 解析不了返回 null —— 调用方此时才退回 compare 兜底。
+ */
+export function parseVersion(value) {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/
+    .exec(cleanText(value, 64));
+  if (!match) return null;
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+    prerelease: match[4] || ''
+  };
+}
+
+/** 预发布标识按 semver 比较：数字段按数值、数字低于字母、前缀相同则段数少的更低。 */
+function comparePrerelease(left, right) {
+  if (left === right) return 0;
+  if (!left) return 1;  // 正式版高于同号预发布
+  if (!right) return -1;
+  const a = left.split('.');
+  const b = right.split('.');
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    const x = a[index];
+    const y = b[index];
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    const xNumeric = /^\d+$/.test(x);
+    const yNumeric = /^\d+$/.test(y);
+    if (xNumeric && yNumeric) {
+      const nx = Number(x);
+      const ny = Number(y);
+      if (nx !== ny) return nx < ny ? -1 : 1;
+    } else if (xNumeric !== yNumeric) {
+      return xNumeric ? -1 : 1;  // 数字标识低于字母标识
+    } else if (x !== y) {
+      return x < y ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+/** 语义化比较：负数表示 left 更旧，0 相等，正数表示 left 更新；任一解析失败返回 null。 */
+export function compareVersions(left, right) {
+  const a = parseVersion(left);
+  const b = parseVersion(right);
+  if (!a || !b) return null;
+  for (const key of ['major', 'minor', 'patch']) {
+    if (a[key] !== b[key]) return a[key] < b[key] ? -1 : 1;
+  }
+  return comparePrerelease(a.prerelease, b.prerelease);
+}
+
+/** 读取指定部署目录根的版本（`<appDir>/package.json`）；读不到返回空串。 */
+export function readVersionAt(appDir) {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(appDir, 'package.json'), 'utf8'));
+    return cleanText(pkg?.version, 64);
+  } catch {
+    return '';
+  }
+}
+
+/** 本机正在运行的版本：本模块所在部署目录根的 package.json。读不到返回空串。 */
+export function readLocalVersion() {
+  return readVersionAt(path.resolve(fileURLToPath(new URL('..', import.meta.url))));
 }
 
 /**
@@ -38,14 +117,15 @@ function ghHeaders() {
   return { accept: 'application/vnd.github+json', 'user-agent': 'qq-agent-plus-console' };
 }
 
-async function fetchJson(url, fetchImpl) {
+async function fetchJson(url, fetchImpl, { timeoutMs = API_TIMEOUT_MS, maxBytes = 512 * 1024 } = {}) {
   try {
     const res = await fetchImpl(url, {
       headers: ghHeaders(),
-      signal: AbortSignal.timeout(API_TIMEOUT_MS)
+      signal: AbortSignal.timeout(timeoutMs)
     });
     if (!res.ok) return { ok: false, status: Number(res.status) || 0 };
-    const data = await res.json().catch(() => null);
+    // 有界读：默认 512KB（2026-10-09 审查）；compare 兜底单独放宽，见 COMPARE_BODY_LIMIT
+    const data = await readJsonBounded(res, maxBytes).catch(() => null);
     return { ok: true, data };
   } catch (error) {
     return { ok: false, status: 0, error: cleanText(error?.message, 200) };
@@ -122,7 +202,8 @@ export async function fetchComparison(repository, base, head, options = {}) {
   if (!slug || !base || !head) return { ok: false, commits: [], error: '缺少比较参数' };
   const result = await fetchJson(
     apiUrl(slug, `/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`),
-    fetchImpl
+    fetchImpl,
+    { timeoutMs: COMPARE_TIMEOUT_MS, maxBytes: COMPARE_BODY_LIMIT }
   );
   if (!result.ok) return { ok: false, commits: [], error: httpFailure(result) };
   const data = result.data;
@@ -147,30 +228,43 @@ export async function fetchComparison(repository, base, head, options = {}) {
 
 /**
  * 检查是否有新的已发布版本。成功结果缓存 30 分钟；部署基线变化（例如刚更新完）立即失效；
- * 连不上 GitHub 或无法比较时不写缓存，下次打开控制台会重试。
+ * 连不上 GitHub 或无法判定方向时不写缓存，下次打开控制台会重试。
+ *
+ * 判定顺序：版本号（主）→ compare（仅在版本号解析不了时兜底）。
+ * 版本号相等也按「已是最新」处理：版本没升却领先 Release 的部署不能回退。
  */
-export async function checkForUpdate(dataDir, config = {}, { force = false, now = Date.now(), fetchImpl } = {}) {
+export async function checkForUpdate(
+  dataDir,
+  config = {},
+  { force = false, now = Date.now(), fetchImpl, localVersion } = {}
+) {
   const settings = config.autoUpdate || {};
   const repository = String(settings.repository || '').trim();
   const branch = String(settings.branch || 'main').trim() || 'main';
   const state = readAutoUpdateState(dataDir);
   const previous = state.updateNotice && typeof state.updateNotice === 'object' ? state.updateNotice : null;
   const deployedNow = deployedRevisionAt(dataDir, state);
+  const local = localVersion !== undefined ? cleanText(localVersion, 64) : readLocalVersion();
 
   if (!repository) {
-    return { available: false, reason: 'unconfigured', checkedAt: now, deployed: deployedNow };
+    return { available: false, reason: 'unconfigured', checkedAt: now, deployed: deployedNow, localVersion: local };
   }
   const fresh = previous && Number(previous.checkedAt) > 0
     && now - Number(previous.checkedAt) < CHECK_TTL_MS;
   const baselineUnchanged = previous && String(previous.deployed || '') === String(deployedNow || '');
-  if (!force && fresh && baselineUnchanged) {
-    return { ...previous, cached: true };
+  // 版本号现在是主判定，必须进缓存键：手工替换源码（版本变了、deployed-revision 没变，
+  // 或只写了 "-dirty" 被剥掉）时若命中旧结论，会把"已是最新"的树回退成 Release tag。
+  // 旧版本写的 notice 没有 localVersion 字段，这里也会自然失效、重算一次。
+  const localUnchanged = previous && String(previous.localVersion || '') === local;
+  if (!force && fresh && baselineUnchanged && localUnchanged) {
+    return { ...previous, localVersion: local, cached: true };
   }
 
   const base = {
     repository,
     branch,
     deployed: deployedNow,
+    localVersion: local,
     revision: '',
     version: '',
     name: '',
@@ -211,10 +305,31 @@ export async function checkForUpdate(dataDir, config = {}, { force = false, now 
   };
 
   if (!deployedNow) {
-    // 部署基线不是 git 提交（例如压缩包安装），无法比较方向：不弹窗，只在面板里说明
+    // 部署基线不是 git 提交（例如压缩包安装），无法判断方向：不弹窗，只在面板里说明
     return store({ ...base, ...releaseInfo, available: false, reason: 'unknown-deployed' });
   }
 
+  // 主判定：版本号。两个版本都能解析时不发 compare —— 跨版本的 compare 响应超过 1MB
+  // （diff 的 files 占大头），旧的上限下必然失败，而这里多数时候并不需要那份 diff。
+  const order = compareVersions(local, release.version);
+  if (order !== null) {
+    if (order >= 0) {
+      // 相等也按「已包含」：版本没升、提交却领先 Release 的手工部署不能回退成 tag
+      return store({ ...base, ...releaseInfo, available: false, reason: 'ahead-of-release' });
+    }
+    return store({
+      ...base,
+      ...releaseInfo,
+      available: true,
+      reason: '',
+      revision: release.version,
+      // 精确的提交列表要下载 1MB+ 的 compare diff，不值得为展示付这个代价；
+      // 发布说明本身已经说明改了什么
+      body: releaseInfo.body ? `【${release.version} 发布说明】\n${releaseInfo.body}` : ''
+    });
+  }
+
+  // 版本号解析不了（非标准安装）：退回 compare 兜底判定方向
   const compare = await fetchComparison(repository, deployedNow, release.version, { fetchImpl });
   if (!compare.ok) {
     // 方向未知：既不提示也不允许部署，且不写缓存（下次打开控制台重试）

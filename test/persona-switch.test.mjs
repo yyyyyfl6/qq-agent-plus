@@ -86,3 +86,16 @@ test('换人设打时间戳；清空交接接口清掉交接并关线程', async
   assert.ok(!thread || thread.state === 'closed', '线程要关掉（这样 checkpoint 就不会再注入）');
   storeAfter.close();
 });
+
+test('PERSONAS.md 记录了换卡后的清残留流程（与 UI 按钮名锚定）', () => {
+  // 文档漂移守卫：按钮/接口改名时这份用例要跟着红（2026-10-12 新增本流程时一起加）。
+  const uiSrc = fs.readFileSync(new URL('../ui/pages/persona.js', import.meta.url), 'utf8');
+  const label = /id="persona-reset-handoff-btn"[^>]*>([^<]+)</.exec(uiSrc)?.[1] || '';
+  assert.ok(label, '要从 ui/pages/persona.js 抠出「换人设后清空交接」按钮文案');
+  const doc = fs.readFileSync(new URL('../docs/PERSONAS.md', import.meta.url), 'utf8');
+  assert.ok(doc.includes(`「${label}」`), `PERSONAS.md 要提到按钮「${label}」`);
+  assert.match(doc, /POST \/api\/persona\/reset-handoffs/);
+  assert.match(doc, /不动聊天记录、不动人物印象/);
+  assert.match(doc, /删掉正在使用的自定义卡不等于换人设/);
+  assert.match(doc, /「保存设置」/, '要写清"未保存不生效"的前提');
+});

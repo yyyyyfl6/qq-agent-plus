@@ -10,11 +10,108 @@ import { CHAT_MSG_PAGE, STICKER_LEVELS } from '../core/constants.js';
 import { askForConfirmation, initChatScrollLoader, patchKeyedList } from '../core/dom-util.js';
 import { $, $$, esc } from '../core/dom.js';
 import {
-  chatNameOf, fmtTime, fmtTok, formatChatTitle, groupSliderPosForUi, normalizeStickerCollectMax,
+  chatNameOf, fmtTime, fmtTok, formatChatTitle, groupSliderPosForUi, ioProfileOf, normalizeStickerCollectMax,
   normalizeStickerMax, paramActiveForProbability, segOfProbability, sliderDesc, sliderToTierUI,
   sliderToTierUI_tierToSlider
 } from '../core/format.js';
 import { state } from '../core/state.js';
+
+/** 主动开话题的一个时段行（新增/删除共用同一份 HTML，避免两处漂移）。 */
+export function proactiveWindowRowHtml(window = {}) {
+  const start = esc(String(window.start ?? '09:00'));
+  const end = esc(String(window.end ?? '24:00'));
+  return `
+    <div class="tc-window pro-window">
+      <div class="field"><label>开始</label><input class="pro-start" type="time" value="${start}" /></div>
+      <div class="field"><label>结束</label><input class="pro-end" type="text" inputmode="numeric" value="${end}" placeholder="24:00" /></div>
+      <button type="button" class="icon-btn pro-remove" title="删除时段" aria-label="删除时段">×</button>
+    </div>`;
+}
+
+function proactiveWindowsForUi(activeHours) {
+  const list = Array.isArray(activeHours?.windows)
+    ? activeHours.windows
+    : (activeHours?.start && activeHours?.end ? [activeHours] : []);
+  return list
+    .filter((window) => window?.start && window?.end)
+    .map((window) => ({ start: window.start, end: window.end }));
+}
+
+/** 主动发言时段：加一行 / 删一行。保存端按 .pro-window 逐行读取，这里只改 DOM。 */
+function bindProactiveWindowEditor() {
+  const box = $('#pro-windows');
+  if (!box) return;
+  $('#pro-add-window')?.addEventListener('click', () => {
+    box.insertAdjacentHTML('beforeend', proactiveWindowRowHtml({ start: '09:00', end: '24:00' }));
+  });
+  box.addEventListener('click', (event) => {
+    const button = event.target.closest('.pro-remove');
+    if (button) button.closest('.pro-window')?.remove();
+  });
+}
+
+/** 风格预设只改界面上的人味参数；保存仍走同一份 saveConfig。 */
+/** 推荐配置：拟人化全家桶一键就位（总开关/低档延迟/反AI/气泡整形）。改的是界面值，保存仍走 saveConfig。 */
+function bindHumanizeRecommend() {
+  const button = $('#humanize-recommend');
+  if (!button) return;
+  button.addEventListener('click', () => {
+    const master = $('#cfg-humanize-enabled');
+    if (master) master.checked = true;
+    const set = (id, value) => { const node = $(id); if (node) node.value = value; };
+    set('#cfg-humanize-delay-min', '0.5');
+    set('#cfg-humanize-delay-max', '1.8');
+    set('#cfg-humanize-delay-perchar', '12');
+    state.settingsDirty = true;
+    const note = $('#cfg-dirty-note');
+    if (note) note.textContent = '已套用推荐配置（记得保存）';
+  });
+}
+
+function bindHumanizePreset() {
+  const select = $('#cfg-humanize-preset');
+  if (!select) return;
+  const presets = {
+    natural: { min: '0.5', max: '1.8', perChar: '12' },
+    active: { min: '0.3', max: '1.0', perChar: '8' },
+    quiet: { min: '1.0', max: '3.0', perChar: '20' },
+    companion: { min: '0.8', max: '2.5', perChar: '15' }
+  };
+  select.addEventListener('change', () => {
+    const preset = presets[select.value] || presets.natural;
+    const setValue = (id, value) => { const node = $(id); if (node) node.value = value; };
+    setValue('#cfg-humanize-delay-min', preset.min);
+    setValue('#cfg-humanize-delay-max', preset.max);
+    setValue('#cfg-humanize-delay-perchar', preset.perChar);
+    state.settingsDirty = true;
+    const note = $('#cfg-dirty-note');
+    if (note) note.textContent = '有未保存改动';
+  });
+}
+/** 只读展示当前会注入提示词的状态；数值只给控制台看，不进提示词。 */
+async function loadHumanizeState() {
+  const box = $('#humanize-state-text');
+  if (!box) return;
+  try {
+    const s = await api('/api/humanize/state');
+    if (!s.enabled) { box.textContent = '拟人化表达未启用'; return; }
+    if (!s.injected) {
+      box.textContent = s.personaStateEnabled === false
+        ? '状态功能已关闭（可在上方重新勾选）'
+        : s.cardFirst
+          ? '角色卡优先：状态不注入提示词（语气由角色卡决定）'
+          : '当前档位不注入状态';
+      return;
+    }
+    const energy = s.energy < 25 ? '低' : s.energy < 50 ? '偏低' : s.energy < 80 ? '正常' : '充足';
+    const mood = s.mood > 25 ? '不错' : s.mood < -25 ? '较差' : s.mood < -10 ? '偏低' : '一般';
+    const age = Math.max(0, Math.round((Date.now() - (Number(s.savedAt) || Date.now())) / 60000));
+    box.textContent = `${s.activity}；精力${energy}，心情${mood}${age ? `；${age} 分钟前更新` : ''}`;
+  } catch {
+    box.textContent = '状态读取失败';
+  }
+}
+
 function renderConversationModePanels(conversation = {}) {
   const activeMode = ['legacy', 'threaded', 'lifecycle'].includes(conversation.mode)
     ? conversation.mode
@@ -108,7 +205,13 @@ function renderConversationModePanels(conversation = {}) {
 
 function renderChatSection(c) {
   const st = c.store || {};
+  const storeSync = String(st.sqliteSynchronous || 'FULL').toUpperCase();
   const conversation = c.conversation || {};
+  const proWindows = proactiveWindowsForUi(c.proactive?.activeHours);
+  const humanize = c.humanize || {};
+  const replyDelay = humanize.replyDelay || {};
+  const delayMinMs = Number.isFinite(Number(replyDelay.minMs)) ? Number(replyDelay.minMs) : 500;
+  const delayMaxMs = Number.isFinite(Number(replyDelay.maxMs)) ? Number(replyDelay.maxMs) : 1800;
   // 滑条位置是唯一真相，而且**滑条上的数字就是概率**（与后端 tier-slider.js 同一套规则）
   const sliderPos = sliderToTierUI_tierToSlider(st);
   const { randomPercent: curPct } = sliderToTierUI(sliderPos);
@@ -167,19 +270,157 @@ return `
 
     <h3>所有模式 · 主动开话题</h3>
     <div class="checkbox-row"><input type="checkbox" id="cfg-proactive" ${c.proactive.enabled ? 'checked' : ''} />
-      <label for="cfg-proactive">冷场时按概率主动开话题</label></div>
+      <label for="cfg-proactive">会话安静时按概率发起话题</label></div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-pro-group" ${c.proactive?.groupEnabled !== false ? 'checked' : ''} />
+      <label for="cfg-pro-group">群聊（独立节奏，按群白名单）</label></div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-pro-private" ${c.proactive?.privateEnabled === true ? 'checked' : ''} />
+      <label for="cfg-pro-private">私聊（独立节奏，按私聊白名单）</label></div>
     <div class="field-row">
-      <div class="field"><label>检查间隔下限（毫秒）</label><input type="number" id="cfg-pro-min" min="60000" value="${esc(c.proactive.checkIntervalMinMs)}" /></div>
-      <div class="field"><label>检查间隔上限（毫秒）</label><input type="number" id="cfg-pro-max" min="120000" value="${esc(c.proactive.checkIntervalMaxMs)}" /></div>
-      <div class="field"><label>触发概率 0~1</label><input type="number" id="cfg-pro-prob" step="0.05" min="0" max="1" value="${esc(c.proactive.probability)}" /></div>
+      <div class="field"><label>判定方式</label><select id="cfg-pro-mode"><option value="shared" ${c.proactive?.scopeMode !== 'perChat' ? 'selected' : ''}>群聊/私聊各共用一次机会</option><option value="perChat" ${c.proactive?.scopeMode === 'perChat' ? 'selected' : ''}>每个群/私聊独立判定</option></select></div>
+      <div class="field"><label>独立模式每轮最多开口</label><input type="number" id="cfg-pro-per-max" min="1" max="10" step="1" value="${esc(Number(c.proactive?.perChatMaxPerTick) || 2)}" /></div>
+    </div>
+    <div class="field pro-windows-field">
+      <label>主动发言时段（仅在该时段内发起）</label>
+      <div id="pro-windows" class="pro-windows">
+        ${proWindows.map((window) => proactiveWindowRowHtml(window)).join('')}
+      </div>
+      <div class="settings-inline-actions">
+        <button type="button" class="btn btn-small" id="pro-add-window">＋ 添加时段</button>
+      </div>
+      <div class="hint">${proWindows.length ? '按上面的时段生效；跨午夜会自动识别。' : '当前没有时段限制 = 全天都可以主动开口。'}</div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>检查间隔下限（分钟）</label><input type="number" id="cfg-pro-min" min="1" value="${esc(Math.round((Number(c.proactive.checkIntervalMinMs) || 1800000) / 60000))}" /></div>
+      <div class="field"><label>检查间隔上限（分钟）</label><input type="number" id="cfg-pro-max" min="2" value="${esc(Math.round((Number(c.proactive.checkIntervalMaxMs) || 5400000) / 60000))}" /></div>
+      <div class="field"><label>触发概率（%）</label><input type="number" id="cfg-pro-prob" step="1" min="0" max="100" value="${esc(Math.round((Number(c.proactive.probability) || 0) * 100))}" /></div>
+      <div class="field"><label>安静判定（分钟，至少 5 分钟）</label><input type="number" id="cfg-pro-idle" min="5" max="1440" step="1" value="${esc(Math.round((Number(c.proactive.idleThresholdMs) || 1800000) / 60000))}" /></div>
     </div>
     <div class="checkbox-row"><input type="checkbox" id="cfg-pro-followup" ${c.proactive?.followUpEnabled !== false ? 'checked' : ''} />
-      <label for="cfg-pro-followup">说完话没人接，过十来分钟补一句（"？"/"人呢"）</label></div>
+      <label for="cfg-pro-followup">发言后无人回应时，稍后补一句</label></div>
     <div class="checkbox-row"><input type="checkbox" id="cfg-pro-selfwake" ${c.proactive?.selfWakeEnabled !== false ? 'checked' : ''} />
       <label for="cfg-pro-selfwake">允许模型给自己安排稍后的主动发言</label></div>
     <div class="hint">
-      这三项互不影响：只取消第一条，机器人仍可能在说完话没人接时补一句、也可能按自己安排的时机开口；
-      完全不想让它主动开口就把三个都取消。后两项在较早版本里一直生效，本版起可以在控制台关掉。
+      中间的「群聊 / 私聊」是范围：分别沿用「群白名单」与「私聊白名单」（deny 优先），两个都不勾就不主动开话题。
+      群聊和私聊各自独立计时；默认「范围共用一次机会」= 每轮在所有群里挑一个、所有私聊里挑一个。选「每个群/私聊独立判定」后，每个会话各自按概率判定，并受「每轮最多开口」限制。
+      后两条是补话与自安排唤醒，独立开关。完全不想让它主动开口，就把上面所有勾选都取消。
+      私聊默认不勾：勾上后私聊白名单里的人（安静够久且没有未读时）也可能收到主动消息。
+    </div>
+
+    <h3>所有模式 · 回复行为</h3>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-reply-guard" ${conversation.replyGuardEnabled !== false ? 'checked' : ''} />
+      <label for="cfg-reply-guard">该回却没发时自动纠正一次（私聊 / 被 @ / 引用 / 点名）</label></div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-poke-reply" ${conversation.pokeReplyEnabled !== false ? 'checked' : ''} />
+      <label for="cfg-poke-reply">拍一拍机器人时按直接互动回复（必回、即时处理）</label></div>
+    <div class="hint">
+      回复纠正只在“模型写了正文却没调用发送工具”时触发，会多跑一次模型；关掉后这类情况不再补救。
+      拍一拍必回会跳过随机概率；关掉后拍一拍按普通群消息处理。
+    </div>
+
+    <h3>所有模式 · 拟人化表达（实验性）</h3>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-humanize-enabled" ${humanize.enabled === true ? 'checked' : ''} />
+      <label for="cfg-humanize-enabled">启用拟人化表达与助手腔过滤</label>
+      <button type="button" class="btn btn-small" id="humanize-recommend" style="margin-left:10px">推荐配置</button></div>
+    <div class="field"><label for="cfg-humanize-preset">风格预设</label>
+      <select id="cfg-humanize-preset">
+        ${[['natural', '自然'], ['active', '活跃'], ['quiet', '安静'], ['companion', '陪聊']].map(([value, label]) =>
+          `<option value="${value}" ${(humanize.preset || 'natural') === value ? 'selected' : ''}>${label}</option>`).join('')}
+      </select>
+    </div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-humanize-delay-enabled" ${replyDelay.enabled !== false ? 'checked' : ''} />
+      <label for="cfg-humanize-delay-enabled">发送前按字数延迟（私聊会先显示“正在输入”）</label></div>
+    <div class="field-row">
+      <div class="field"><label for="cfg-humanize-delay-min">最短等待（秒）</label>
+        <input type="number" id="cfg-humanize-delay-min" min="0" max="30" step="0.1" value="${esc((delayMinMs / 1000).toFixed(1))}" /></div>
+      <div class="field"><label for="cfg-humanize-delay-max">最长等待（秒）</label>
+        <input type="number" id="cfg-humanize-delay-max" min="0" max="30" step="0.1" value="${esc((delayMaxMs / 1000).toFixed(1))}" /></div>
+      <div class="field"><label for="cfg-humanize-delay-perchar">每字增加（毫秒）</label>
+        <input type="number" id="cfg-humanize-delay-perchar" min="0" max="200" step="1" value="${esc(Number(replyDelay.perCharMs) || 0)}" /></div>
+    </div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-humanize-antaienabled" ${humanize.antiAi?.enabled !== false ? 'checked' : ''} />
+      <label for="cfg-humanize-antaienabled">过滤助手式自指与客服收尾语</label></div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-humanize-blocksevere" ${humanize.antiAi?.blockSevere !== false ? 'checked' : ''} />
+      <label for="cfg-humanize-blocksevere">检测到明显的助手自指/免责时，要求重写一次</label></div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-humanize-state-enabled" ${humanize.personaState?.enabled !== false ? 'checked' : ''} />
+      <label for="cfg-humanize-state-enabled">状态（精力/心情/当前活动）影响语气（同一人设跨群共享）</label></div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-humanize-relationship-enabled" ${humanize.relationship?.enabled !== false ? 'checked' : ''} />
+      <label for="cfg-humanize-relationship-enabled">记录与每个人的互动关系（仅对已有人物印象的人生效）</label></div>
+    <div class="field"><label for="cfg-humanize-meme-level">梗密度（闲聊里的网络梗）</label>
+      <select id="cfg-humanize-meme-level">
+        <option value="off" ${(humanize.memeUse?.level || 'normal') === 'off' ? 'selected' : ''}>关闭：不主动用梗</option>
+        <option value="light" ${(humanize.memeUse?.level || 'normal') === 'light' ? 'selected' : ''}>克制：只接对方用过的梗</option>
+        <option value="normal" ${(humanize.memeUse?.level || 'normal') === 'normal' ? 'selected' : ''}>正常：贴合时用一次</option>
+        <option value="heavy" ${(humanize.memeUse?.level || 'normal') === 'heavy' ? 'selected' : ''}>活跃：闲聊里更主动</option>
+      </select>
+      <div class="hint">只影响闲聊；技术、学习、情绪严肃场景仍不用梗。角色卡优先时也按这个档位收放。</div>
+    </div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-humanize-respect-card" ${humanize.respectPersonaCard !== false ? 'checked' : ''} />
+      <label for="cfg-humanize-respect-card">角色卡优先时不覆盖角色语气（推荐）</label></div>
+    <div class="field">
+      <label>当前状态（只读）</label>
+      <div class="hint" id="humanize-state-text">读取中…</div>
+    </div>
+    <div class="hint">
+      只影响发送时机与措辞，不改变角色设定。延迟仅作用于本轮第一条，后续气泡仍按发送保护里的间隔；
+      暂停或中止会立即取消等待。默认关闭，建议从 0.5–2 秒开始观察。
+    </div>
+
+    <h3>所有模式 · 自主节奏（实验性）</h3>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-pacing-enabled" ${c.pacing?.enabled === true ? 'checked' : ''} />
+      <label for="cfg-pacing-enabled">消息不即时唤醒，按自主节奏攒批处理</label></div>
+    <div class="field-row">
+      <div class="field"><label for="cfg-pacing-default">默认多久醒一次（分钟）</label>
+        <input type="number" id="cfg-pacing-default" min="1" max="240" value="${esc(c.pacing?.defaultWakeMinutes ?? 20)}" /></div>
+      <div class="field"><label for="cfg-pacing-min">两次自主醒来最短间隔（分钟）</label>
+        <input type="number" id="cfg-pacing-min" min="1" max="240" value="${esc(c.pacing?.minWakeMinutes ?? 5)}" /></div>
+    </div>
+    <div class="field"><label for="cfg-pacing-max">最长沉默上限（分钟）</label>
+      <input type="number" id="cfg-pacing-max" min="1" max="240" value="${esc(c.pacing?.maxSilenceMinutes ?? 45)}" /></div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-pacing-instant" ${c.pacing?.instantOnMention !== false ? 'checked' : ''} />
+      <label for="cfg-pacing-instant">被 @ 时仍然立刻处理，不排队</label></div>
+    <div class="hint">
+      开启后普通消息先攒着，等机器人自己安排的时机统一处理；被 @ 或拍一拍时仍然立刻处理
+      （拍一拍算不算直接互动看上一条开关）。私聊永远即时。默认关闭，仍在实验阶段，建议先在少量群里试。
+    </div>
+
+    <h3>所有模式 · 数据保留</h3>
+    <div class="field-row">
+      <div class="field"><label for="cfg-store-maxmessages">每个会话最多保留消息（0 = 不限）</label>
+        <input type="number" id="cfg-store-maxmessages" min="0" max="1000000" value="${esc(st.maxMessagesPerChat ?? 0)}" /></div>
+      <div class="field"><label for="cfg-store-keepsessions">会话审计文件保留条数（0 = 不限）</label>
+        <input type="number" id="cfg-store-keepsessions" min="0" max="100000" value="${esc(st.keepSessionFiles ?? 2000)}" /></div>
+    </div>
+    <div class="hint">
+      消息保留上限只清理已经处理完的历史，不会删待处理或结果未知的消息，填 0 表示不清理，保存后即时生效。
+      审计文件条数在下次重启后生效；占用磁盘时再调小。
+    </div>
+    <div class="field" style="margin-top:12px">
+      <label for="cfg-store-ioprofile">磁盘写入策略</label>
+      <select id="cfg-store-ioprofile">
+        ${(() => {
+          const current = ioProfileOf(st);
+          const option = (value, label) => `<option value="${value}" ${current === value ? 'selected' : ''}>${label}</option>`;
+          return [
+            option('balanced', '均衡（推荐）：每 10 秒落盘一次，消息库 FULL'),
+            option('low', '省 IO：每 30 秒落盘一次，消息库 NORMAL'),
+            option('minimal', '最省 IO：每 60 秒落盘一次，消息库 NORMAL'),
+            option('custom', '自定义：自己填落盘间隔和消息库同步级别')
+          ].join('');
+        })()}
+      </select>
+    </div>
+    <div id="cfg-store-iocustom" class="field-row"${ioProfileOf(st) === 'custom' ? '' : ' style="display:none"'}>
+      <div class="field"><label for="cfg-store-persistms">运行中会话落盘间隔（毫秒，2000~60000）</label>
+        <input type="number" id="cfg-store-persistms" min="2000" max="60000" step="1000" value="${esc(st.sessionPersistMs ?? 10000)}" /></div>
+      <div class="field"><label for="cfg-store-sqlitesync">消息库写入同步</label>
+        <select id="cfg-store-sqlitesync">
+          <option value="FULL" ${storeSync === 'FULL' ? 'selected' : ''}>FULL：最稳，每条提交都等落盘</option>
+          <option value="NORMAL" ${storeSync === 'NORMAL' ? 'selected' : ''}>NORMAL：省磁盘 IOPS，掉电可能丢最近几条</option>
+        </select></div>
+    </div>
+    <div class="hint">
+      大多数服务器用「均衡」就行。磁盘 IOPS 紧张（例如 2 核 2G 小云盘、控制台常开）时选「省 IO」或「最省 IO」，
+      会减少运行中会话的落盘频率，并把消息库改成 NORMAL 同步；代价是进程异常退出时最多丢对应间隔内的运行记录，
+      消息库掉电可能丢最近几条提交。正常结束的会话始终立即完整落盘。选「自定义」才会显示具体数值。
     </div>
 
     <h3>所有模式 · 表情包</h3>
@@ -198,6 +439,16 @@ return `
       <div class="hint">
         拖动设置 1-60（默认 10 张/小时）。全局上限；每个会话另有 3 张/小时的上限。
         控制台里手动添加表情不受这两项影响。
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="cfg-sticker-collect-criteria">收藏的判定标准（留空 = 内置默认）</label>
+      <textarea id="cfg-sticker-collect-criteria" rows="4" maxlength="2000" placeholder="只写「收什么 / 不收什么」；留空用内置默认（与之前版本完全一致）">${esc(c.sticker?.collectCriteria || '')}</textarea>
+      <div class="hint">
+        这段文字替换表情判定里的"判定标准"部分（"你是「谁」、正在看谁的图"仍由代码补充），
+        只影响<b>哪些图会被收进表情库</b>，不影响聊天与发送。改完即时生效、不用重启；
+        超 2000 字判定时只取前 2000。
       </div>
     </div>
 
@@ -221,7 +472,7 @@ return `
       </div>
       <div class="hint">
         拖动设置 1-60（默认 10）。清单一半放常用的，一半放没用过/很久没用的，发掉一张自动换下一张上来
-        （不会再总是那几张）。条数越大能选的范围越宽，代价是每轮提示词变长；省 Token 模式还会再夹到
+        （不会再总是那几张）。条数越大能选的范围越宽，代价是每轮提示词变长；Token 节省模式还会再夹到
         3~5 条。库容量不受这一项影响。
       </div>
     </div>
@@ -295,6 +546,11 @@ return `
       <div class="tier-param${paramOn.all ? '' : ' dim'}">
         <label>④ 全响应时：发未读 + <input type="number" id="cfg-allcount" min="0" max="500" value="${esc(st.allCount ?? 80)}" /> 条已读</label>
         <div class="hint">滑条拖到 <b>100%</b> 时，任何消息都响应。</div>
+      </div>
+      <div class="field" style="margin-top:10px">
+        <label for="cfg-pastchars">过去状态最多字符数</label>
+        <input type="number" id="cfg-pastchars" min="100" max="100000" step="1000" value="${esc(st.pastStateMaxChars ?? 24000)}" />
+        <div class="hint">上限 100000。条数和字符数是两道闸门，先到哪道按哪道截；调大上下文更全，但每轮 token 花费也更高。</div>
       </div>
     </div>
 
@@ -405,22 +661,29 @@ async function openUnknownOperations(chatKey) {
     closeModelModal(overlay));
   overlay.querySelectorAll('[data-unknown-result]').forEach((button) => {
     button.addEventListener('click', async () => {
-      const sent = button.dataset.unknownResult === 'sent';
-      if (!await askForConfirmation(sent
-        ? '确认已在 QQ 中看到这次操作成功？不会再次发送。'
-        : '确认这次操作未成功？系统也不会自动重试。')) return;
-      await api(
-        `/api/chats/${chatKey.replace(':', '_')}/unknown-operations/${encodeURIComponent(button.dataset.operationId)}/reconcile`,
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            result: button.dataset.unknownResult,
-            confirm: true
-          })
-        }
-      );
-      closeModelModal(overlay);
-      await loadChats();
+      try {
+        const sent = button.dataset.unknownResult === 'sent';
+        if (!await askForConfirmation(sent
+          ? '确认已在 QQ 中看到这次操作成功？不会再次发送。'
+          : '确认这次操作未成功？系统也不会自动重试。')) return;
+        button.disabled = true;
+        await api(
+          `/api/chats/${chatKey.replace(':', '_')}/unknown-operations/${encodeURIComponent(button.dataset.operationId)}/reconcile`,
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              result: button.dataset.unknownResult,
+              confirm: true
+            })
+          }
+        );
+        closeModelModal(overlay);
+        await loadChats();
+      } catch (error) {
+        // 失败时保留弹窗（用户可以再试或关掉），并给出明确反馈
+        button.disabled = false;
+        alert(`核对写入失败：${error.message}`);
+      }
     });
   });
 }
@@ -449,9 +712,9 @@ function renderChatList() {
     if (mode === 'threaded' && Number(c.thread?.engagedUntil) > Date.now()) {
       threadLabel = '续接中';
     } else if (mode === 'lifecycle' && c.thread?.state === 'active') {
-      threadLabel = '生命周期·活跃';
+      threadLabel = '生命周期 · 活跃';
     } else if (mode === 'lifecycle' && c.thread?.state === 'listening') {
-      threadLabel = '生命周期·监听';
+      threadLabel = '生命周期 · 监听';
     } else if (mode === 'lifecycle' && c.thread?.state === 'rollover_armed') {
       threadLabel = '等待续接';
     }
@@ -459,7 +722,7 @@ function renderChatList() {
     const showIncidentControl = c.key.startsWith('group:')
       && state.config?.incidentPilot?.enabled === true;
     return `
-      <div class="chat-item ${c.key === state.currentChatKey ? 'selected' : ''} ${c.unread ? 'unread-row' : ''} ${isNew ? 'new-item' : ''}" data-key="${esc(c.key)}">
+      <div class="chat-item ${c.key === state.currentChatKey ? 'selected' : ''} ${c.unread ? 'unread-row' : ''} ${isNew ? 'new-item' : ''}" data-key="${esc(c.key)}" role="button" tabindex="0">
         <div class="chat-item-title">
           <span class="session-chat">${esc(name)}</span>
           ${c.timeControl?.enabled ? `<span class="thread-pill">${c.timeControl.active ? '活跃时段' : '仅记录'}</span>` : ''}
@@ -477,12 +740,20 @@ function renderChatList() {
   const rows = visibleChats.length
     ? chatRows
     : [{ key: '__empty__', html: `<div class="list-head muted">${state.chats.length ? '没有匹配筛选条件的会话' : '还没有消息存档（等白名单里的群/好友来消息）'}</div>` }];
-  patchKeyedList(box, rows, 'data-key');
+  // exit: true —— 行被筛掉/归档时先塔缩再移除（见 ui/core/dom-util.js 与 style.css 的 rowOut）
+  patchKeyedList(box, rows, 'data-key', { exit: true });
   for (const c of state.chats) state.seenChatKeys.add(c.key);
   $$('.chat-item', box).forEach((el) => {
     if (el.__bound) return;      // 增量更新会保留旧行，别重复绑定
     el.__bound = true;
     el.addEventListener('click', () => selectChat(el.dataset.key));
+    // 键盘也要能进会话：存档列表原来是纯 div（无 role/tabindex），Tab 直接跳过整列 ——
+    // 只能点鼠标才打得开（2026-10-08 审查）。与「会话」列表同样的 Enter/Space 口径。
+    el.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      selectChat(el.dataset.key);
+    });
   });
   $$('[data-chat-runtime]', box).forEach((button) => {
     if (button.__bound) return;
@@ -516,28 +787,62 @@ async function selectChat(key) {
  *    —— 表现为"明明滚下去了，过一会儿自己弹回上面"。
  */
 async function loadChatMessages(key, { keepView = false } = {}) {
+  // 注册给滚动加载器（模块求值期不碰 state：真 ESM 环境里有 TDZ / 环引用风险）
+  state.chatLoadOlder = loadOlderChatMessages;
   try {
     const request = ++state.chatSkinRequest;
     const view = state.chatSkinView || '';
-    const data = await api(`/api/chats/${key.replace(':', '_')}/messages?limit=100000${view ? '&skinId=' + encodeURIComponent(view) : ''}`);
+    const base = `/api/chats/${key.replace(':', '_')}/messages`;
+    const skinQuery = view ? '&skinId=' + encodeURIComponent(view) : '';
+    if (keepView && (state.chatMessages || []).length) {
+      // 轮询只取"比当前最新一条更新的"，不再整页重拉（否则已加载的更早分页会被冲掉）
+      const lastId = Number(state.chatMessages[state.chatMessages.length - 1]?.id) || 0;
+      const data = await api(`${base}?limit=${CHAT_MSG_PAGE}&after=${lastId}${skinQuery}`);
+      if (state.currentChatKey !== key || state.chatSkinRequest !== request || (state.chatSkinView || '') !== view) return;
+      const fresh = data.messages || [];
+      if (!fresh.length) return;
+      state.chatMessages.push(...fresh);
+      updateChatMessagesBody(true);
+      return;
+    }
+
+    const data = await api(`${base}?limit=${CHAT_MSG_PAGE}${skinQuery}`);
     if (state.chatSkinRequest !== request || (state.chatSkinView || '') !== view) return;
     state.chatSkinInfo = data.skins ? data : null;
     // 期间用户可能切走了会话，那就别覆盖当前视图
     if (state.currentChatKey !== key) return;
     state.chatMessages = data.messages || [];
-
-    if (keepView && (state.chatMsgLimit || 0) > 0 && $('#chat-msg-body')) {
-      // 只更新表格内容：分页不变、滚动位置不变
-      updateChatMessagesBody(true);
-    } else {
-      // 切换会话：重置分页并从第一页开始
-      state.chatMsgLimit = CHAT_MSG_PAGE;
-      renderChatMessages();
-    }
+    state.chatHasMore = data.hasMore === true;
+    state.chatNextBefore = Number(data.nextBefore) || 0;
+    state.chatMsgLimit = CHAT_MSG_PAGE;
+    renderChatMessages();
   } catch (e) {
     if (state.currentChatKey !== key) return;
     const box = $('#chat-detail');
     if (box) box.innerHTML = `<div class="empty-hint">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+/** 向上翻页：取比当前最老一条更早的一批，插到数组头部（表格末尾）。 */
+async function loadOlderChatMessages() {
+  if (state.chatLoadingOlder || !state.chatHasMore || !state.chatNextBefore) return 0;
+  const key = state.currentChatKey;
+  state.chatLoadingOlder = true;
+  const view = state.chatSkinView || '';
+  const request = state.chatSkinRequest;
+  try {
+    const data = await api(`/api/chats/${key.replace(':', '_')}/messages?limit=${CHAT_MSG_PAGE}&before=${state.chatNextBefore}${view ? '&skinId=' + encodeURIComponent(view) : ''}`);
+    if (state.currentChatKey !== key || state.chatSkinRequest !== request || (state.chatSkinView || '') !== view) return 0;
+    state.chatHasMore = data.hasMore === true;
+    state.chatNextBefore = Number(data.nextBefore) || 0;
+    const older = data.messages || [];
+    if (!older.length) return 0;
+    state.chatMessages = [...older, ...state.chatMessages];
+    return older.length;
+  } catch {
+    return 0;
+  } finally {
+    state.chatLoadingOlder = false;
   }
 }
 
@@ -629,42 +934,62 @@ function renderChatMessages() {
   $('#chat-runtime-control')?.addEventListener('click', () =>
     openChatRuntimeControl(key).catch((error) => alert(error.message)));
   $('#chat-read-btn').addEventListener('click', async () => {
-    await api(`/api/chats/${key.replace(':', '_')}/mark-read`, { method: 'POST', body: '{}' });
-    loadChats();
-    // 保持视图：用户可能已经滚到中间了，别把他弹回顶部
-    loadChatMessages(key, { keepView: true });
+    try {
+      await api(`/api/chats/${key.replace(':', '_')}/mark-read`, { method: 'POST', body: '{}' });
+      loadChats();
+      // 保持视图：用户可能已经滚到中间了，别把他弹回顶部
+      loadChatMessages(key, { keepView: true });
+    } catch (error) {
+      alert(`标记已读失败：${error.message}`);
+    }
   });
   $('#chat-retry-btn')?.addEventListener('click', async () => {
-    if (!await askForConfirmation('重新处理确定未发送成功的失败批次？')) return;
-    await api(`/api/chats/${key.replace(':', '_')}/retry-failed`, { method: 'POST', body: '{"confirm":true}' });
-    loadChats();
+    try {
+      if (!await askForConfirmation('重新处理确定未发送成功的失败批次？')) return;
+      await api(`/api/chats/${key.replace(':', '_')}/retry-failed`, { method: 'POST', body: '{"confirm":true}' });
+      loadChats();
+    } catch (error) {
+      alert(`重试失败：${error.message}`);
+    }
   });
   $('#chat-resolve-btn')?.addEventListener('click', async () => {
-    if (state.config?.incidentPilot?.enabled === true) {
-      await openUnknownOperations(key);
-      return;
+    try {
+      if (state.config?.incidentPilot?.enabled === true) {
+        await openUnknownOperations(key);
+        return;
+      }
+      if (!await askForConfirmation('已核对 QQ 中的实际发送结果？确认后将结束待确认批次，不会重发。')) return;
+      await api(`/api/chats/${key.replace(':', '_')}/resolve-held`, {
+        method: 'POST', body: '{"confirm":true}'
+      });
+      loadChats();
+    } catch (error) {
+      alert(`核对失败：${error.message}`);
     }
-    if (!await askForConfirmation('已核对 QQ 中的实际发送结果？确认后将结束待确认批次，不会重发。')) return;
-    await api(`/api/chats/${key.replace(':', '_')}/resolve-held`, {
-      method: 'POST', body: '{"confirm":true}'
-    });
-    loadChats();
   });
   $('#chat-thread-close-btn')?.addEventListener('click', async () => {
-    if (!await askForConfirmation('结束当前对话线程？后续普通消息将重新遵循响应档位。')) return;
-    await api(`/api/chats/${key.replace(':', '_')}/thread`, { method: 'DELETE', body: '{}' });
-    await loadChats();
+    try {
+      if (!await askForConfirmation('结束当前对话线程？后续普通消息将重新遵循响应档位。')) return;
+      await api(`/api/chats/${key.replace(':', '_')}/thread`, { method: 'DELETE', body: '{}' });
+      await loadChats();
+    } catch (error) {
+      alert(`结束线程失败：${error.message}`);
+    }
   });
   $('#chat-testsend-btn').addEventListener('click', async () => {
     const input = $('#test-send-text');
     const text = input.value.trim();
     if (!text) return;
-    await api(`/api/chats/${key.replace(':', '_')}/test-send`, {
-      method: 'POST', body: JSON.stringify({ text })
-    });
-    input.value = '';
-    // 同理，保持当前分页与滚动位置
-    loadChatMessages(key, { keepView: true });
+    try {
+      await api(`/api/chats/${key.replace(':', '_')}/test-send`, {
+        method: 'POST', body: JSON.stringify({ text })
+      });
+      input.value = '';
+      // 同理，保持当前分页与滚动位置
+      loadChatMessages(key, { keepView: true });
+    } catch (error) {
+      alert(`发送失败：${error.message}`);
+    }
   });
 
   updateChatMessagesBody();
@@ -700,8 +1025,10 @@ function updateChatMessagesMeta(newestFirst) {
   const more = $('#chat-msg-more');
   if (more) {
     more.textContent = rest > 0
-      ? `向下滚动加载更早的（还有 ${rest} 条）`
-      : (total > CHAT_MSG_PAGE ? `已显示全部 ${total} 条` : '');
+      ? `向下滚动加载更早的（已载入里还有 ${rest} 条）`
+      : (state.chatHasMore
+        ? '向下滚动加载更早的（还有更早的存档）'
+        : (total > CHAT_MSG_PAGE ? `已显示全部 ${total} 条` : ''));
   }
   const cnt = $('#chat-detail')?.querySelector('[data-field="chat-msg-count"]');
   if (cnt) {
@@ -772,4 +1099,4 @@ function conversationModeForChat(chatKey, cfg = state.config) {
 }
 
 
-export { appendChatMessageRows, loadChats, renderChatSection, updateChatMessagesBody };
+export { appendChatMessageRows, bindHumanizePreset, bindHumanizeRecommend, bindProactiveWindowEditor, loadChats, loadHumanizeState, renderChatSection, updateChatMessagesBody };

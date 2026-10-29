@@ -1,6 +1,7 @@
 // 原工具实现完整保存在 tools-core.js。
 // 本文件只提供“实验工具调度器”的薄包装：关闭时直接委托原实现，保持现有行为。
 import { getConfig } from '../core/config.js';
+import { skillGateMessage } from '../skills/registry.js';
 import {
   recordMultimodalToolResult
 } from '../pilots/experimental-multimodal-context-core.js';
@@ -61,12 +62,19 @@ function runtimeBatch(defs, ctx, settings) {
 
   const batch = new ExperimentalToolBatch(calls, {
     maxParallelReads: settings.maxParallelReads,
-    execute: (call) => coreExecuteTool(
-      defs,
-      ctx,
-      call?.function?.name ?? '',
-      call?.function?.arguments ?? '{}'
-    ),
+    execute: (call) => {
+      const name = call?.function?.name ?? '';
+      const gate = skillGateMessage(ctx?.activeSkill, ctx?.pendingSkillUse, name, safeToolArgs(call?.function?.arguments));
+      if (gate) {
+        return { content: gate, isError: true, reportIncident: false, skillBlocked: true };
+      }
+      return coreExecuteTool(
+        defs,
+        ctx,
+        name,
+        call?.function?.arguments ?? '{}'
+      );
+    },
     onParallelWave: ({ size, names }) => {
       session.experimentalToolScheduler = {
         enabled: true,

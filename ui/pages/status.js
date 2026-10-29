@@ -10,7 +10,7 @@ import {
 } from '../app.js';
 import { api } from '../core/api.js';
 import { THREAD_STATE_LABEL } from '../core/constants.js';
-import { askForConfirmation, setStatusLabel, updateOnebotStatusLine } from '../core/dom-util.js';
+import { askForConfirmation, closeDialog, setStatusLabel, updateOnebotStatusLine } from '../core/dom-util.js';
 import { $, esc } from '../core/dom.js';
 import {
   chatNameOf, fmtRemainingMs, fmtTime, fmtTok, fmtTokens, fmtYuan, formatChatTitle, mulOf, onebotIssueText
@@ -100,7 +100,16 @@ async function resumePause({ skipBacklog = false } = {}) {
 
 // 「更新部署」里的上次更新检查说明：口径是「已发布的 Release」，
 // 让"连不上 GitHub / 没有新 Release / 当前部署领先"这些情况都能看见，而不是完全无声。
+// 容器部署：更新是"换镜像"，控制台里的"立即更新"没有可执行的 systemd 服务。
+function containerManaged() {
+  return state.config?.runtime?.container === true;
+}
+
 function renderUpdateCheckNote(update = {}) {
+  if (containerManaged()) {
+    return '当前以 Docker 容器运行：应用由镜像管理。升级时先把 compose 里的 QQ_AGENT_IMAGE 改到目标版本，'
+      + '再 docker compose pull && docker compose up -d（数据卷不动）。';
+  }
   const short = (value) => (value ? String(value).slice(0, 12) : '-');
   const check = update.updateNotice && typeof update.updateNotice === 'object' ? update.updateNotice : null;
   if (!check || (!check.checkedAt && !check.error)) {
@@ -109,7 +118,7 @@ function renderUpdateCheckNote(update = {}) {
   const when = check.checkedAt ? `（${esc(fmtTime(check.checkedAt))}）` : '';
   if (check.available) {
     return `上次更新检查${when}：发现新版本${check.version ? ` ${esc(check.version)}` : ''}`
-      + `（当前 ${esc(short(check.deployed))} → 最新 ${esc(short(check.revision))}`
+      + `（当前 ${esc(short(check.deployed))} → 最新 ${esc(String(check.revision || '-'))}`
       + `${Number(check.commitCount) > 0 ? `，${Number(check.commitCount)} 个新提交` : ''}）。`;
   }
   if (check.reason === 'unconfigured') {
@@ -120,11 +129,14 @@ function renderUpdateCheckNote(update = {}) {
       + '（只有发布 Release 才算新版本，branch 上的日常提交不会提示）。';
   }
   if (check.reason === 'ahead-of-release') {
-    return `上次更新检查${when}：当前部署已包含最新 Release`
-      + `${check.version ? ` ${esc(check.version)}` : ''}（${esc(short(check.deployed))}），无需更新。`;
+    // 新口径是「本地版本 >= Release 版本」，不再断言提交层面"已包含"（版本相等但提交
+    // 分叉的部署也会落到这里；文案不能比实际保证更强）。
+    return `上次更新检查${when}：本地版本${check.localVersion ? ` ${esc(check.localVersion)}` : ''}`
+      + `不低于最新 Release${check.version ? ` ${esc(check.version)}` : ''}`
+      + `（${esc(short(check.deployed))}），无需更新。`;
   }
   if (check.reason === 'unknown-deployed') {
-    return `上次更新检查${when}：当前部署不是 git 提交（可能是压缩包安装），无法比较版本`
+    return `上次更新检查${when}：没有部署基线（deployed-revision 为空），无法判断当前版本`
       + `${check.version ? `；最新 Release 为 ${esc(check.version)}，可用「立即更新」安装该版本` : ''}。`;
   }
   if (check.reason === 'compare-failed') {
@@ -179,10 +191,17 @@ async function pauseAutoUpdate() {
 }
 
 async function runManualUpdate() {
+  const result = $('#auto-update-result');
+  if (containerManaged()) {
+    if (result) {
+      result.textContent = '容器部署请先把 compose 里的 QQ_AGENT_IMAGE 改到目标版本，再执行 docker compose pull && docker compose up -d';
+      result.className = 'control-result muted';
+    }
+    return;
+  }
   if (!await askForConfirmation('立即检查 GitHub 最新代码并尝试部署？服务会在部署阶段短暂重启。')) {
     return;
   }
-  const result = $('#auto-update-result');
   if (result) result.textContent = '更新任务已提交…';
   try {
     const response = await api('/api/auto-update/run', {
@@ -202,6 +221,13 @@ async function runManualUpdate() {
 async function runUpdateFromNotice() {
   const result = $('#update-notice-result');
   const runBtn = $('#update-notice-run');
+  if (containerManaged()) {
+    if (result) {
+      result.textContent = '容器部署请先把 compose 里的 QQ_AGENT_IMAGE 改到目标版本，再执行 docker compose pull && docker compose up -d';
+      result.className = 'control-result muted';
+    }
+    return;
+  }
   if (runBtn) runBtn.disabled = true;
   if (result) { result.textContent = '正在提交更新任务…'; result.className = 'control-result muted'; }
   try {
@@ -214,7 +240,7 @@ async function runUpdateFromNotice() {
     // 提交成功就关掉提示框，切到「控制 → 更新部署」：进度（阶段 + 已耗时）显示在那一块，
     // 由状态派生、整页重绘也不会丢。以前这里留着框只把按钮点灰，用户看不到任何进展
     // （2026-09-22 反馈）。
-    $('#update-notice')?.close();
+    closeDialog($('#update-notice'));
     switchTab('control');
   } catch (error) {
     // 提交失败：框留着，错误直接显示在框里
@@ -229,7 +255,7 @@ async function ignoreUpdateVersion() {
   try {
     await api('/api/auto-update/ignore', { method: 'POST', body: JSON.stringify({ version }) });
   } catch { /* 忽略失败就当作稍后处理，下次打开仍会提示 */ }
-  $('#update-notice')?.close();
+  closeDialog($('#update-notice'));
 }
 
 // ── 状态栏 ──

@@ -140,8 +140,8 @@ import { esc } from './core/dom.js';
         <label><span>最大重试等待（秒）</span><input type="number" id="auto-update-retry-max" min="0.5" max="120" step="0.5" value="${esc(retryMax)}" /></label>
         <label><span>连通测试超时（秒）</span><input type="number" id="auto-update-connect-timeout" min="3" max="120" value="${esc(status.connectivityTimeoutSeconds ?? 20)}" /></label>
         <label><span>Git 拉取超时（秒）</span><input type="number" id="auto-update-fetch-timeout" min="30" max="1800" value="${esc(status.fetchTimeoutSeconds ?? 300)}" /></label>
-        <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="auto-update-http11" ${status.forceHttp11 !== false ? 'checked' : ''} /><span>强制 Git HTTP/1.1</span></label>
-        <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="auto-update-disable-failure" ${status.disableOnFailure !== false ? 'checked' : ''} /><span>失败后禁用自动更新</span></label>
+        <label style="display:flex;gap:10px;align-items:center"><input class="sw" type="checkbox" id="auto-update-http11" ${status.forceHttp11 !== false ? 'checked' : ''} /><span>强制 Git HTTP/1.1</span></label>
+        <label style="display:flex;gap:10px;align-items:center"><input class="sw" type="checkbox" id="auto-update-disable-failure" ${status.disableOnFailure !== false ? 'checked' : ''} /><span>失败后禁用自动更新</span></label>
         <div class="settings-actions" style="grid-column:1 / -1">
           <button type="button" class="btn btn-small" id="auto-update-network-save" ${status.busy ? 'disabled' : ''}>保存网络策略</button>
           <button type="button" class="btn btn-small" id="auto-update-connectivity-test" ${!status.installed || status.busy ? 'disabled' : ''}>测试 GitHub 连通性</button>

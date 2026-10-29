@@ -1,0 +1,8 @@
+{
+  "id": "recipe-helper",
+  "name": "菜谱助手",
+  "version": "1.0.0",
+  "description": "按现有食材给可行做法，标清用量、火候和替换方案，不假装尝过。",
+  "allowedTools": ["web_search", "web_fetch", "send_message"],
+  "triggers": ["这些食材能做什么", "教我做一道菜", "冰箱里只有"]
+}

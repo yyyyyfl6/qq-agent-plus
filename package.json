@@ -1,6 +1,6 @@
 {
   "name": "qq-agent-plus",
-  "version": "0.7.9",
+  "version": "0.9.12",
   "private": false,
   "description": "Linux QQ group agent (OneBot v11)：分条发言、贴纸系统、主动发言与内置运维命令。",
   "type": "module",
@@ -11,22 +11,27 @@
     "start": "node src/server.js",
     "server": "node src/server.js",
     "ops": "node src/ops.js",
-    "test": "node --test test/*.test.mjs && node test/test-prompt.mjs && node test/render-test.mjs && node test/scroll-test.mjs && node test/usage-e2e.mjs",
-    "test:unit": "node --test test/*.test.mjs",
-    "test:local": "node test/local/run.mjs",
+    "test": "node scripts/test-suite.mjs",
+    "test:unit": "node scripts/test-suite.mjs unit",
+    "test:unit:win": "node scripts/test-windows.mjs",
+    "test:local": "node scripts/test-suite.mjs local",
+    "test:regression": "node scripts/test-suite.mjs regression",
+    "test:browser": "playwright test",
     "test:prompt": "node test/test-prompt.mjs",
     "test:render": "node test/render-test.mjs",
     "test:scroll": "node test/scroll-test.mjs",
     "test:usage": "node test/usage-e2e.mjs",
-    "test:legacy-selftest": "node test/selftest.mjs",
     "lint": "eslint .",
-    "lint:fix": "eslint . --fix"
+    "lint:fix": "eslint . --fix",
+    "humanize:eval": "node scripts/humanize-eval.mjs",
+    "skill:pack": "node scripts/skill-pack.mjs",
+    "skill:check": "node scripts/skill-market-check.mjs"
   },
   "dependencies": {
     "jce": "0.2.3",
-    "node-html-parser": "^9.0.4",
+    "node-html-parser": "^9.0.5",
     "silk-wasm": "^3.7.1",
-    "undici": "^8.11.2",
+    "undici": "^8.12.3",
     "ws": "^8.22.0"
   },
   "license": "MIT",
@@ -50,10 +55,11 @@
   },
   "homepage": "https://github.com/sakurawwwxh/qq-agent-plus#readme",
   "devDependencies": {
-    "eslint": "^10.11.0",
+    "@playwright/test": "1.64.1",
+    "eslint": "^10.13.0",
     "eslint-scope": "^9.1.2",
     "espree": "^11.2.0",
-    "globals": "^17.12.0",
-    "happy-dom": "^20.14.5"
+    "globals": "^17.13.0",
+    "happy-dom": "^21.0.4"
   }
 }

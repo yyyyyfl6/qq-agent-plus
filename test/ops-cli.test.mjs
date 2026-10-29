@@ -100,3 +100,13 @@ test('install-timers --print：备份单元把路径/服务名/保留份数显�
     assert.deepEqual(unquoted, [], `Environment 值必须加引号：${unquoted.join(' / ')}`);
   }
 });
+
+test('ops scan --strict 指向不存在的目录要退出非 0（CI 把关用；否则扫了空气还判绿）', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const missing = path.join(os.tmpdir(), `qq-ops-missing-${Date.now()}`);
+  const strict = spawnSync(process.execPath, ['src/ops.js', 'scan', missing, '--strict'], { encoding: 'utf8' });
+  assert.notEqual(strict.status, 0, '目录写错时 --strict 必须让 CI 变红');
+  assert.match(String(strict.stdout) + String(strict.stderr), /目录不存在/);
+  const loose = spawnSync(process.execPath, ['src/ops.js', 'scan', missing], { encoding: 'utf8' });
+  assert.equal(loose.status, 0, '不带 --strict 时只报告、不阻断（保持只读体检的用法）');
+});

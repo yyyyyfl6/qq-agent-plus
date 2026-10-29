@@ -11,6 +11,7 @@
 // 只做"探测 + 预览"：绝不自动写入配置。写入由用户确认（控制台按渠道键写进 api.modelPrices）。
 // 所有失败都以 { ok:false, error } 返回，不抛异常。
 import { normalizePriceFeed } from './price-feed.js';
+import { readJsonBounded } from '../core/http-body.js';
 
 const DEFAULT_USD_RATE = 7.2;
 const DEFAULT_TIMEOUT_MS = 10000;
@@ -150,7 +151,8 @@ export async function probeChannelPrices(options = {}) {
       signal: AbortSignal.timeout(timeoutMs)
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return res.json();
+    // 有界读（2MB）：探测目标响应不该无上限（2026-10-09 审查）
+    return readJsonBounded(res, 2 * 1024 * 1024);
   };
 
   let statusPayload = null;

@@ -14,24 +14,32 @@ qq-agent-linux-update.timer
 timer 每小时唤醒一次，应用配置中的 `intervalHours` 决定是否已到达实际检查时间。
 默认每 6 小时检查一次，功能默认关闭。更新器不复用聊天会话，也不调用模型。
 
-## 更新依据：已发布的 Release
+## 更新依据：已发布的 Release 与本地版本
 
 更新提示与部署目标均以 GitHub 上**已发布的 Release** 为准。branch 上新增提交不触发更新，
 以避免部署未经发布的中间状态：
 
 1. 读取仓库最新的 Release，草稿与预发布均不计入。仓库尚无 Release 时不提示、不更新。
-2. 以「当前部署 revision 与 Release tag」的比较结果判断方向：
+2. 以**版本号**判断方向：比较部署目录 `package.json` 的版本与该 Release 的 tag。
 
-   | 比较结果 | 含义 | 行为 |
-   | --- | --- | --- |
-   | `ahead` | Release 领先当前部署 | 提示新版本，部署目标为该 tag 的提交 |
-   | `diverged` | 两侧均有提交 | 按 Release 部署，以发布版本为准 |
-   | `behind` | 当前部署已经包含该 Release | 提示“已是最新”，不回退 |
-   | `identical` | 为同一个提交 | 提示“已是最新” |
+   | 版本关系 | 行为 |
+   | --- | --- |
+   | 本地版本 < Release 版本 | 提示新版本，部署目标为该 tag 的提交 |
+   | 本地版本 = Release 版本 | 提示“已是最新”，不回退 |
+   | 本地版本 > Release 版本 | 提示“已是最新”，不回退 |
 
-3. 比较接口不可用时不提示、不部署，等待下次检查，不推测方向，以避免部署错误版本。
-4. 当前部署 revision 不是 git 提交（如压缩包安装）时无法比较方向：控制台仅作说明、不弹窗，
-   但「立即更新」与自动更新会直接安装最新 Release，安装完成后基线即为 git 提交。
+   版本号按语义化规则比较（`v` 前缀与构建元数据忽略，预发布按 semver 排序）。版本相等
+   也按“已是最新”处理：版本没升、提交却领先 Release 的手工部署不会被回退成 tag。
+3. 版本号解析不了（非标准安装）时才退回 GitHub compare 判定方向；比较接口不可用时不提示、
+   不部署，等待下次检查，不推测方向，以避免部署错误版本。compare 响应包含 diff，跨版本
+   可达 1MB 以上，因此单独放宽到 4MB / 60 秒。
+4. 没有任何部署基线（`deployed-revision` 与状态里的 `currentRevision` 都为空）时保持既有行为：
+   控制台仅作说明、不弹窗，但「立即更新」与自动更新会直接安装最新 Release —— 即使本地版本
+   相同或更高。经 `deploy.sh` 从非 git 源码树安装会写入 `source-<UTC>`，它不是空值：本版按
+   本地版本判定，不受影响。
+5. 仍停在旧版本的实例无法自动跨过较大的版本区间（旧代码受 512KB compare 上限影响）；其中基线为
+   `source-…` 的压缩包安装是另一种失败：旧代码拿非 SHA 基址去调比较接口，得到 `compare-failed`。
+   这两类都需要手工执行一次部署脚本；升到本版后按本地版本判定，`source-…` 不再需要特殊处理。
 
 发布流程：推送 `v*` tag 触发 `.github/workflows/release.yml`，该工作流先执行与 CI 相同的检查，
 再创建**草稿** Release。确认无误并发布后，控制台的“发现新版本”弹窗与自动更新才会识别该版本。
@@ -52,7 +60,12 @@ timer 每小时唤醒一次，应用配置中的 `intervalHours` 决定是否已
     "connectivityTimeoutSeconds": 20,
     "fetchTimeoutSeconds": 300,
     "forceHttp11": true,
-    "disableOnFailure": true
+    "disableOnFailure": true,
+    "snowluma": {
+      "enabled": false,
+      "image": "",
+      "followBaseline": true
+    }
   }
 }
 ```
@@ -66,6 +79,10 @@ timer 每小时唤醒一次，应用配置中的 `intervalHours` 决定是否已
 - `disableOnFailure=true` 保持既有行为：更新失败后暂停后续自动更新；关闭时失败仅记录并告警，后续周期继续尝试。
 - 管理员 QQ 必须位于私聊白名单；单独的“测试 GitHub 连通性”不要求配置管理员。
 - 控制台“控制 -> 更新部署”可保存网络策略、测试连通性、立即手动更新、暂停或恢复自动更新。
+- `snowluma.enabled`：协议端（SnowLuma）自身的自动更新开关（默认关，每 6 小时比一次基线）。
+- `snowluma.followBaseline`（**默认开**）：**协议端随本体版本对齐** —— 部署新版本后、主服务
+  以新代码启动时，若新版带的协议端基线比当前镜像高就自动升级一次；基线没变（发版没动协议端）
+  时不会有任何动作。设了 `snowluma.image`（自定义镜像）的机器永不被自动动到（锁版本优先）。
 
 ## 更新流程
 
@@ -75,13 +92,29 @@ timer 每小时唤醒一次，应用配置中的 `intervalHours` 决定是否已
 4. 浅拉取该 Release 的 tag（`refs/tags/<tag>:refs/tags/<tag>`），解析出它指向的提交；
    与 `data/deployed-revision` 相同则记录“已是最新”并结束。`git fetch` 同样按配置重试。
 5. 将目标提交检出到 `data/update-work/` 的临时目录。
-6. 在独立临时数据目录中执行 `npm ci`、全部 `node:test` 单元测试及关键语法检查，不读取或修改生产数据。
+6. 在独立临时数据目录中执行 `npm ci --omit=dev`（与更新器实际部署的依赖面一致：eslint 等
+   devDeps 不装，测试需要 devDeps 的用例按约定自带缺件跳过），然后按 CI 同一套**门禁全清单**
+   校验候选代码：全部
+   `node:test` 单元测试、`test/local/run.mjs` 与四个回归 harness（提示词 / 渲染 / 滚动 / 用量
+   端到端）、关键语法检查，最后 `node src/ops.js scan --strict`；不读取或修改生产数据。
    `npm ci` 使用 `--prefer-offline` 优先复用 npm cache，并把同一组重试参数传给 npm 的 fetch 层。
+   有失败项时，错误信息直接列出**失败的用例名与断言原因**（`failureDetail()`），不再截取输出结尾。
+   CI 与发布闸门另有一步「按 unit 的加固环境复跑」（`NoNewPrivileges` + `umask 0077` +
+   `DOCKER_HOST` 指向不可访问的假套接字 + `npm prune --omit=dev` 的无 devDeps 依赖面），
+   把"只在门禁环境里才失败"的用例挡在发布之前 —— 2026-10-10 的两次「升级装不上」（sudo 回退
+   用例读真实 /proc、巡检用例读真实 docker 套接字）都属于这一类。
 7. 调用目标提交中的 `deploy.sh`。部署脚本创建代码快照、保留数据和凭据、重装依赖、
    校验 systemd 单元、启动服务并检查 `/healthz`。
 8. 成功后记录目标提交（`currentRevision`）与 Release tag（`targetVersion`）；失败时由 `deploy.sh` 恢复旧代码和服务。
 
 `deploy.sh` 会同时安装和校验更新 service/timer，并在部署失败时恢复旧单元及原启用状态。
+
+**协议端随版本对齐（2026-10-09）**：协议端基线（`SNOWLUMA_BASELINE_IMAGE`）是代码常量，只随
+本体的新版本到达机器 —— 所以"部署新版本后主服务带新代码重启"是看到新基线的唯一时刻。届时
+控制台会做一次对齐（仍走"改 .env → pull → up → 等就绪 → 失败自动回滚"这套，数据卷不动）；
+基线没变（发版没动协议端）或用户设了自定义镜像（`snowluma.image`）时不会有任何动作，也可以
+用 `snowluma.followBaseline=false` 显式关掉。该动作同样要求服务进程能直连 docker.sock
+（见 [LINUX.md](LINUX.md) 的「控制台里更新协议端报 docker 权限不足」）。
 
 ## 两条下载通道：git 与 API + 源码包
 
@@ -151,7 +184,7 @@ timer 每小时唤醒一次，应用配置中的 `intervalHours` 决定是否已
 
 两种都不会因告警失败再次触发部署，也不会递归创建异常。
 
-“没有新 Release”“当前部署已包含最新 Release”“比较接口不可用”均不计为失败：不发送告警、
+“没有新 Release”“本地版本不低于最新 Release”“无法判定方向”均不计为失败：不发送告警、
 不触发 `disableOnFailure`，仅在状态文件与控制页“更新部署”面板中说明原因。
 
 ## 状态与运维
@@ -164,9 +197,10 @@ data/auto-update-request.json  # 一次性请求（manual / scheduled / probe）
 data/deployed-revision         # 当前部署的 git 提交，deploy.sh 写入
 ```
 
-`updateNotice` 中 `reason` 的取值：`no-release`（尚无 Release）、`ahead-of-release`（当前部署已包含最新 Release）、
-`unknown-deployed`（部署基线不是 git 提交）、`compare-failed`（无法比较方向）、`unreachable`（无法连接 GitHub）、
-`unconfigured`（未配置仓库）。仅当 `available=true` 时弹窗，`version` 为待部署的 Release tag。
+`updateNotice` 中 `reason` 的取值：`no-release`（尚无 Release）、`ahead-of-release`（本地版本不低于最新 Release）、
+`unknown-deployed`（没有 `deployed-revision` 基线）、`compare-failed`（版本号无法解析且比较失败）、
+`unreachable`（无法连接 GitHub）、`unconfigured`（未配置仓库）。仅当 `available=true` 时弹窗，
+`version` 为待部署的 Release tag。
 
 判定使用的 GitHub API 默认为 `api.github.com`；仅测试桩或自建镜像需要设置 `QQ_AGENT_GITHUB_API` 覆盖该地址。
 

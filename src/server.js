@@ -7,10 +7,15 @@ import { installExperimentalMultimodalContextPilot } from './pilots/experimental
 import { DATA_DIR } from './core/config.js';
 import { assertSqliteAvailable } from './core/sqlite.js';
 import { createLogger } from './core/logger.js';
+import { createDailyRetentionScheduler } from './core/ledger-retention.js';
+import { isContainerRuntime } from './core/runtime.js';
 
 const log = createLogger('server');
 
 let app = null;
+// 台账保留期清理的每日调度（见 core/ledger-retention.js）。
+// 三个台账的保留期 DELETE 原来只在各自构造函数里跑一次 —— 常驻不重启等于不执行。
+let retentionScheduler = null;
 process.on('unhandledRejection', (error) => {
   app?.captureIncident(error, {
     source: 'process',
@@ -41,6 +46,9 @@ process.on('uncaughtException', (error) => {
  * 只告警不拦截：让人按快照决定，而不是让服务起不来。恢复步骤见 docs/LINUX.md。
  */
 function reportInterruptedDeploy() {
+  // 容器里没有 deploy.sh，旧卷残留的 .deploy-in-progress 只会制造一条无法自愈的误报：
+  // 巡检已经把这项标成"容器模式不适用"，启动日志与异常面板要同一口径。
+  if (isContainerRuntime()) return;
   // 这段挂在 app.start() 的 then 后面，抛错会落进下游的 catch 直接 process.exit(1) ——
   // 一句告警不该有能力把服务带崩，所以整体兜住。
   try {
@@ -90,7 +98,18 @@ installExperimentalMultimodalContextPilot();
 
 app = createApp();
 installManualFriendReviewRoute(app);
-app.start().then(reportInterruptedDeploy).catch((error) => {
+app.start().then(() => {
+  reportInterruptedDeploy();
+  // 启动成功后再挂每日台账清理：1 小时 tick + 内存里的今日闸门（构造期已清过一轮，
+  // 当天不重复）；跨重启由构造函数那一次兜底，所以闸门不需要落盘。
+  // 放这里而不是各自模块里：进程生命周期只有 server.js 知道，
+  // stop() 也能就近在下面的 shutdown() 里收干净。
+  retentionScheduler = createDailyRetentionScheduler({
+    targets: app.retentionPruneTargets(),
+    log
+  });
+  retentionScheduler.start();
+}).catch((error) => {
   log.error('[启动失败]', error);
   process.exit(1);
 });
@@ -99,6 +118,7 @@ let stopping = false;
 async function shutdown() {
   if (stopping) return;
   stopping = true;
+  retentionScheduler?.stop();
   const deadline = setTimeout(() => process.exit(1), 25000);
   deadline.unref();
   try { await app.stop(); process.exit(0); }

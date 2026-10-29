@@ -26,7 +26,16 @@ function readJson(file, fallback = null) {
     if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
     const value = JSON.parse(text);
     return value && typeof value === 'object' ? value : fallback;
-  } catch { return fallback; }
+  } catch (error) {
+    // 文件在但读不了（坏 JSON 等）：静默返回 fallback 的话，随后同路径的写入会把它直接
+    // 覆盖掉，用户再也查不出人物印象为什么没了。留档成 .broken-<时间戳>（与 reminders /
+    // group-game 同口径；2026-10-12 审查）。ENOENT（首次运行没有文件）是正常的。
+    if (error?.code !== 'ENOENT') {
+      console.error(`[memory-global] 读取 ${file} 失败，本次跳过，原文件已备份为 .broken-<时间戳>：`, error?.message ?? error);
+      try { fs.renameSync(file, `${file}.broken-${Date.now()}`); } catch { /* 备份失败就留在原处，至少不覆盖 */ }
+    }
+    return fallback;
+  }
 }
 function writeJson(file, value) {
   // 人物印象是隐私正文：目录 0700 / 文件 0600（与 consolidation-backup、identity 库同一口径）。
@@ -51,8 +60,27 @@ function sourceKeys(value, fallback = '') {
   add(fallback);
   return out;
 }
+function emptyRelationship() {
+  return { interactions: 0, warmth: 0, lastInteractionAt: 0 };
+}
+function normalizeRelationship(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return emptyRelationship();
+  return {
+    interactions: Math.max(0, Number(raw.interactions) || 0),
+    warmth: Math.min(100, Math.max(-100, Number(raw.warmth) || 0)),
+    lastInteractionAt: Math.max(0, Number(raw.lastInteractionAt) || 0)
+  };
+}
+/** 关系只按"实际互动次数"分档，避免用温度数值制造看不懂的差异。 */
+export function relationshipLabel(interactions) {
+  const n = Math.max(0, Number(interactions) || 0);
+  if (n >= 50) return '很熟';
+  if (n >= 20) return '熟';
+  if (n >= 5) return '有点熟';
+  return '刚认识';
+}
 function emptyMember(userId = '', name = '') {
-  return { version: 2, userId: String(userId || ''), name: String(name || ''), impressions: [], sourceChatKeys: [], updatedAt: 0, lastConsolidatedAt: 0 };
+  return { version: 2, userId: String(userId || ''), name: String(name || ''), impressions: [], sourceChatKeys: [], updatedAt: 0, lastConsolidatedAt: 0, relationship: emptyRelationship() };
 }
 // origin：这条印象是怎么来的 —— 'model'（机器人自己 memory_append 记的）、
 // 'consolidated'（记忆整理/提炼改写的）、'manual'（控制台手动编辑的）；
@@ -91,6 +119,7 @@ function normalizeMember(raw = {}, userId = '', name = '', fallbackChatKey = '')
   member.updatedAt = Number(raw.updatedAt) || 0;
   member.lastConsolidatedAt = Number(raw.lastConsolidatedAt) || 0;
   member.sourceChatKeys = sourceKeys(raw.sourceChatKeys, fallbackChatKey);
+  member.relationship = normalizeRelationship(raw.relationship);
   for (const item of Array.isArray(raw.impressions) ? raw.impressions : []) {
     const entry = normalizeEntry(item, fallbackChatKey);
     if (entry) mergeEntry(member, entry);
@@ -104,6 +133,14 @@ function mergeMember(target, incoming) {
   if (incoming.name && (!target.name || incoming.updatedAt >= target.updatedAt)) target.name = incoming.name;
   for (const entry of incoming.impressions) mergeEntry(target, entry);
   target.sourceChatKeys = sourceKeys([...target.sourceChatKeys, ...incoming.sourceChatKeys]);
+  const a = normalizeRelationship(target.relationship);
+  const b = normalizeRelationship(incoming.relationship);
+  const newer = b.lastInteractionAt >= a.lastInteractionAt ? b : a;
+  target.relationship = {
+    interactions: Math.max(a.interactions, b.interactions),
+    warmth: newer.warmth,
+    lastInteractionAt: Math.max(a.lastInteractionAt, b.lastInteractionAt)
+  };
   target.updatedAt = Math.max(target.updatedAt || 0, incoming.updatedAt || 0);
   target.lastConsolidatedAt = Math.max(target.lastConsolidatedAt || 0, incoming.lastConsolidatedAt || 0);
 }
@@ -115,6 +152,38 @@ function archive(src, rel, memoryDir = MEMORY_DIR) {
     if (fs.existsSync(dst)) fs.rmSync(dst, { force: true });
     fs.renameSync(src, dst);
   } catch (error) { console.warn('[memory] 归档旧人物记忆失败:', error?.message ?? error); }
+}
+
+const DEFAULT_MAX_IMPRESSIONS = 50;
+const DEFAULT_RETENTION_DAYS = 0;
+
+export function memoryLimits() {
+  const cfg = getConfig().memory || {};
+  const max = Math.max(5, Math.min(200, Math.round(Number(cfg.maxImpressionsPerPerson) || DEFAULT_MAX_IMPRESSIONS)));
+  const days = Math.max(0, Math.min(3650, Math.round(Number(cfg.impressionRetentionDays ?? DEFAULT_RETENTION_DAYS) || 0)));
+  return { max, days };
+}
+
+function trimMember(member, now = Date.now(), limits = memoryLimits()) {
+  const before = member.impressions?.length || 0;
+  const retentionMs = limits.days > 0 ? limits.days * 86400000 : 0;
+  const keep = (member.impressions || []).filter((entry) => {
+    if (normalizeOrigin(entry.origin) === 'manual') return true;
+    const observed = Number(entry.lastObservedAt) || Number(entry.createdAt) || 0;
+    return !(retentionMs > 0 && observed > 0 && now - observed > retentionMs);
+  });
+  if (keep.length > limits.max) {
+    const manual = keep.filter((entry) => normalizeOrigin(entry.origin) === 'manual');
+    const auto = keep
+      .filter((entry) => normalizeOrigin(entry.origin) !== 'manual')
+      .sort((a, b) => (Number(b.lastObservedAt || b.createdAt) || 0) - (Number(a.lastObservedAt || a.createdAt) || 0));
+    member.impressions = [...manual, ...auto.slice(0, Math.max(0, limits.max - manual.length))]
+      .sort((a, b) => (Number(a.createdAt) || 0) - (Number(b.createdAt) || 0));
+  } else {
+    member.impressions = keep;
+  }
+  if (member.impressions.length !== before) member.updatedAt = now;
+  return member.impressions.length !== before;
 }
 
 export class GlobalPersonMemoryStore {
@@ -203,6 +272,22 @@ export class GlobalPersonMemoryStore {
     this.people = map;
     return map;
   }
+  /** 清理过期/超量的自动印象；manual 永远保留。返回实际删除条数。 */
+  pruneExpired({ now = Date.now() } = {}) {
+    const map = this.#ensure();
+    const limits = memoryLimits();
+    let removed = 0;
+    let touched = 0;
+    for (const member of map.values()) {
+      const before = member.impressions?.length || 0;
+      if (!trimMember(member, now, limits)) continue;
+      removed += Math.max(0, before - member.impressions.length);
+      touched += 1;
+      this.#persist(member);
+    }
+    return { removed, touched, limits };
+  }
+
   listSourceChats() {
     const out = new Set();
     for (const member of this.#ensure().values()) for (const key of member.sourceChatKeys) out.add(key);
@@ -215,9 +300,51 @@ export class GlobalPersonMemoryStore {
       .map((m) => structuredClone(m))
       .sort((a, b) => b.updatedAt - a.updatedAt);
   }
+
+  stats() {
+    const limits = memoryLimits();
+    let entries = 0;
+    let manual = 0;
+    let oldest = 0;
+    let newest = 0;
+    let bytes = 0;
+    let people = 0;
+    for (const member of this.#ensure().values()) {
+      if (!member.impressions?.length) continue;
+      people += 1;
+      bytes += Buffer.byteLength(JSON.stringify(member));
+      for (const entry of member.impressions) {
+        entries += 1;
+        if (normalizeOrigin(entry.origin) === 'manual') manual += 1;
+        const at = Number(entry.createdAt) || 0;
+        if (at > 0 && (!oldest || at < oldest)) oldest = at;
+        if (at > newest) newest = at;
+      }
+    }
+    return { people, entries, manual, oldestAt: oldest, newestAt: newest, bytes, limits };
+  }
   get(userId) {
     const uid = String(userId || '').trim();
     return structuredClone(this.#ensure().get(uid) || emptyMember(uid));
+  }
+  /**
+   * 记一次互动（只更新已经有印象的人，不为陌生人建档案）。
+   * 关系温度只影响提示词里的一行标签，不参与检索/排序。
+   */
+  noteInteraction(userId, { at = Date.now(), delta = 0.5 } = {}) {
+    const uid = String(userId || '').trim();
+    if (!uid) return null;
+    const map = this.#ensure();
+    const member = map.get(uid);
+    if (!member || !member.impressions?.length) return null;
+    const rel = normalizeRelationship(member.relationship);
+    rel.interactions += 1;
+    rel.lastInteractionAt = Math.max(rel.lastInteractionAt, Number(at) || Date.now());
+    rel.warmth = Math.min(100, Math.max(-100, rel.warmth + (Number(delta) || 0)));
+    member.relationship = rel;
+    member.updatedAt = Date.now();
+    this.#persist(member);
+    return structuredClone(rel);
   }
   append(chatKey, userId, name, content, createdAt = Date.now(), origin = 'model', lastObservedAt = 0) {
     const map = this.#ensure();
@@ -236,6 +363,7 @@ export class GlobalPersonMemoryStore {
     member.name = String(name || member.name || member.userId || '');
     member.sourceChatKeys = sourceKeys([...member.sourceChatKeys, chatKey]);
     member.updatedAt = now;
+    trimMember(member, now);
     this.#persist(member); map.set(memberKey(member.userId, member.name), member);
     return structuredClone(entry);
   }
@@ -266,7 +394,7 @@ export class GlobalPersonMemoryStore {
     const finalName = clean(name, 60) || old.name || uid;
     const now = Date.now();
     const incoming = (Array.isArray(contents) ? contents : [contents])
-      .map((x) => clean(x)).filter(Boolean).slice(0, 20);
+      .map((x) => clean(x)).filter(Boolean).slice(0, memoryLimits().max);
     const hadSource = old.sourceChatKeys.includes(String(chatKey || '').trim());
     let member;
     if (old.impressions.length && !hadSource) {
@@ -296,6 +424,8 @@ export class GlobalPersonMemoryStore {
       member = {
         version: 2, userId: uid, name: finalName, sourceChatKeys: sources,
         updatedAt: now, lastConsolidatedAt: old.lastConsolidatedAt || 0,
+        // 关系是独立于"印象正文"的计数：整理只改写印象，不该把聊过多少次清零。
+        relationship: normalizeRelationship(old.relationship),
         impressions: incoming.map((content) => {
           const prev = previous.get(String(content));
           const createdAt = Number(prev?.createdAt) || now;
@@ -339,6 +469,7 @@ export class GlobalPersonMemoryStore {
       try { fs.rmSync(globalMemberFile(candidate.userId, candidate.name, this.memoryDir), { force: true }); } catch { /* 有意忽略：删残留文件失败仅造成文件残留，数据已先留快照可回滚 */ }
       map.delete(key);
     }
+    trimMember(member, now);
     this.#persist(member); map.set(uid, member);
     return structuredClone(member);
   }
@@ -376,7 +507,16 @@ export class GlobalPersonMemoryStore {
         member.impressions = member.impressions.filter((x) =>
           x.content !== content || (scope && !sourceKeys(x.sourceChatKeys).includes(scope)));
         removed ||= member.impressions.length !== n;
+      } else if (scope) {
+        // 按 userId/target 删但带了会话范围：只摘这个会话来源的条目，别把私聊/别的群一起清空
+        const n = member.impressions.length;
+        member.impressions = member.impressions.filter((x) =>
+          !sourceKeys(x.sourceChatKeys).includes(scope));
+        removed ||= member.impressions.length !== n;
       } else { member.impressions = []; removed = true; }
+      // 摘掉印象后要重算成员级来源：否则这个人还会声称"来自 A 群"，而他在 A 群已经没有印象了
+      //（members(chatKey) / consolidationState 会把他算进 A 群；2026-10-13 全项目审查 P3）。
+      member.sourceChatKeys = sourceKeys(member.impressions.flatMap((x) => x.sourceChatKeys || []));
       // 只要真删掉了东西就留快照，不限于"整条被删空"：这个人还有别的来源时，
       // 被摘掉的那几条同样再也回不来 —— 而控制台文案承诺的是"服务端会留可回滚快照"。
       // before 是动手前的克隆；它本来就是空列表时，备份函数自己会返回 null 不落盘。

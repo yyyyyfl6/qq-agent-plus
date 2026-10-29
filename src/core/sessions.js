@@ -11,6 +11,13 @@ import { todayKey } from './util.js';
 
 const SESSIONS_DIR = path.join(DATA_DIR, 'sessions');
 
+// 运行中会话的落盘间隔：小于 2 秒等于没节流，大于 60 秒崩溃丢的进度太多。
+function clampPersistMs(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 10000;
+  return Math.min(60000, Math.max(2000, Math.round(n)));
+}
+
 export function newSessionId() {
   return `${Date.now().toString(36)}-${crypto.randomBytes(4).toString('hex')}`;
 }
@@ -42,14 +49,20 @@ export class SessionRegistry {
    * @param {number} keepFiles 保留最近多少个会话记录文件；**0 = 不限制**。
    *   注意：不能用 `x || 300` 兜底 —— 0 是 falsy 会被误当成"未设置"变回 300，
    *   用户想"取消上限"就永远改不掉。也不能 Math.max(20,…) 强制下限。
+   * @param {{persistIntervalMs?: number}} [options] 运行中会话的落盘间隔（默认 10 秒）
    */
-  constructor(keepFiles = 0) {
+  constructor(keepFiles = 0, { persistIntervalMs = 10000 } = {}) {
     this.keepFiles = Math.max(0, Number.isFinite(Number(keepFiles)) ? Math.round(Number(keepFiles)) : 0);
+    this.persistIntervalMs = clampPersistMs(persistIntervalMs);
     this.index = [];   // [{ id, chatKey, startedAt, endedAt, status, outcome, usage, trigger, model, promptChars }]
     this.current = new Map(); // id -> session object（运行中的在内存里）
     fs.mkdirSync(SESSIONS_DIR, { recursive: true, mode: 0o700 });
     this.#loadIndex();
+    this.pruneSessions();   // 与运行台账同款：构造时清一次（常驻期间每日调度再跑）
   }
+
+  /** 控制台保存后即时生效，不必重启。 */
+  setPersistIntervalMs(ms) { this.persistIntervalMs = clampPersistMs(ms); }
 
   #loadIndex() {
     try {
@@ -233,18 +246,76 @@ export class SessionRegistry {
     this.#persist(s);
     const idx = this.index.findIndex((e) => e.id === id);
     if (idx >= 0) this.index[idx] = this.#summary(s);
-    // 清理超出保留数的旧文件
+    // 清理超出保留数的旧文件：与 pruneSessions 同一保护口径 —— 正在跑/等待中的会话不删
+    //（长线程会话可能是最"旧"的文件，运行到一半被删会让本轮记录与用量消失），
+    // 删掉的同步从内存索引收缩，避免"列表里点开却是空文件"（2026-10-12 审查）。
     try {
       if (this.keepFiles > 0) {
         const files = fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith('.json')).sort();
         if (files.length > this.keepFiles) {
+          const dropped = new Set();
           for (const f of files.slice(0, files.length - this.keepFiles)) {
-            try { fs.unlinkSync(path.join(SESSIONS_DIR, f)); } catch { /* ignore */ }
+            const file = path.join(SESSIONS_DIR, f);
+            try {
+              const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+              if (data?.status === 'running' || data?.status === 'waiting') continue;
+              fs.unlinkSync(file);
+              dropped.add(String(data?.id ?? f.replace(/\.json$/, '')));
+            } catch { /* 坏文件不动（与 pruneSessions 同） */ }
           }
+          if (dropped.size) this.index = this.index.filter((e) => !dropped.has(String(e.id)));
         }
       }
     } catch { /* ignore */ }
     return s;
+  }
+
+  /**
+   * 会话留档保留期（2026-10-10 审查）：默认 90 天（与运行台账 pruneRuns 同口径）。
+   * 之前只有 keepFiles>0 才会清、默认 0 = 永不清理 —— 连跑数月就是无界增长（磁盘 +
+   * 启动时全量读进内存的 index）。构造时清一次，常驻期间由每日保留期调度
+   * （retentionPruneTargets）复用同一方法。正在跑/等待中的会话不删。
+   * @returns {{ removed: number, kept: number }}
+   */
+  pruneSessions(retentionDays = 90) {
+    const days = Math.max(1, Number(retentionDays) || 90);
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    let removed = 0;
+    let files = [];
+    try {
+      files = fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith('.json'));
+    } catch {
+      return { removed, kept: 0 };
+    }
+    const keptIds = new Set();
+    for (const f of files) {
+      const file = path.join(SESSIONS_DIR, f);
+      // 文件名就是会话 id（sessionFile 的口径）；先按 mtime 预筛：最近写过的文件不可能
+      // "结束于保留期之前"，不必解析 —— 把每日调度的同步读取量压到只剩旧文件（P3-1）。
+      // （启动回收重写过的新 mtime 文件，会在 mtime 老化后的下一轮被清。）
+      const id = f.replace(/\.json$/, '');
+      try {
+        if (fs.statSync(file).mtimeMs >= cutoff) {
+          keptIds.add(id);
+          continue;
+        }
+        const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+        if (!data?.id) continue;
+        keptIds.add(String(data.id));
+        // 正在跑/等待中的不能删（硬崩溃残留会由启动回收改成 aborted，下次就按时间判了）；
+        // 其余按"结束时间（缺了用开始时间）"判旧。
+        const active = data.status === 'running' || data.status === 'waiting';
+        const ended = Number(data.endedAt) || Number(data.startedAt) || 0;
+        if (!active && ended && ended < cutoff) {
+          fs.rmSync(file, { force: true });
+          removed += 1;
+          keptIds.delete(String(data.id));
+        }
+      } catch { /* 坏文件不动（loadIndex 本来也跳过它） */ }
+    }
+    // 内存索引同步收缩（index 只在启动全量读入，不跟着删一样无界）
+    if (removed > 0) this.index = this.index.filter((e) => keptIds.has(String(e.id)));
+    return { removed, kept: keptIds.size };
   }
 
   /**
@@ -264,6 +335,11 @@ export class SessionRegistry {
     // 已运行过的不允许丢弃（会抹掉用量/成本记录，导致对不上账）
     if (s && s.status !== 'waiting') return false;
     this.current.delete(id);
+    // 与 finish() 同款：节流时间戳要随会话一起清（2026-10-04 全面复审 P3）。
+    // 丢弃不写文件、也不进 index，_lastPersistAt 就成了唯一没人回收的按会话键 ——
+    // 反复丢弃 waiting 会话（预算降级、时间窗、block 都会走这条路）就只涨不消
+    //（实测 50 次丢弃后 Map size = 50，无界）。
+    this._lastPersistAt?.delete(id);
     const before = this.index.length;
     this.index = this.index.filter((e) => e.id !== id);
     try {
@@ -304,48 +380,105 @@ export class SessionRegistry {
         unpricedRuns = Number(data.unpricedRuns) || 0;
       }
     } catch { /* 无记录 */ }
-    // 加上运行中的
+    // 加上运行中的。token 与**估算金额**都要加：只加 token 时，并发运行的会话在结束落盘前
+    // 不计入当日花费，日预算会被"在途数 × 单次预算"地超出（2026-10-19 全项目审查 P2）。
+    // 与 #mergeTodayUsage 同一套估价口径：会话结束时会再按同一份 usage 合并一次，
+    // 但那时它已从 this.current 移除，不会重复计。
     for (const s of this.current.values()) {
-      promptTokens += s.usage.promptTokens;
-      completionTokens += s.usage.completionTokens;
-      totalTokens += s.usage.totalTokens;
-      cachedTokens += Number(s.usage.cachedTokens) || 0;
+      const usage = s.usage || {};
+      const total = Number(usage.totalTokens) || 0;
+      promptTokens += Number(usage.promptTokens) || 0;
+      completionTokens += Number(usage.completionTokens) || 0;
+      totalTokens += total;
+      cachedTokens += Number(usage.cachedTokens) || 0;
       webSearchCount += Number(s.webSearchCount) || 0;
+      try {
+        const cfgNow = getConfig();
+        const est = estimateCost({
+          promptTokens: Number(usage.promptTokens) || 0,
+          completionTokens: Number(usage.completionTokens) || 0,
+          totalTokens: total,
+          cachedTokens: Number(usage.cachedTokens) || 0
+        }, {
+          model: s.model || cfgNow.api?.model,
+          at: Date.now(),
+          vendor: s.vendor || vendorOfConfig(cfgNow)
+        });
+        const cost = Number(est?.cost) || 0;
+        estimatedYuan += cost;
+        if (total > 0 && !(cost > 0)) unpricedRuns += 1;
+      } catch { /* 估价失败不影响 token 统计（最坏情况＝这项当天少算） */ }
     }
     return { dayKey, promptTokens, completionTokens, totalTokens, cachedTokens, runs, webSearchCount, estimatedYuan, unpricedRuns };
   }
 
   /** 在会话结束时累加今日用量。 */
   #bumpTodayUsage(s) {
+    // 2026-10-06 复审 P3：waiting 会话被 finish 成 aborted（预算 block、并发满、无未读等
+    // 早退路径）时 0 token、0 发送 —— 与启动回收"不是一次真实运行就不计"的口径对齐
+    //（启动回收为此专门写了不 bump 的 #rewriteSessionFile），这类会话不计 runs，
+    // 否则预算 block 期间每条进群消息都虚增一次"运行次数"。
+    if (!(Number(s.usage?.totalTokens) > 0) && !(s.sent?.length > 0)) return;
     // 按"结束时刻"归属。用 startedAt 的话，跨零点的会话会把它的数字按开始那天算，发现文件
     // 是另一天就把新一天已累计的量重置成 0；之后当天的会话又因 dayKey 不匹配一直少算。
+    this.#mergeTodayUsage({
+      promptTokens: Number(s.usage?.promptTokens) || 0,
+      completionTokens: Number(s.usage?.completionTokens) || 0,
+      totalTokens: Number(s.usage?.totalTokens) || 0,
+      cachedTokens: Number(s.usage?.cachedTokens) || 0,
+      runs: 1,
+      webSearchCount: Number(s.webSearchCount) || 0
+    }, { model: s.model, vendor: s.vendor });
+  }
+
+  /**
+   * 非会话类模型调用（记忆整理、群日报等）计入今日台账：这些调用照样花钱，此前完全没有账
+   * —— 控制台"今日花费"与预算判定都偏乐观（2026-10-07 复审 P3）。
+   * 与 #bumpTodayUsage 共用同一份文件与估价口径，但不计 runs（不是一次会话运行）。
+   */
+  recordExternalUsage(usage, { model = '', vendor = '' } = {}) {
+    const totalTokens = Number(usage?.totalTokens) || 0;
+    if (!(totalTokens > 0)) return;
+    this.#mergeTodayUsage({
+      promptTokens: Number(usage.promptTokens) || 0,
+      completionTokens: Number(usage.completionTokens) || 0,
+      totalTokens,
+      cachedTokens: Number(usage.cachedTokens) || 0,
+      runs: 0,
+      webSearchCount: 0
+    }, { model, vendor });
+  }
+
+  /** 把一份用量增量并进 usage-today.json（读盘合并 → 估算金额 → 原子落盘）。 */
+  #mergeTodayUsage(delta, { model = '', vendor = '' } = {}) {
     const dayKey = todayKey(Date.now());
     let data = { dayKey, promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedTokens: 0, runs: 0, webSearchCount: 0 };
     try {
       const parsed = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'usage-today.json'), 'utf8'));
       if (parsed?.dayKey === dayKey) data = parsed;
     } catch { /* 新的一天 */ }
-    data.promptTokens += s.usage.promptTokens;
-    data.completionTokens += s.usage.completionTokens;
-    data.totalTokens += s.usage.totalTokens;
-    data.cachedTokens = (data.cachedTokens || 0) + (Number(s.usage.cachedTokens) || 0);
-    data.runs += 1;
-    data.webSearchCount = (data.webSearchCount || 0) + (Number(s.webSearchCount) || 0);
-    // 估算金额（改进方案 #8/J.3）：按会话实际模型估价；价格缺失记 0 并计 unpricedRuns
+    data.promptTokens += delta.promptTokens;
+    data.completionTokens += delta.completionTokens;
+    data.totalTokens += delta.totalTokens;
+    data.cachedTokens = (data.cachedTokens || 0) + delta.cachedTokens;
+    data.runs += delta.runs;
+    data.webSearchCount = (data.webSearchCount || 0) + delta.webSearchCount;
+    // 估算金额（改进方案 #8/J.3）：按实际模型估价；价格缺失记 0 并计 unpricedRuns
     // —— budgetStatus 会把它暴露给控制台，防"没价＝永远不超限"的静默失效。
     try {
       const cfgNow = getConfig();
-      const est = estimateCost({ ...s.usage }, {
-        model: s.model || cfgNow.api?.model,
+      const est = estimateCost({ ...delta }, {
+        model: model || cfgNow.api?.model,
         at: Date.now(),
-        vendor: vendorOfConfig(cfgNow)
+        // 调用方记录过 vendor（兜底模型接管后记实际渠道）就优先用它；
+        // 拿当前配置倒推历史是错的（vendorOfConfig 注释同款约定）。
+        vendor: vendor || vendorOfConfig(cfgNow)
       });
       const cost = Number(est?.cost) || 0;
       data.estimatedYuan = (Number(data.estimatedYuan) || 0) + cost;
-      const hadUsage = (Number(s.usage.totalTokens) || 0) > 0;
-      if (hadUsage && !(cost > 0)) data.unpricedRuns = (Number(data.unpricedRuns) || 0) + 1;
+      if (delta.totalTokens > 0 && !(cost > 0)) data.unpricedRuns = (Number(data.unpricedRuns) || 0) + 1;
     } catch { /* 估价失败不影响用量累加（最坏情况＝这项当天少算） */ }
-    const tmp = path.join(DATA_DIR, 'usage-today.json.tmp');
+    const tmp = path.join(DATA_DIR, `usage-today.json.${process.pid}.tmp`);
     try { fs.rmSync(tmp, { force: true }); } catch { /* 不存在就算了 */ }
     fs.writeFileSync(tmp, JSON.stringify(data), { encoding: 'utf8', mode: 0o600 });
     fs.renameSync(tmp, path.join(DATA_DIR, 'usage-today.json'));
@@ -366,7 +499,7 @@ export class SessionRegistry {
     const now = Date.now();
     this._lastPersistAt ||= new Map();
     const last = this._lastPersistAt.get(s.id) || 0;
-    if (now - last < 2000) return;
+    if (now - last < this.persistIntervalMs) return;
     this._lastPersistAt.set(s.id, now);
     this.#persist(s);
   }
@@ -379,7 +512,9 @@ export class SessionRegistry {
       fs.mkdirSync(SESSIONS_DIR, { recursive: true, mode: 0o700 });
       const tmp = `${sessionFile(s.id)}.${process.pid}.tmp`;
       try { fs.rmSync(tmp, { force: true }); } catch { /* 不存在就算了 */ }
-      fs.writeFileSync(tmp, JSON.stringify(s, null, 1), { encoding: 'utf8', mode: 0o600 });
+      // 紧凑 JSON：运行中每 10 秒整份重写，缩进会白白多写三成字节（Issue #45）。
+      // 文件仍可被 JSON.parse / 人眼查看，只是不再逐行缩进。
+      fs.writeFileSync(tmp, JSON.stringify(s), { encoding: 'utf8', mode: 0o600 });
       fs.renameSync(tmp, sessionFile(s.id));
       fs.chmodSync(sessionFile(s.id), 0o600);
       if (s.status !== 'running' && s.status !== 'waiting') this.#bumpTodayUsage(s);

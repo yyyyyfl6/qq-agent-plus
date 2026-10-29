@@ -275,3 +275,69 @@ test('owner command replay is consumed once and acknowledgement uses configurati
   assert.deepEqual(acks, ['已切换到 猫\n原人格没有可总结的消息，未生成交接摘要']);
   assert.deepEqual(store.recent('group:1'), []);
 });
+
+test('upstream shared context and pagination never cross persona partitions', async (t) => {
+  const { store } = fixture(t);
+  setRuntimeConfig(cfg());
+  const skins = new SkinManager({ store, getConfig });
+  skins.scope('private:1', () => {
+    for (let i = 1; i <= 4; i++) store.appendIncoming('private:1', { mid: `fish-${i}`, text: `fish ${i}` });
+  }, 'fish');
+  skins.scope('private:2', () => store.appendIncoming('private:2', { mid: 'cat-1', text: 'cat only' }), 'cat');
+  skins.scope('private:1', () => {
+    assert.deepEqual(store.recent('private:1', { afterId: 1, limit: 2 }).map(m => m.text), ['fish 2', 'fish 3']);
+    assert.deepEqual(store.recent('private:1', { beforeId: 3, limit: 2 }).map(m => m.text), ['fish 1', 'fish 2']);
+    for (const scope of ['all', 'private']) {
+      const rows = store.recent('private:1', { scope });
+      assert.equal(rows.length, 4);
+      assert.ok(rows.every(m => m.text.startsWith('fish')));
+      assert.ok(rows.every(m => m.chatKey === 'private:1'));
+    }
+    assert.equal(store.getChatMeta('private:1').total, 4);
+  }, 'fish');
+});
+
+test('upstream per-chat persona cannot override the selected skin', async () => {
+  const { resolvePersona } = await import('../src/personas.js');
+  const base = cfg();
+  base.personaPerChat = { 'group:1': { botName: 'wrong', roleText: 'wrong' } };
+  const resolved = resolveSkinConfig(base, 'cat');
+  assert.equal(resolvePersona(resolved, 'group:1').templateId, 'hajimi');
+  assert.equal(resolvePersona(resolved, 'group:1').botName, '哈基米');
+});
+
+test('new FTS memory search follows isolated skin stores and closes cleanly', (t) => {
+  const { store, dir } = fixture(t);
+  setRuntimeConfig(cfg());
+  const skins = new SkinManager({ store, getConfig });
+  const legacy = new MemoryStore({ memoryDir: path.join(dir, 'legacy'), bindIdentity: false });
+  const memory = new SkinMemoryStore({ legacy, skins, memoryDir: path.join(dir, 'isolated') });
+  t.after(() => memory.close());
+  skins.scope('group:1', () => memory.append('group:1', 'memberImpression', '喜欢蓝莓蛋糕', { userId: '42', target: '朋友' }), 'fish');
+  skins.scope('group:1', () => {
+    assert.equal(memory.search('group:1', '蓝莓').results.length, 0);
+    assert.equal(memory.stats().members || 0, 0);
+  }, 'cat');
+  skins.scope('group:1', () => assert.equal(memory.search('group:1', '蓝莓').results.length, 1), 'fish');
+  memory.maybePrune(Date.now());
+});
+
+test('semantic memory captures and recalls use durable persona scope IDs', async (t) => {
+  const { LivingMemoryRuntime } = await import('../src/living-memory/runtime.js');
+  const { LivingMemoryStore } = await import('../src/living-memory/store.js');
+  const { withSkinScope } = await import('../src/skins/context.js');
+  const { dir } = fixture(t);
+  const base = cfg();
+  base.livingMemory = { enabled: true, allowPrivate: true, allowGlobal: true };
+  const runtime = new LivingMemoryRuntime({ dataDir: dir, getConfig: () => getConfig() });
+  setRuntimeConfig(base);
+  const scopes = withSkinScope({ skinId: 'cat', chatKey: 'group:1', resolveConfig: c => resolveSkinConfig(c, 'cat') }, () => runtime.scopesFor('group:1'));
+  assert.deepEqual(scopes, ['group:1/skin/cat', 'owner-global/skin/cat']);
+  assert.ok(runtime.applies('group:1/skin/cat'));
+  assert.equal(runtime.storageScope('group:1/skin/cat'), 'group:1/skin/cat');
+  const db = new LivingMemoryStore({ file: path.join(dir, 'semantic.sqlite') });
+  t.after(() => { runtime.stop(); db.close(); });
+  assert.doesNotThrow(() => db.recordTurn({ scopeKey: 'group:1/skin/cat', payload: { lines: [] } }));
+  setRuntimeConfig({ ...base, skins: { ...base.skins, enabled: false } });
+  assert.equal(runtime.applies('group:1/skin/cat'), false);
+});

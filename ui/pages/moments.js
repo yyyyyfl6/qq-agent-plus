@@ -17,8 +17,8 @@ import { state } from '../core/state.js';
 import { saveConfig } from './settings-save.js';
 function renderExperimentalSettingsSectionImpl(c) {
   const enabled = c.identityPilot?.enabled === true;
-  const slang = c.slangPilot || {};
   const incident = c.incidentPilot || {};
+  const livingMemory = c.livingMemory || {};
   return `
     <section class="experimental-settings">
       <h3 id="settings-experiments">实验功能</h3>
@@ -42,13 +42,10 @@ function renderExperimentalSettingsSectionImpl(c) {
           </span>
         </div>
         <div class="control-key-row">
-          <span><strong>黑话语料库</strong><small id="slang-pilot-state">${slang.enabled === true ? '已启用' : '已停用'} · ${slang.graduated === true ? '已固化' : '实验中'}</small></span>
+          <span><strong>黑话语料库</strong><small id="slang-pilot-state">已退役（自动发现/研究/审批已下线；旧 slang.json 不再注入）</small></span>
           <span class="settings-actions" style="margin:0">
-            <label class="checkbox-row" style="margin:0"><input type="checkbox" id="cfg-slang-pilot-enabled" ${slang.enabled === true ? 'checked' : ''} /><span>启用</span></label>
-            <button type="button" class="btn btn-small ${slang.graduated === true ? '' : 'btn-primary'}"
-              id="launch-slang-feature" ${slang.graduated === true ? 'disabled' : ''}>
-              ${slang.graduated === true ? '已固化' : '固化上线'}
-            </button>
+            <label class="checkbox-row" style="margin:0"><input type="checkbox" id="cfg-slang-pilot-enabled" disabled /><span>已退役</span></label>
+            <button type="button" class="btn btn-small" id="launch-slang-feature" disabled>已退役</button>
           </span>
         </div>
         <div class="control-key-row">
@@ -68,6 +65,24 @@ function renderExperimentalSettingsSectionImpl(c) {
           </span>
         </div>
       </div>
+      <div class="experiment-card" id="experiment-living-memory">
+        <div class="experiment-card-main">
+          <div class="experiment-card-title">
+            <strong>长期语义记忆</strong>
+            <span class="experiment-badge ${livingMemory.graduated === true ? 'is-solid' : ''}" id="living-memory-badge">${livingMemory.graduated === true ? '已固化' : '实验中'}</span>
+          </div>
+          <p>把群聊里值得长期保留的事件、约定和项目记下来，回复前按会话范围召回。数据只存在本机 SQLite，默认按群/私聊隔离，不跨会话共享。</p>
+          <small id="living-memory-state">${livingMemory.enabled === true ? '已启用' : '已停用'} · ${livingMemory.mode === 'active' ? '注入模式' : '影子模式'}</small>
+        </div>
+        <div class="experiment-card-side">
+          <label class="skills-switch"><input type="checkbox" class="sw" id="cfg-living-memory-enabled" ${livingMemory.enabled === true ? 'checked' : ''} /><span>启用</span></label>
+          <div class="experiment-card-actions">
+            ${livingMemory.graduated === true
+              ? '<button type="button" class="btn btn-small" id="lm-open-console">打开记忆页</button><button type="button" class="btn btn-small" id="lm-ungraduate">取消固化</button>'
+              : '<button type="button" class="btn btn-small btn-primary" id="launch-living-memory-feature">固化上线</button>'}
+          </div>
+        </div>
+      </div>
       <div class="hint">群游戏（数字炸弹 / 谁是卧底 / 狼人杀）的详细设置与「正在进行的局」在 <b>设置 → 群游戏</b>；
         这里只控制它是否运行（生命周期）。默认关、白名单制、每群同时一局。</div>
       <div class="hint" id="experiment-launch-result"></div>
@@ -81,7 +96,9 @@ async function launchExperimentalFeature(feature) {
       ? $('#launch-auto-friend-feature')
       : feature === 'incidents'
         ? $('#launch-incident-feature')
-        : $('#launch-slang-feature');
+        : feature === 'living-memory'
+          ? $('#launch-living-memory-feature')
+          : $('#launch-slang-feature');
   const result = $('#experiment-launch-result');
   let ownerUin = feature === 'slang'
     ? state.config?.slangPilot?.ownerUin
@@ -108,7 +125,9 @@ async function launchExperimentalFeature(feature) {
       ? '固化上线自动好友添加？Agent 可提交好友候选，管理员批准后会立即发送申请；收到的好友申请仍需管理员审批。发送结果未知时不会自动重试。'
       : feature === 'incidents'
         ? '固化上线异常处理基础设施？上线后会记录异常、向管理员告警，并允许逐群控制自动、阻塞或继续。结果未知的旧写入不会自动重试。'
-        : '固化上线黑话语料库？上线后会启用本地发现和审批流程，并显示独立页面。';
+        : feature === 'living-memory'
+          ? '固化上线长期语义记忆？上线后会显示独立管理页，并以影子模式开始收集与召回；不会立刻把记忆注入 QQ 回复。'
+          : '固化上线黑话语料库？上线后会启用本地发现和审批流程，并显示独立页面。';
   if (!await askForConfirmation(message)) return;
   if (button) button.disabled = true;
   if (result) result.textContent = '正在上线…';
@@ -128,13 +147,44 @@ async function launchExperimentalFeature(feature) {
           ? '自动好友添加已固化上线'
           : feature === 'incidents'
             ? '异常处理基础设施已固化上线'
-            : '黑话语料库已固化上线';
+            : feature === 'living-memory'
+              ? '长期语义记忆已固化上线（影子模式）'
+              : '黑话语料库已固化上线';
     }
     refreshStatus();
   } catch (error) {
     if (button) button.disabled = false;
     if (result) result.textContent = `上线失败：${error.message}`;
     throw error;
+  }
+}
+
+async function cancelLivingMemoryGraduation() {
+  const button = $('#lm-ungraduate');
+  if (button?.disabled) return;
+  if (button) button.disabled = true;
+  if (!await askForConfirmation(
+    '取消固化长期语义记忆？会同时关闭开关并隐藏左侧入口；已保存的记忆不会删除，重新固化后可以继续使用。'
+  )) {
+    if (button) button.disabled = false;
+    return;
+  }
+  const result = $('#experiment-launch-result');
+  if (result) result.textContent = '正在取消固化…';
+  try {
+    const response = await api('/api/config', {
+      method: 'POST',
+      body: JSON.stringify({ livingMemory: { enabled: false, graduated: false } })
+    });
+    state.config = response.config || state.config;
+    syncGraduatedFeatureNavigation(state.config);
+    renderSettings();
+    const current = $('#experiment-launch-result');
+    if (current) current.textContent = '已取消固化；记忆保留，重新固化后可继续使用。';
+    refreshStatus();
+  } catch (error) {
+    if (button) button.disabled = false;
+    if (result) result.textContent = `取消失败：${error.message}`;
   }
 }
 
@@ -151,9 +201,22 @@ function renderDailyMomentsSection(c) {
     end: `${String((hour + 1) % 24).padStart(2, '0')}:${minute}`, count: 1
   }];
   return `
-    <h3 id="settings-moments">每日动态</h3>
+    <h3 id="settings-moments">QQ 空间动态</h3>
     <div class="checkbox-row"><input type="checkbox" id="cfg-moments-enabled" ${moments.enabled === true ? 'checked' : ''} />
-      <label for="cfg-moments-enabled">启用每日群聊总结与说说决策</label></div>
+      <label for="cfg-moments-enabled">启用 QQ 空间动态</label></div>
+    <div class="field"><label for="cfg-moments-source">内容来源</label>
+      <select id="cfg-moments-source">
+        <option value="self" ${String(moments.source || 'self') === 'self' ? 'selected' : ''}>人设自己的动态（不收集群聊）</option>
+        <option value="group" ${moments.source === 'group' ? 'selected' : ''}>群聊见闻（从群里挑一个瞬间）</option>
+        <option value="mixed" ${moments.source === 'mixed' ? 'selected' : ''}>混合（人设为主，群聊作灵感）</option>
+      </select></div>
+    <div class="field"><label for="cfg-moments-autopublish">发布方式</label>
+      <select id="cfg-moments-autopublish">
+        <option value="draft" ${moments.autoPublish !== true ? 'selected' : ''}>只生成草稿，等我确认</option>
+        <option value="auto" ${moments.autoPublish === true ? 'selected' : ''}>自动发布到 QQ 空间</option>
+      </select>
+      <div class="hint">默认只生成草稿；自动发布会走现有发布闸门，失败不会重试。</div>
+    </div>
     <div class="checkbox-row"><input type="checkbox" id="cfg-moments-catchup" ${moments.startupCatchup !== false ? 'checked' : ''} />
       <label for="cfg-moments-catchup" id="cfg-moments-catchup-label">${randomMode ? '重启后在未结束的范围内补跑' : '服务错过固定时刻后补跑'}</label></div>
     <div class="field"><label for="cfg-moments-schedule-mode">定时方式（上海时间）</label>
@@ -215,7 +278,7 @@ function renderDailyMomentsSection(c) {
     <div id="daily-moments-status" class="daily-moments-status"><span class="muted">正在读取状态…</span></div>
     <h3 id="settings-digest">群日报</h3>
     <div class="checkbox-row"><input type="checkbox" id="cfg-digest-enabled" ${c.groupDigest?.enabled === true ? 'checked' : ''} />
-      <label for="cfg-digest-enabled">每天定时把「过去 24 小时群里聊了啥」汇总成一条发到指定群（默认关）</label></div>
+      <label for="cfg-digest-enabled">每天定时汇总过去 24 小时的群聊内容，发送到指定群（默认关）</label></div>
     <div class="field-row">
       <div class="field"><label for="cfg-digest-time">发送时间（北京时间 HH:MM）</label>
         <input type="text" id="cfg-digest-time" value="${esc(c.groupDigest?.time || '09:30')}" placeholder="09:30" /></div>
@@ -226,6 +289,22 @@ function renderDailyMomentsSection(c) {
       <button class="btn btn-small" id="digest-run-btn" type="button">立即试跑一次</button>
       <span id="digest-run-result" class="muted"></span>
       <span class="muted">试跑会真的把日报发到上面配置的群里</span>
+    </div>
+    <h3 id="settings-briefing">管理员早报</h3>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-briefing-enabled" ${c.adminBriefing?.enabled === true ? 'checked' : ''} />
+      <label for="cfg-briefing-enabled">每天将昨日群聊摘要以机器人身份私聊给管理员（默认关）</label></div>
+    <div class="field-row">
+      <div class="field"><label for="cfg-briefing-time">发送时间（北京时间 HH:MM）</label>
+        <input type="text" id="cfg-briefing-time" value="${esc(c.adminBriefing?.time || '09:30')}" placeholder="09:30" /></div>
+      <div class="field"><label for="cfg-briefing-max">最多字数</label>
+        <input type="number" id="cfg-briefing-max" min="80" max="600" value="${esc(c.adminBriefing?.maxChars ?? 300)}" /></div>
+    </div>
+    <div class="field"><label>汇报哪些群（不勾选 = 所有当前可运行的白名单群）</label>
+      <div id="cfg-briefing-chats-box" class="group-checklist"><span class="muted">正在读取群列表…</span></div></div>
+    <div class="settings-actions">
+      <button class="btn btn-small" id="briefing-run-btn" type="button">立即试跑一次</button>
+      <span id="briefing-run-result" class="muted"></span>
+      <span class="muted">试跑会真的私聊管理员；收件人取「设置 → 管理员」里的 QQ</span>
     </div>`;
 }
 
@@ -245,13 +324,15 @@ function renderGroupGameSection(c) {
     <h3 id="settings-groupgame">群游戏</h3>
     <div class="hint">系统负责轮次、计票与判定，模型只负责氛围与解说；卧底的词只走私聊，公开摘要里不含身份。
       默认关、白名单制、每群同时一局。</div>
-    <div class="muted" style="margin:6px 0 10px;font-size:12px">当前状态：<b>${enabled ? '已启用' : '已停用'}</b>
+    <div class="muted" style="margin:6px 0 10px;font-size: var(--fs-sm)">当前状态：<b>${enabled ? '已启用' : '已停用'}</b>
       —— 开关在「实验功能」页（生命周期），这里是详细设置与局面。</div>
     <div class="field-row">
       <div class="field"><label>允许开局的群（勾选机器人已加入的群）</label>
         <div id="cfg-game-chats-box" class="group-checklist"><span class="muted">正在读取群列表…</span></div></div>
       <div class="field"><label for="cfg-game-daily">每群每天最多开局数</label>
         <input type="number" id="cfg-game-daily" min="1" max="50" value="${esc(c.groupGame?.dailyLimitPerChat ?? 6)}" /></div>
+      <div class="field"><label for="cfg-game-maxtime">单局时长上限（分钟）</label>
+        <input type="number" id="cfg-game-maxtime" min="5" max="180" value="${esc(c.groupGame?.maxDurationMin ?? 60)}" /></div>
     </div>
     <div class="checkbox-row"><input type="checkbox" id="cfg-game-private" ${c.groupGame?.allowPrivateInvite === true ? 'checked' : ''} />
       <label for="cfg-game-private">允许私聊发词/身份（谁是卧底与狼人杀都必需；只发给报名/在册的人，失败不重试）</label></div>
@@ -265,10 +346,10 @@ function renderGroupGameSection(c) {
       <div class="field"><label for="cfg-game-recruit">开局报名时长（秒，0=不报名直接发牌）</label>
         <input type="number" id="cfg-game-recruit" min="0" max="300" value="${esc(c.groupGame?.recruitSeconds ?? 45)}" /></div>
     </div>
-    <div class="hint">需要私聊的游戏（谁是卧底/狼人杀）默认先**报名**：想玩的在群里发一句「我玩」或「报名」，
+    <div class="hint">需要私聊的游戏（谁是卧底/狼人杀）默认先<strong>报名</strong>：想玩的在群里发一句「我玩」或「报名」，
       够人数才发牌、发牌才发私聊——不会把只是在群里插话的围观者拉进局（把报名时长设 0 就回到"按最近发言者直接发牌"）。</div>
-    <div class="hint">白天讨论到点会自动进投票；中途**超过半数**存活玩家说一句「投吧 / 直接投」也会立刻开投
-      （说「投 3」这种带目标的算投票，不算想开投）。讨论时长与单回合超时**小于 30 秒按 30 秒生效**（0 = 用插件默认）。</div>
+    <div class="hint">白天讨论到点会自动进投票；中途<strong>超过半数</strong>存活玩家说一句「投吧 / 直接投」也会立刻开投
+      （说「投 3」这种带目标的算投票，不算想开投）。讨论时长与单回合超时<strong>小于 30 秒按 30 秒生效</strong>（0 = 用插件默认）。</div>
     <div class="checkbox-row"><input type="checkbox" id="cfg-game-bomb" ${games.includes('number-bomb') ? 'checked' : ''} />
       <label for="cfg-game-bomb">允许「数字炸弹」</label></div>
     <div class="checkbox-row"><input type="checkbox" id="cfg-game-undercover" ${games.includes('undercover') ? 'checked' : ''} />
@@ -323,10 +404,20 @@ async function loadRemindersView() {
   const rows = (items, done) => items.map((it) => {
     const time = new Date(it.at).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
     const statusLabel = { fired: '已触发', canceled: '已取消', expired: '已过期' }[it.status] || String(it.status || '');
+    // 归属（谁提的/提醒谁）：与提醒到点派发时的话术同源（字段来自 config 的 memberNotes 口径）
+    const from = String(it.from || '').trim();
+    const to = String(it.to || '').trim();
+    const attr = from && to ? `${from} 请你提醒 ${to}`
+      : from ? `${from} 请你提醒`
+      : to ? `有人请你提醒 ${to}` : '';
+    const repeatLabel = { daily: '每天', weekly: '每周', cron: 'cron' }[it.repeat] || '';
+    const repeatTag = repeatLabel ? `<span class="reminder-repeat">${esc(repeatLabel)}${it.status === 'pending' ? ' · 下一期见上' : ''}</span>` : '';
     return `<div class="reminder-row" data-id="${esc(it.id)}" data-chatkey="${esc(it.chatKey)}">`
       + `<span class="reminder-when">${esc(time)}</span>`
       + `<span class="reminder-chat">${esc(formatChatTitle(it.chatKey, chatNameOf(it.chatKey)))}</span>`
+      + (attr ? `<span class="reminder-attr" title="${esc(attr)}">${esc(attr)}</span>` : '')
       + `<span class="reminder-text">${esc(it.text)}</span>`
+      + repeatTag
       + (done ? `<span class="muted">${esc(statusLabel)}</span>` : '<button type="button" class="btn btn-small reminder-cancel-btn">取消</button>')
       + '</div>';
   }).join('');
@@ -529,6 +620,15 @@ function renderMomentSchedule(status) {
     </details>` : ''}`;
 }
 
+/** 编辑结果提示：写进任务状态区（本页没有全局 setStatus；模块图守卫禁止跨文件全局引用）。 */
+function setEditNote(text) {
+  const node = document.getElementById('moment-edit-note')
+    || (() => { const el = document.createElement('div'); el.id = 'moment-edit-note'; el.className = 'hint'; return el; })();
+  node.textContent = text;
+  const box = document.querySelector('.daily-moments-status, [id^="daily-moments"]');
+  if (box && !node.isConnected) box.prepend(node);
+}
+
 async function loadDailyMomentsStatus() {
   const box = $('#daily-moments-status');
   if (!box) return;
@@ -548,6 +648,14 @@ async function loadDailyMomentsStatus() {
     // 按钮必须跟着未决记录走，否则入口藏在旧记录里、面板上看不到，阻断却仍在。
     const unresolvedRecord = records.find((record) => record.status === 'publish-unknown');
     const blockingRecord = records.find((record) => ['publishing', 'publish-unknown'].includes(record.status));
+    // 15s 状态轮询每次都把这块 innerHTML 整个重建：`<details>` 的展开态不在 HTML 里，
+    // 重建即折叠 —— 正在读"内部群摘要"的人每 15 秒被收起一次。记住并恢复（2026-10-12 审查）。
+    const summariesOpen = Boolean(box.querySelector('.moment-summaries')?.open);
+    // 编辑态防冲：textarea 打开时轮询重画会冲掉未保存的输入 —— 记住内容与焦点，重建后恢复
+    const editArea = box.querySelector('#moment-edit-area');
+    const editingNow = editArea && editArea.style.display !== 'none';
+    const editDraft = editingNow ? editArea.value : '';
+    const editFocused = editingNow && document.activeElement === editArea;
     box.innerHTML = `
       <div class="field-row">
         <div class="field"><label>任务状态</label><div>${status.running ? '运行中' : (status.enabled ? '等待中' : '已关闭')}</div></div>
@@ -556,7 +664,9 @@ async function loadDailyMomentsStatus() {
       </div>
       ${renderMomentSchedule(status)}
       ${blockingRecord && blockingRecord.id !== latest?.id ? `<div class="hint">有一条「${esc(momentStatusLabel(blockingRecord))}」的记录（${esc(blockingRecord.dayKey || '-')}）正在挡住所有时段的发布；下面的人工确认/核对按钮针对这条记录。</div>` : ''}
-      ${latest?.content ? `<div class="field"><label>正文</label><div class="daily-moments-content">${esc(latest.content)}</div></div>` : ''}
+      ${latest?.content ? `<div class="field"><label>正文${publishable ? ' <button type="button" class="btn btn-small" id="moment-edit-btn">编辑</button>' : ''}</label>
+        <div class="daily-moments-content" data-moment-view style="display:${editingNow ? 'none' : 'block'}">${esc(latest.content)}</div>
+        ${publishable ? `<textarea id="moment-edit-area" rows="5" maxlength="2000" style="display:${editingNow ? 'block' : 'none'};width:100%">${esc(editingNow ? editDraft : (latest.content || ''))}</textarea>` : ''}</div>` : ''}
       ${latest?.reason ? `<div class="field"><label>决定理由</label><div>${esc(latest.reason)}</div></div>` : ''}
       ${latest?.error ? `<div class="moment-error" role="alert">${esc(latest.error)}</div>` : ''}
       ${latest?.tid ? `<div class="field"><label>说说 ID</label><code>${esc(latest.tid)}</code></div>` : ''}
@@ -571,17 +681,26 @@ async function loadDailyMomentsStatus() {
         ${latest.groupSummaries.map((group) => `<div class="field"><label>${esc(group.groupName || group.chatKey)}</label><div>${esc(group.summary)}</div></div>`).join('')}
       </details>` : ''}
       ${records.length ? `<div class="table-wrap"><table class="usage-table">
-        <thead><tr><th>日期</th><th>来源</th><th>状态</th><th>群数</th><th>配图</th><th>时间</th><th></th></tr></thead>
+        <thead><tr><th>日期</th><th>摘要</th><th>来源</th><th>状态</th><th>时间</th><th></th></tr></thead>
         <tbody>${records.slice(0, 7).map((record) => `<tr>
           <td>${esc(record.dayKey || '-')}</td>
+          <td class="moment-summary-cell">${record.content ? esc(String(record.content).replace(/\s+/g, ' ').slice(0, 32)) + (String(record.content).length > 32 ? '…' : '') : '<span class="pd-write-note">（无正文）</span>'}</td>
           <td>${record.publicationSource !== 'manual' && ['scheduled', 'startup-catchup'].includes(record.source) ? '定时' : '手动'}</td>
           <td>${esc(momentStatusLabel(record))}</td>
-          <td>${Number(record.groupCount) || 0}</td>
-          <td>${Number(record.imageCount) || 0}</td>
           <td>${record.endedAt || record.startedAt ? esc(fmtTime(record.endedAt || record.startedAt)) : '-'}</td>
           <td><button type="button" class="btn btn-small" data-moment-select="${esc(record.id)}">查看</button></td>
         </tr>`).join('')}</tbody>
       </table></div>` : ''}`;
+    if (summariesOpen) {
+      const details = box.querySelector('.moment-summaries');
+      if (details) details.open = true;
+    }
+    if (editingNow) {
+      const btn = box.querySelector('#moment-edit-btn');
+      if (btn) btn.textContent = '取消编辑';
+      const area = box.querySelector('#moment-edit-area');
+      if (area && editFocused) area.focus();
+    }
     $$('[data-moment-select]', box).forEach((button) => button.addEventListener('click', () => {
       state.currentMomentId = button.dataset.momentSelect;
       loadDailyMomentsStatus();
@@ -620,6 +739,30 @@ async function loadDailyMomentsStatus() {
       }
     };
     $('#moment-publish-draft')?.addEventListener('click', () => recordAction('publish'));
+    // 编辑草稿：切换到 textarea，保存走 /edit；成功后刷新状态面板
+    $('#moment-edit-btn')?.addEventListener('click', () => {
+      const area = $('#moment-edit-area');
+      const view = box.querySelector('[data-moment-view]');
+      if (!area || !view) return;
+      const editing = area.style.display !== 'none';
+      area.style.display = editing ? 'none' : 'block';
+      view.style.display = editing ? 'block' : 'none';
+      $('#moment-edit-btn').textContent = editing ? '编辑' : '取消编辑';
+      if (!editing) area.focus();
+    });
+    $('#moment-edit-area')?.addEventListener('change', async (event) => {
+      const content = String(event.target.value || '').trim();
+      if (!content || content === latest?.content) return;
+      try {
+        await api('/api/daily-moments/records/' + encodeURIComponent(latest.id) + '/edit', {
+          method: 'POST', body: JSON.stringify({ content })
+        });
+        setEditNote('草稿已修改（记得发布前再看一眼）');
+        await loadDailyMomentsStatus();
+      } catch (error) {
+        setEditNote(`保存失败：${error?.message || error}`);
+      }
+    });
     $('#moment-reconcile')?.addEventListener('click', () => recordAction('reconcile', unresolvedRecord?.id));
     // 自动核对（reconcile）在空间里找不到那条说说时，记录会一直停在待核对并挡住所有
     // 时段的发布；这两个按钮是人工终局：确认未发出（解除阻断）或确认已发出（保持阻断）。
@@ -717,8 +860,35 @@ async function loadQzoneInteractionStatus() {
 }
 
 
+/**
+ * 「管理员早报」立即试跑按钮。放在本页模块里，避免 settings-bind.js 继续膨胀
+ * （它有 max-lines 约束）；settings-bind 的跨页控件统一调这个函数。
+ */
+function bindAdminBriefingRunButton() {
+  const button = $('#briefing-run-btn');
+  if (!button || button.dataset.bound) return;
+  button.dataset.bound = '1';
+  button.addEventListener('click', async () => {
+    const out = $('#briefing-run-result');
+    if (out) out.textContent = '生成中…（先保存设置再试跑）';
+    try {
+      const r = await api('/api/admin-briefing/run', { method: 'POST' });
+      const skipped = {
+        'no-admin': '未配置管理员 QQ（设置 → 管理员）',
+        'no-groups': '没有可运行的白名单群',
+        'too-few': '消息太少，本次跳过',
+        'already-running': '正在跑，稍等',
+        blocked: `当前不可运行：${r.error || ''}`
+      };
+      if (out) out.textContent = skipped[r.skipped] || JSON.stringify(r).slice(0, 220);
+    } catch (e) {
+      if (out) out.textContent = `失败：${e.message}`;
+    }
+  });
+}
+
 export {
-  launchExperimentalFeature, loadDailyMomentsStatus, loadGroupGameView, loadQzoneInteractionStatus,
+  bindAdminBriefingRunButton, cancelLivingMemoryGraduation, launchExperimentalFeature, loadDailyMomentsStatus, loadGroupGameView, loadQzoneInteractionStatus,
   loadRemindersView, momentStatusLabel, renderDailyMomentsSection, renderExperimentalSettingsSectionImpl,
   renderGroupChecklist, renderGroupGameSection, renderMomentWindowRow, renderQzoneInteractionSection,
   renderRemindersSection
