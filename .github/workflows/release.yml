@@ -66,6 +66,7 @@ jobs:
       # 与 ci.yml 同口径：全仓库的 .sh 都检（原先写死三个文件名，
       # 新加脚本不会被检查 —— 当前恰好只有三个，属埋雷不是漏检）。
       - name: Tag 与版本号一致
+        if: startsWith(github.ref, 'refs/tags/v')
         run: |
           set -e
           # 打错 tag 会让 Release 版本与产物长期不一致，而 src/auto-update.js 正是按 tag
