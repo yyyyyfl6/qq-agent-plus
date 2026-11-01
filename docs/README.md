@@ -35,6 +35,7 @@
 | [STABLE_FEATURES.md](STABLE_FEATURES.md) | 已从实验转为默认开启的功能，以及转正的判定标准 |
 | [STABLE_FEATURE_MIGRATION_NOTES.md](STABLE_FEATURE_MIGRATION_NOTES.md) | 实验/退役功能留下的一次性兼容边界（身份、好友、异常、黑话） |
 | [EXPERIMENTAL_FEATURE_STANDARD.md](EXPERIMENTAL_FEATURE_STANDARD.md) | 实验功能的开发规范：开关、默认值、降级与转正流程 |
+| [VERTEX.md](VERTEX.md) | 用 Google Vertex AI 服务账号 JSON 直连 Gemini（花自己 GCP 额度 / 赠金，不走网关） |
 | [EXTENSIONS.md](EXTENSIONS.md) | 扩展功能：群聊总结、大肥鱼桥（实验室 DeepSeek Harness）、趣味功能、专属指令、谷歌/Edge 搜索、人格工作台 |
 | [ASSET_OBSERVABILITY.md](ASSET_OBSERVABILITY.md) | AI 资产观测（表情/黑话等）的统计口径与控制台入口 |
 

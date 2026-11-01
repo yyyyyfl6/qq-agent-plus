@@ -3,6 +3,7 @@ import { getConfig, updateConfig } from './config.js';
 import { assertTimeAllowed, watchTimeWindow } from './time-gate.js';
 import { resolveProviderKey } from './provider-key.js';
 import { readJsonBounded } from './http-body.js';
+import { resolveRequestAuth } from '../llm/vertex-auth.js';
 import { modelServiceOfBaseUrl, modelServiceById, resolveThinkingPatch, normalizeThinkingIntent, effectiveThinkingRaw, hostOf } from './provider-presets.js';
 
 /** 当前生效的提供商目录（配置里的 providers）。 */
@@ -111,8 +112,10 @@ function opencodeHeaders(baseUrl, model = '') {
 export async function fetchModelsFrom(baseUrl, apiKey, timeoutMs = 15000) {
   const base = normalizeBaseUrl(baseUrl);
   if (!base) throw new Error('请先填写 Base URL');
-  const res = await fetch(`${base}/models`, {
-    headers: { ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}), ...opencodeHeaders(base) },
+  // Google 服务账号 JSON → Vertex 访问令牌（直连官方，见 llm/vertex-auth.js）；普通 Key 原样
+  const auth = await resolveRequestAuth({ baseUrl: base, apiKey });
+  const res = await fetch(`${auth.baseUrl}/models`, {
+    headers: { ...(auth.apiKey ? { authorization: `Bearer ${auth.apiKey}` } : {}), ...opencodeHeaders(base) },
     signal: AbortSignal.timeout(timeoutMs)
   });
   if (!res.ok) throw new Error(`获取模型列表失败：HTTP ${res.status}`);
@@ -133,11 +136,12 @@ export async function testModelChat({ baseUrl, apiKey, model }) {  assertTimeAll
   const releaseTimeGuard = watchTimeWindow((error) => controller.abort(error), '');
   try {
     controller.signal.throwIfAborted();
-    const res = await fetch(`${base}/chat/completions`, {
+    const auth = await resolveRequestAuth({ baseUrl: base, apiKey }, { signal: controller.signal });
+    const res = await fetch(`${auth.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+        ...(auth.apiKey ? { authorization: `Bearer ${auth.apiKey}` } : {}),
         ...opencodeHeaders(base, model)
       },
       body: JSON.stringify({
@@ -226,11 +230,12 @@ export async function probeThinking({ providerId = '', baseUrl = '', apiKey = ''
   const releaseTimeGuard = watchTimeWindow((error) => controller.abort(error), '');
   try {
     controller.signal.throwIfAborted();
-    const res = await fetch(`${base}/chat/completions`, {
+    const auth = await resolveRequestAuth({ baseUrl: base, apiKey: key }, { signal: controller.signal });
+    const res = await fetch(`${auth.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        ...(key ? { authorization: `Bearer ${key}` } : {}),
+        ...(auth.apiKey ? { authorization: `Bearer ${auth.apiKey}` } : {}),
         ...opencodeHeaders(base, modelId)
       },
       body: JSON.stringify(body),
@@ -448,9 +453,10 @@ export async function testProvider(p, timeoutMs = 12000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error('超时')), timeoutMs);
   try {
-    const res = await fetch(`${p.baseURL}/models`, {
+    const auth = await resolveRequestAuth({ baseUrl: p.baseURL, apiKey: p.apiKey }, { signal: controller.signal });
+    const res = await fetch(`${auth.baseUrl}/models`, {
       headers: {
-        ...(p.apiKey ? { authorization: `Bearer ${p.apiKey}` } : {}),
+        ...(auth.apiKey ? { authorization: `Bearer ${auth.apiKey}` } : {}),
         ...opencodeHeaders(p.baseURL)
       },
       signal: controller.signal

@@ -80,6 +80,7 @@ QQ Agent Plus 是面向 Linux 服务器的 QQ 群聊 Agent。它连接外部 One
   **群聊总结**（"刚才聊了啥"/ 指令 `/总结` 按话题整理后发出）、
   **大肥鱼桥**（管理员在 QQ 里用 `/lab <任务>` 把活派给实验室电脑上的 DeepSeek Harness，跑完结果发回来；只认管理员本人、结果不确定不重试）、
   **趣味功能**（今日人品 / 今日运势 / 塔罗牌，离线零花费）；搜索新增**谷歌**与 **Edge（必应国际版）**。
+- **Google Vertex AI 直连**：API Key 栏粘贴服务账号 JSON，本机签名换令牌后直连 Vertex 官方端点调用 Gemini（花自己 GCP 的额度 / 赠金，不经过网关），见 [VERTEX.md](docs/VERTEX.md)。
 - **人格工作台**：设置 → 人设里可以试聊草稿卡、一句话让 AI 起草新卡、导入导出 `.md`、覆盖保存自定义卡；全局 Ctrl / ⌘ + K 快速跳转。
 配置项示例见[配置示例](docs/CONFIG-EXAMPLES.md)。运维命令统一收录在 [src/ops.js](src/ops.js)，
 用法见[运维工具](docs/OPS.md)。本地回归测试位于 [test/local/](test/local/README.md)。

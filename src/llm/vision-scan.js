@@ -8,6 +8,7 @@ import { getConfig, updateConfig } from '../core/config.js';
 import { builtinVisionResults } from './model-vision-docs.js';
 import { withTimeWindow, assertTimeAllowed } from '../core/time-gate.js';
 import { readJsonBounded } from '../core/http-body.js';
+import { resolveRequestAuth } from './vertex-auth.js';
 
 // 1×1 像素 PNG（70 字节），足够让视觉模型"看到点什么"，也不会浪费 token。
 const TINY_PNG =
@@ -83,9 +84,10 @@ async function detectModelVisionRequest({ baseUrl, apiKey, model }, timeoutMs, s
 
   let res;
   try {
-    res = await fetch(joinUrl(baseUrl, '/chat/completions'), {
+    const auth = await resolveRequestAuth({ baseUrl, apiKey });   // 服务账号 JSON → Vertex 访问令牌
+    res = await fetch(joinUrl(auth.baseUrl, '/chat/completions'), {
       method: 'POST',
-      headers: { 'content-type': 'application/json', ...authHeaders(apiKey, baseUrl, model) },
+      headers: { 'content-type': 'application/json', ...authHeaders(auth.apiKey, auth.baseUrl, model) },
       body: JSON.stringify({
         model,
         messages: [{

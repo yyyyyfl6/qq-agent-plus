@@ -10,6 +10,7 @@ import { readJsonBounded, readTextBounded } from '../core/http-body.js';
 import { createLogger } from '../core/logger.js';
 import { imageType } from '../core/image-type.js';
 import { redactText } from '../core/redact.js';
+import { resolveRequestAuth } from './vertex-auth.js';
 
 const log = createLogger('llm');
 
@@ -512,9 +513,11 @@ export async function chatCompletion({
   try {
     controller.signal.throwIfAborted();
     assertTimeAllowed();
-    const send = (payload) => fetch(joinUrl(api.baseUrl, '/chat/completions'), {
+    // 普通 Key 原样用；Google 服务账号 JSON 在这里换成 Vertex 访问令牌（直连 Google 官方，见 vertex-auth.js）
+    const auth = await resolveRequestAuth(api, { signal: controller.signal });
+    const send = (payload) => fetch(joinUrl(auth.baseUrl, '/chat/completions'), {
       method: 'POST',
-      headers: { 'content-type': 'application/json', ...authHeaders(api.apiKey, api.baseUrl, api.model) },
+      headers: { 'content-type': 'application/json', ...authHeaders(auth.apiKey, auth.baseUrl, api.model) },
       body: JSON.stringify(payload),
       signal: controller.signal
     });
@@ -567,8 +570,9 @@ export async function chatCompletion({
 /** 获取模型列表（GET /models）。返回 [{ id }]；失败抛错。 */
 export async function listModels() {
   const cfg = effectiveApi();
-  const res = await fetch(joinUrl(cfg.baseUrl, '/models'), {
-    headers: authHeaders(cfg.apiKey, cfg.baseUrl),
+  const auth = await resolveRequestAuth(cfg);
+  const res = await fetch(joinUrl(auth.baseUrl, '/models'), {
+    headers: authHeaders(auth.apiKey, auth.baseUrl),
     signal: AbortSignal.timeout(15000)
   });
   if (!res.ok) throw new Error(`获取模型列表失败：HTTP ${res.status}`);

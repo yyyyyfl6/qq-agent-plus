@@ -199,6 +199,28 @@ export const MODEL_SERVICES = [
     }
   },
   {
+    // Google Vertex AI：用服务账号 JSON 直连官方 OpenAI 兼容端点（花自己 GCP 项目的额度 / 赠金）。
+    // API Key 栏粘贴整份服务账号 JSON；{project} 由 JSON 的 project_id 自动填（src/llm/vertex-auth.js）。
+    id: 'vertex',
+    label: 'Google Vertex AI（服务账号 JSON）',
+    baseUrl: 'https://aiplatform.googleapis.com/v1/projects/{project}/locations/global/endpoints/openapi',
+    keyUrl: 'https://console.cloud.google.com/iam-admin/serviceaccounts',
+    hosts: ['aiplatform.googleapis.com'],
+    source: 'Vertex AI 官方文档：OpenAI 兼容 Chat Completions（endpoints/openapi），模型名形如 google/gemini-2.5-flash；思考档位用 reasoning_effort',
+    thinking: {
+      canDisable: null,
+      off: null,
+      offIsApprox: false,
+      efforts: {
+        low: { reasoning_effort: 'low' },
+        medium: { reasoning_effort: 'medium' },
+        high: { reasoning_effort: 'high' }
+      },
+      uiLevels: ['low', 'medium', 'high'],
+      note: 'API Key 一栏粘贴服务账号 JSON（需要「Vertex AI 用户」角色）；模型例：google/gemini-2.5-flash、google/gemini-2.5-pro。只连 Google 官方域名。'
+    }
+  },
+  {
     id: 'custom',
     label: '自定义 / 自建（OpenAI 兼容）',
     baseUrl: '',
