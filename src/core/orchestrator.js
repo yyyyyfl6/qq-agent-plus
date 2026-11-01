@@ -115,6 +115,7 @@ import { ZONE_OFFSET_MS, minuteOfDayInZone, randInt, createEventBus, todayKey } 
 import { buildSystemPrompt, buildUserPrompt, resolveContextTier } from '../llm/prompt.js';
 import { chatCompletion, chatCompletionWithRetry, addUsage, isRetryableError } from '../llm/llm.js';
 import { buildToolDefs, toOpenAiTools, executeTool } from '../tools/tools.js';
+import { extensionPromptContext, extensionToolAvailable } from '../extensions/index.js';
 import { normalizeMid } from '../tools/tools-core.js';
 import { visionEnabled } from '../llm/vision-scan.js';
 import { currentProviders } from './providers.js';
@@ -1463,6 +1464,8 @@ export class Orchestrator {
       if (!imageGenEnabled && d.name === 'generate_image') return false;
       if (d.feature === 'identityPilot' && !identityAvailable) return false;
       if (d.feature === 'friendProposal' && !friendProposalAvailable) return false;
+      // 扩展工具（src/extensions）：各自的开关/场合判定（如大肥鱼桥默认只在私聊注入）
+      if (d.extension && !extensionToolAvailable(d, { cfg, kind, chatKey })) return false;
       return true;
     });
     const openAiTools = toOpenAiTools(toolDefs);
@@ -1520,6 +1523,10 @@ export class Orchestrator {
       : null;
     const lifecycleContinuation = priorProviderMessages.length > 0;
 
+    // 扩展段落（目前是长期记忆召回）：放在用户提示词里而不是系统提示，不破坏前缀缓存。
+    // 召回失败/超时只会少这一段，不影响本轮。
+    const extensionContext = await extensionPromptContext({ chatKey, triggerEntries, signal });
+
     // 首轮带完整上下文；生命周期后续轮只附加增量，旧消息保持字节级稳定以命中 DeepSeek 前缀缓存。
     const userPrompt = buildUserPrompt({
       chatKey, kind, chatId, chatName,
@@ -1529,6 +1536,7 @@ export class Orchestrator {
       stickerEntries,
       slangContext,
       incidentContext,
+      extensionContext,
       selfNickname,
       // 点名标签的文本兜底要用它认「@QQ号」与 CQ 码形态（存档里的 mentionsSelf 才是主判据）。
       // 取值与上面的档位判定保持一致，否则两处会对同一条消息给出不同判断。
@@ -1631,7 +1639,11 @@ export class Orchestrator {
       // 定时提醒（remind 工具）：持久化的"给别人的承诺"，到点走主动唤醒
       reminders: this.reminders,
       // 群游戏（group_game 工具）：进行中的局由管理器负责推进与判定
-      games: this.getGames?.() || null
+      games: this.getGames?.() || null,
+      // 本轮触发者（不含自己）：权限敏感的扩展工具（大肥鱼桥）据此判断"是不是管理员本人下的指令"
+      triggerSenderIds: (triggerEntries || [])
+        .filter((m) => !m.self && m.senderId)
+        .map((m) => String(m.senderId))
     };
 
     // 省 Token 模式：轮数与单次运行预算夹上限（关闭时与升级前逐字一致）

@@ -352,6 +352,56 @@ export const DEFAULT_CONFIG = {
     chats: [],
     maxChars: 300
   },
+  // ── 扩展功能（src/extensions/*，见 docs/EXTENSIONS.md）：全部默认关，各自有独立控制台页面 ──
+  // 长期记忆：事件/约定类记忆，按相关度召回进提示词（与按 QQ 记印象的「人物记忆」互补）
+  longMemory: {
+    enabled: false,
+    scope: 'chat',
+    autoRecall: true,
+    recallTopK: 4,
+    recallMinScore: 0.18,
+    maxContentChars: 200,
+    maxEntries: 5000,
+    autoExtract: false,
+    extractMinMessages: 30,
+    extractIntervalMinutes: 30,
+    extractMaxPerHour: 6,
+    extractChats: [],
+    embedding: { enabled: false, baseUrl: '', apiKey: '', model: '', timeoutMs: 15000 }
+  },
+  // 群聊总结：按需（"总结一下刚才聊了啥"）；与定时的 groupDigest 互补
+  chatSummary: {
+    enabled: false,
+    defaultMessages: 120,
+    maxMessages: 500,
+    maxInputChars: 16000,
+    maxPerHourPerChat: 3,
+    maxPerHour: 12,
+    style: 'structured'
+  },
+  // 大肥鱼桥：管理员在 QQ 里把任务派给实验室电脑上的 DeepSeek Harness（仅管理员、默认仅私聊）
+  labBridge: {
+    enabled: false,
+    name: '实验室电脑',
+    protocol: 'task',
+    baseUrl: '',
+    token: '',
+    model: '',
+    systemPrompt: '',
+    privateOnly: true,
+    maxPerHour: 10,
+    timeoutMinutes: 30,
+    pollSeconds: 5,
+    reportBack: true,
+    reportMaxChars: 900
+  },
+  // 趣味小功能：今日人品 / 今日运势 / 塔罗牌（离线、零花费）
+  funTools: {
+    enabled: false,
+    jrrp: true,
+    fortune: true,
+    tarot: true
+  },
   // 群游戏（实验性，默认关）：白名单制、每群同时一局；私聊发词默认关闭（风控考虑）。
   groupGame: {
     enabled: false,

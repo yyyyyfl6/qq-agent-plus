@@ -526,13 +526,15 @@ export function buildToolDefs() {
       description: '自己画一张图（调用图片生成服务，按张计费、有每小时上限）。适合群友点名要"画一张"：梗图、应景的图。'
         + 'prompt 要写清楚画面内容（主体、风格、氛围）；要在图上带中文文字时，把文字用引号原样写进 prompt'
         + '（例如：…画面上有中文文字"事已至此，先吃饭吧"——能不能写对取决于所选图模型）。'
-        + '生成后图片会存进表情库，接着用 send_sticker 发出去。'
+        + '生成后图片会存进表情库；传 send=true 会画完直接发到当前聊天（省一轮），否则接着用 send_sticker 发出去。'
         + '别频繁用（一次调用就是一次真实花费）。',
       parameters: {
         type: 'object',
         properties: {
           prompt: { type: 'string', description: '画面描述：主体 + 风格 + 氛围（如"一只橘猫戴着草帽坐在海边，卡通风格"）' },
-          note: { type: 'string', description: '可选：给这张图起的短语（存进表情库便于以后找）' }
+          note: { type: 'string', description: '可选：给这张图起的短语（存进表情库便于以后找）' },
+          send: { type: 'boolean', description: '可选：true = 画完直接发到当前聊天（推荐）；false/不传 = 只存进表情库' },
+          replyToMessageId: { type: ['integer', 'string'], description: '可选：send=true 时引用哪条消息（谁点的图就引用谁）' }
         },
         required: ['prompt']
       },
@@ -574,6 +576,30 @@ export function buildToolDefs() {
               tags: ['生成'],
               usage: revisedPrompt ? `提示词修订：${revisedPrompt}`.slice(0, 300) : ''
             });
+            if (args.send === true || args.send === 'true') {
+              // 直接发：与 send_sticker 走同一条发送链路（限频/留档/禁言判定一致）。
+              // 图已经花钱画出来并落库了 —— 发送失败不退额度，返回 id 让模型改用 send_sticker 重试。
+              try {
+                const sticker = await ctx.stickers.findForSend(entry.id);
+                if (!sticker?.url) throw new Error('刚生成的图找不到可发送的地址');
+                const sent = await ctx.sender.sendSticker(ctx.chatKey, sticker, {
+                  runId: ctx.session.leaseId, signal: ctx.signal,
+                  replyToMessageId: normalizeMid(args.replyToMessageId) || null
+                });
+                ctx.stickers.markUsed?.(sticker.id, String(ctx.session.triggerText || '').slice(0, 100));
+                ctx.session.sent.push({ type: 'sticker', text: `[生成的图:${entry.desc || prompt.slice(0, 20)}]`, at: new Date().toLocaleTimeString('zh-CN', { hour12: false }) });
+                ctx.emit('session-update', ctx.session.id);
+                return ok({ id: entry.id, sent: true, messageId: sent?.message_id ?? null, note: '图已经发出去了，想配一句话就用 send_message，不用再发一次图。' });
+              } catch (sendError) {
+                return ok({
+                  id: entry.id,
+                  sent: false,
+                  kind: '已存进表情库',
+                  error: `直接发送失败：${sendError?.message ?? sendError}`,
+                  next: '稍后用 send_sticker 传这个 id 再发一次（图已经画好了，别重画）'
+                });
+              }
+            }
             return ok({
               id: entry.id,
               note: entry.localNote,

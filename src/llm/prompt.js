@@ -827,6 +827,9 @@ export function buildUserPrompt(ctx) {
   const memText = ctx.memory.formatForPrompt(ctx.chatKey, { userIds: [...relevantUserIds] });
   if (memText) parts.push(`【记忆】\n${memText}`);
 
+  // 扩展段落（长期记忆召回等，由 orchestrator 事先算好；没启用时为空串）
+  if (ctx.extensionContext) parts.push(String(ctx.extensionContext));
+
   // 成员备注：不再单独成段——备注名已经直接替换了消息里的显示名
   // （formatEntry/triggerLabels 都优先用备注），单独列一遍是重复信息。
 

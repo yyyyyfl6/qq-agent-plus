@@ -27,6 +27,10 @@ import { Orchestrator } from '../core/orchestrator.js';
 import { DailyMomentsManager } from '../features/daily-moments.js';
 import { QzoneInteractionManager } from '../features/qzone-interactions.js';
 import { GroupDigestManager } from '../features/group-digest.js';
+import {
+  initExtensions, registerExtensionRoutes, startExtensions, stopExtensions
+} from '../extensions/index.js';
+import { registerPersonaRoutes } from './persona-routes.js';
 import { GroupGameManager } from '../features/group-game.js';
 import { ReminderStore } from '../core/reminders.js';
 import { listModels, chatCompletion, resolveApiKey, cachedTokensOfUsage } from '../llm/llm.js';
@@ -568,6 +572,9 @@ export function createApp({
     sender,
     log: moduleLog('group-digest')
   });
+  // 扩展功能（长期记忆 / 群聊总结 / 大肥鱼桥 / 趣味）：只建运行时对象，不建库、不起定时器；
+  // 真正开工在 start() 里按各自配置决定（见 src/extensions/index.js）
+  initExtensions({ dataDir: DATA_DIR, store, sender, log });
   function createIncidentPilot() {
     return new IncidentPilotManager({
       dataDir: DATA_DIR,
@@ -1668,6 +1675,7 @@ export function createApp({
   router.add('GET', '/api/qzone-interactions/status', async (req, res) => json(res, 200, qzoneInteractions.status()));
   router.add('GET', '/api/group-game/status', async (req, res) => json(res, 200, groupGame.status()));
   router.add('GET', '/api/group-digest/status', async (req, res) => json(res, 200, groupDigest.status()));
+  registerExtensionRoutes(router, { json, readBody, keyEndpointAllowed });
   router.add('GET', '/api/tts/presets', async (req, res) => json(res, 200, { ok: true, services: TTS_SERVICES }));
   router.add('GET', '/api/identity-pilot/status', async (req, res) => json(res, 200, identityPilotStatus()));
   router.add('GET', '/api/slang-pilot/status', async (req, res) => json(res, 200, slangPilotStatus()));
@@ -2815,6 +2823,7 @@ export function createApp({
     updateConfig({ customPersonas: next });
     return json(res, 200, { ok: true, templates: next });
   });
+  registerPersonaRoutes(router, { json, readBody });
   router.add('POST', '/api/persona/reset-handoffs', async (req, res) => {
     if (!keyEndpointAllowed(req)) return json(res, 403, { error: '请求来源不被信任，已拒绝。' });
     const body = await readBody(req).catch(() => ({}));
@@ -4007,6 +4016,7 @@ export function createApp({
     if (getConfig().dailyMoments?.enabled) dailyMoments.start();
     if (getConfig().qzoneInteractions?.enabled) qzoneInteractions.start();
     if (getConfig().groupDigest?.enabled) groupDigest.start();
+    startExtensions();
     groupGame.startLoop();   // 内部按配置判断是否推进；重启后从磁盘恢复进行中的局
     if (getConfig().proactive?.enabled) orchestrator.startProactiveLoop();
     orchestrator.startScheduledWakeTicker();
@@ -4031,6 +4041,7 @@ export function createApp({
     clearTimeout(timeControlTimer);
     clearInterval(sseHeartbeat);
     releaseTimeControl();
+    stopExtensions();
     dailyMoments.stop();
     dailyMoments.abort();
     qzoneInteractions.stop();

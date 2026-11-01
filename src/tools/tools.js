@@ -15,11 +15,16 @@ import {
   executeTool as coreExecuteTool,
   toOpenAiTools as coreToOpenAiTools
 } from './tools-core.js';
+import { extensionToolDefs } from '../extensions/index.js';
 
 export * from './tools-core.js';
 
 // 显式导出覆盖 export * 中同名项；关闭实验时仍原样调用旧实现。
-export const buildToolDefs = coreBuildToolDefs;
+// 扩展工具（长期记忆 / 群聊总结 / 大肥鱼桥 / 趣味）追加在末尾：每个都带 extension 标记，
+// 关闭时由 orchestrator 的 extensionToolAvailable 过滤掉，不进模型工具表（前缀缓存不变）。
+export function buildToolDefs() {
+  return [...coreBuildToolDefs(), ...extensionToolDefs()];
+}
 
 export function toOpenAiTools(defs) {
   const tools = coreToOpenAiTools(defs);

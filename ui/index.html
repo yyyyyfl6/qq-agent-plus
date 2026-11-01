@@ -56,11 +56,17 @@
         <button class="tab active" data-icon="💬" data-tab="sessions" data-page-node-id="QA2pcdHYdARJK2APBNKZmC">会话</button>
         <button class="tab" data-icon="🗂" data-tab="chats" data-page-node-id="AdXD0D2NiWH5UBfpPQqzQ2">存档</button>
         <button class="tab" data-icon="🎛" data-tab="control" data-page-node-id="qcontrolnav">控制</button>
+        <button class="tab" data-icon="🎭" data-tab="settings" data-settings-jump="persona" title="直达 设置 → 人设：卡库、试聊、AI 起草">人格</button>
         <div class="nav-group-label">记忆</div>
         <button class="tab" data-icon="🧠" data-tab="memory" data-page-node-id="vXS9OY6wG4MkJlzQ2aLADZ">会话记忆</button>
         <button class="tab" data-icon="👥" data-tab="people-memory" data-page-node-id="qpeoplememorynav">人物记忆</button>
         <button class="tab" data-icon="🪪" data-tab="identity" data-feature-nav="identity">人物印象</button>
         <button class="tab" data-icon="🤝" data-tab="friends" data-feature-nav="auto-friend">好友管理</button>
+        <button class="tab" data-icon="📚" data-tab="ext-memory">长期记忆</button>
+        <div class="nav-group-label">扩展</div>
+        <button class="tab" data-icon="📝" data-tab="ext-summary">群聊总结</button>
+        <button class="tab" data-icon="🐟" data-tab="ext-lab">大肥鱼桥</button>
+        <button class="tab" data-icon="🎉" data-tab="ext-fun">趣味功能</button>
         <div class="nav-group-label">运行</div>
         <button class="tab" data-icon="📈" data-tab="assets" data-page-node-id="qassetobserve">观测</button>
         <button class="tab" data-icon="💰" data-tab="usage" data-page-node-id="hcZzcXuMojNoiE7UcRVYfR">用量</button>
@@ -90,6 +96,7 @@
           <span id="usage-label" class="muted" data-page-node-id="ASGoXILEnFSWWqgmj2pS4B">今日：-</span>
           <span id="search-count-label" class="muted" title="今日联网搜索次数（web_search / web_fetch）" data-page-node-id="OLNka4FykNQRaxEpBoEK6t">搜索：-</span>
         </div>
+        <button type="button" id="cp-open" class="cp-trigger" title="快速跳转（Ctrl / ⌘ + K）"><span>跳转到…</span><kbd>Ctrl K</kbd></button>
       </header>
 
       <div id="banner" class="banner hidden" data-page-node-id="XwcKf16gobwX1Rec9tqlEn"></div>
@@ -180,6 +187,20 @@
 
     <section id="view-incidents" class="view">
       <div id="incident-page" class="asset-pane"></div>
+    </section>
+
+    <!-- 扩展功能（src/extensions/*）：每个功能一个独立页面，关闭时页面仍可查看数据、修配置 -->
+    <section id="view-ext-memory" class="view">
+      <div id="ext-memory-page" class="asset-pane ext-pane"></div>
+    </section>
+    <section id="view-ext-summary" class="view">
+      <div id="ext-summary-page" class="asset-pane ext-pane"></div>
+    </section>
+    <section id="view-ext-lab" class="view">
+      <div id="ext-lab-page" class="asset-pane ext-pane"></div>
+    </section>
+    <section id="view-ext-fun" class="view">
+      <div id="ext-fun-page" class="asset-pane ext-pane"></div>
     </section>
 
     <!-- AI 资产观测 -->
@@ -304,5 +325,13 @@
   <script type="module" src="/multimodal-context-pilot.js"></script>
   <script type="module" src="/relationship-pilot.js"></script>
   <script type="module" src="/auto-update-network.js"></script>
+  <!-- 扩展功能页面 + 人格工作台 + 命令面板（外挂层，见各文件文首） -->
+  <script type="module" src="/ext-kit.js"></script>
+  <script type="module" src="/ext-long-memory.js"></script>
+  <script type="module" src="/ext-chat-summary.js"></script>
+  <script type="module" src="/ext-lab-bridge.js"></script>
+  <script type="module" src="/ext-fun-tools.js"></script>
+  <script type="module" src="/persona-studio.js"></script>
+  <script type="module" src="/command-palette.js"></script>
 </body>
 </html>
