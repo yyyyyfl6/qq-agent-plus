@@ -73,7 +73,11 @@ function assertTokenUri(sa) {
 }
 
 /** 取（必要时换新）访问令牌。到期前 5 分钟就续，同一账号并发只换一次。 */
-export async function vertexAccessToken(sa, { fetchFn = fetch, now = Date.now, signal = null } = {}) {
+export async function vertexAccessToken(sa, options = {}) {
+  // 显式取别名而不是解构参数：ops scan 的未定义调用扫描器不认识解构参数（见 console/router.js）
+  const fetchFn = options.fetchFn || fetch;
+  const now = options.now || Date.now;
+  const signal = options.signal || null;
   const cacheKey = `${sa.client_email}|${sa.private_key_id || ''}`;
   const hit = tokenCache.get(cacheKey);
   if (hit && hit.exp - now() > 5 * 60_000) return hit.token;
