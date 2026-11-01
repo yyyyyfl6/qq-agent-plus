@@ -678,7 +678,9 @@ export function createApp({
     // 索引里标了 revoked 的插件一律拒载（索引改一次，所有机器下次读到就生效）
     getIndexRevoked: indexRevokedRules,
     // 插件声明 send 能力后，发言走机器人自己那条发送队列（禁言/限频/白名单/记账全在里面）
-    getSender: () => sender
+    getSender: () => sender,
+    // 插件 v3 的主动唤醒：走编排器同一条 proactive 唤醒（白名单 / 作息 / 预算守卫都在里面）
+    getAgent: () => ({ wake: (chatKey, options) => orchestrator.wake(chatKey, options) })
   });
   // OneBot 入站新鲜度告警：连接还在但 10 分钟没有任何事件/心跳（半开连接/上游卡死）——
   // 只在主进程里看着，一次发作只通知一次，恢复后复位。
@@ -750,8 +752,6 @@ export function createApp({
     sender: {
       sendTextBatch: (chatKey, messages, options) => skins.scope(chatKey, () => sender.sendTextBatch(chatKey, messages, options))
     },
-    // 陪伴的主动消息走聊天主链路（和冷场开话题同一种 proactive 唤醒）：人设 / 记忆 / 发送全都复用
-    wake: (chatKey, options) => orchestrator.wake(chatKey, options),
     log
   });
   // 专属指令（/总结、/lab …）：与人格切换指令同一形态，唤醒前消费

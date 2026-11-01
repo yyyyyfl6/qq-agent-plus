@@ -16,14 +16,10 @@
 //   /lab 结果 N      → 第 N 个任务的输出（也认 result）
 //   /lab 取消 N      → 取消（也认 cancel）
 //   /lab ping        → 测连通
-//
-// 陪伴（companion.commands，默认「/陪伴」）：只在私聊、只认陪伴对象本人或管理员
-//   /陪伴 [状态|日程|日记 [日期/关键词]|日期]
 import { getConfig } from '../core/config.js';
 import { chatSummaryConfig } from './chat-summary.js';
 import { clipOutput, labBridgeConfig, labBridgeConfigured } from './lab-bridge.js';
 import { ownerUin } from './shared.js';
-import { companionConfig } from './companion.js';
 
 /** 文本是否以某个指令词开头（完整词：后面要么结束、要么是空白）。返回参数串或 null。 */
 export function matchCommand(text, commands) {
@@ -95,20 +91,6 @@ export class ExtensionCommands {
         if (lab.privateOnly && kind !== 'private') return false;
         if (this.#dedupe(chatKey, mid)) return true;
         await this.#runLab(chatKey, senderId, arg, mid);
-        return true;
-      }
-    }
-    const comp = companionConfig(cfg);
-    if (comp.enabled && comp.commands.length && kind === 'private') {
-      const arg = matchCommand(text, comp.commands);
-      const rt = this.getRuntimes()?.companion;
-      if (arg !== null && rt && rt.commandAllowed(chatKey, senderId, comp)) {
-        if (this.#dedupe(chatKey, mid)) return true;
-        try {
-          await this.#reply(chatKey, await rt.command(chatKey, arg));
-        } catch (error) {
-          await this.#reply(chatKey, `陪伴指令出错：${String(error?.message ?? error).slice(0, 120)}`);
-        }
         return true;
       }
     }

@@ -512,28 +512,6 @@ export const DEFAULT_CONFIG = {
     commands: ['/总结', '总结一下'],
     commandAccess: 'everyone'
   },
-  // 陪伴（移植自 AstrBot「我会永远陪着你」）：私聊日记 / 每日日程 / 重要日子 / 低频主动消息。默认关
-  companion: {
-    enabled: false,
-    targets: [],
-    proactiveEnabled: true,
-    intensity: 'normal',
-    quietStart: '23:30',
-    quietEnd: '08:00',
-    morning: true,
-    meals: true,
-    followups: true,
-    idle: true,
-    diaryEnabled: true,
-    diaryScope: 'all',
-    diaryMinMessages: 6,
-    diaryInjectDays: 3,
-    diaryRefreshHours: 3,
-    keepDays: 400,
-    scheduleEnabled: true,
-    dates: [],
-    commands: ['/陪伴']
-  },
   // 生图参考图：命中触发词时把图交给生图模型（见 src/extensions/image-refs.js）。默认关
   imageRefs: {
     enabled: false,

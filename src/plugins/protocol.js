@@ -12,7 +12,7 @@
 // 宿主 → 插件：init / callTool / observe / schedule / ping / shutdown
 // 插件 → 宿主：cap.log.write / cap.storage.get / cap.storage.set / cap.config.get / cap.http.request
 //   （`cap.` 前缀的就是"能力调用"，宿主按 manifest 声明逐条鉴权）
-export const PLUGIN_API_VERSION = 2;
+export const PLUGIN_API_VERSION = 3;
 
 export const HOST_METHODS = Object.freeze({
   init: 'init',
@@ -45,7 +45,11 @@ export const CAP_METHODS = Object.freeze({
   mediaDescribe: `${CAP_PREFIX}media.describe`,
   asrTranscribe: `${CAP_PREFIX}asr.transcribe`,
   feedPublish: `${CAP_PREFIX}feed.publish`,
-  sendFile: `${CAP_PREFIX}send.file`
+  sendFile: `${CAP_PREFIX}send.file`,
+  // ── apiVersion 3：接进连续对话工作流（src/plugins/agent-caps.js） ──
+  llmComplete: `${CAP_PREFIX}llm.complete`,
+  contextSet: `${CAP_PREFIX}context.set`,
+  wakeRequest: `${CAP_PREFIX}wake.request`
 });
 
 /** 能力方法 → 需要声明的能力名（鉴权用；漏一条就是"没声明也能用"）。 */
@@ -67,7 +71,10 @@ export const CAP_REQUIREMENT = Object.freeze({
   [CAP_METHODS.mediaDescribe]: 'media',
   [CAP_METHODS.asrTranscribe]: 'media',
   [CAP_METHODS.feedPublish]: 'feed',
-  [CAP_METHODS.sendFile]: 'send'
+  [CAP_METHODS.sendFile]: 'send',
+  [CAP_METHODS.llmComplete]: 'llm',
+  [CAP_METHODS.contextSet]: 'context',
+  [CAP_METHODS.wakeRequest]: 'wake'
 });
 
 export const MAX_LINE_BYTES = 1024 * 1024;   // 单行上限：插件不能靠"吐一大坨"把宿主内存打满

@@ -7100,45 +7100,10 @@ html[data-glass='liquid'] #view-settings .settings-pane {
 /* ── 人格页嵌在控制台里时的外层 ── */
 .skins-pane { overflow-y: auto; }
 
-/* ── 陪伴页（ext-companion.js） ── */
-.cmp-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
-.cmp-grid > .ext-card { margin: 0; }
-.cmp-timeline { list-style: none; margin: 0; padding: 0 0 0 4px; position: relative; }
-.cmp-timeline::before { content: ''; position: absolute; left: 51px; top: 6px; bottom: 6px; width: 2px; background: var(--border); border-radius: var(--r-pill); }
-.cmp-timeline li { position: relative; display: flex; align-items: baseline; gap: 22px; padding: 6px 0; font-size: var(--fs-md); color: var(--muted); }
-.cmp-timeline li::before { content: ''; position: absolute; left: 43px; top: 12px; width: 10px; height: 10px; border-radius: 50%; background: var(--bg-2); border: 2px solid var(--border-strong, var(--border)); }
-.cmp-timeline time { flex: 0 0 38px; font-family: var(--mono); font-size: var(--fs-sm); color: var(--faint); }
-.cmp-timeline li.now { color: var(--text); font-weight: 600; }
-.cmp-timeline li.now::before { background: var(--accent); border-color: var(--accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 22%, transparent); }
-.cmp-timeline em { font-style: normal; font-size: var(--fs-2xs); color: var(--accent); padding: 1px 8px; border-radius: var(--r-pill); background: color-mix(in srgb, var(--accent) 14%, transparent); }
-.cmp-target { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-top: 1px solid var(--border); }
-.cmp-target:first-of-type { border-top: 0; }
-.cmp-target-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
-.cmp-target-main .muted { font-size: var(--fs-sm); }
-.cmp-eval { font-size: var(--fs-sm); color: var(--faint); }
-.cmp-eval.go { color: var(--green); font-weight: 600; }
-.cmp-log { margin: 0; padding-left: 18px; font-size: var(--fs-sm); color: var(--muted); line-height: 1.8; }
-.cmp-diary-body { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 16px; margin-top: 6px; }
-.cmp-days { display: flex; flex-direction: column; gap: 4px; max-height: 420px; overflow: auto; padding-right: 4px; }
-.cmp-days button { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; padding: 8px 12px; border: 0; border-radius: var(--r-md); background: transparent; color: var(--text); cursor: pointer; text-align: left; font: inherit; }
-.cmp-days button b { font-size: var(--fs-md); font-family: var(--mono); }
-.cmp-days button span { font-size: var(--fs-xs); color: var(--faint); }
-.cmp-days button:hover { background: var(--hover); }
-.cmp-days button.on { background: color-mix(in srgb, var(--accent) 14%, transparent); }
-.cmp-days button.on b { color: var(--accent); }
-.cmp-entry { padding: 16px 18px; border-radius: var(--r-card); background: var(--bg); }
-.cmp-entry header { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
-.cmp-entry h3 { margin: 0; font-size: var(--fs-lg); }
-.cmp-entry h3 small { font-size: var(--fs-xs); color: var(--accent); font-weight: 500; margin-left: 6px; }
-.cmp-entry header .muted { font-size: var(--fs-xs); }
-.cmp-summary { font-size: var(--fs-md); line-height: 1.75; margin: 10px 0 4px; }
-.cmp-entry ul { margin: 0; padding-left: 18px; line-height: 1.8; font-size: var(--fs-md); }
-.cmp-follow li::marker { content: '→ '; color: var(--accent); }
+/* 勾选行（图片生成页、模型供应商弹窗共用；原「陪伴」页已改为独立插件） */
 .cmp-checks { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 4px 0 10px; }
 .cmp-check { display: inline-flex; align-items: center; gap: 8px; font-size: var(--fs-md); cursor: pointer; }
 .cmp-check input { accent-color: var(--accent); width: 16px; height: 16px; }
-.cmp-date-row { display: grid; grid-template-columns: 90px minmax(0, 2fr) minmax(0, 1fr) auto; gap: 8px; margin-bottom: 6px; }
-.cmp-date-row input { min-width: 0; }
 
 /* ── 图片生成页（ext-imagegen.js） ── */
 .ig-refs { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; margin: 10px 0 4px; }
@@ -7160,10 +7125,7 @@ html[data-glass='liquid'] #view-settings .settings-pane {
 .ig-drop:hover { border-color: var(--accent); color: var(--text); }
 .ig-drop.has span { padding: 2px 8px; border-radius: var(--r-pill); background: color-mix(in srgb, var(--bg) 80%, transparent); }
 @media (max-width: 900px) {
-  .cmp-grid, .cmp-diary-body, .ig-add { grid-template-columns: minmax(0, 1fr); }
-  .cmp-days { flex-direction: row; overflow-x: auto; max-height: none; }
-  .cmp-date-row { grid-template-columns: 80px minmax(0, 1fr) auto; }
-  .cmp-date-row [data-k="uin"] { display: none; }
+  .ig-add { grid-template-columns: minmax(0, 1fr); }
 }
 
 /* ── 设置 → 模型 API：模型供应商（provider-manager.js） ── */

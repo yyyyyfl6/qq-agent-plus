@@ -24,10 +24,10 @@
 import path from 'node:path';
 import { secretFieldKeys } from './secrets.js';
 
-export const PLUGIN_API_VERSION = 2;
+export const PLUGIN_API_VERSION = 3;
 
 /** 兼容的 manifest 版本。加载时会把这组版本一起告诉插件（plugins 可以按 version 分支）。 */
-export const SUPPORTED_API_VERSIONS = Object.freeze([1, 2]);
+export const SUPPORTED_API_VERSIONS = Object.freeze([1, 2, 3]);
 
 /** v1 能力白名单。加能力 = 加一条宿主侧实现 + 这里补一个名字（`send` 刻意不在 v1 里）。 */
 export const PLUGIN_CAPABILITIES = Object.freeze([
@@ -45,10 +45,15 @@ export const PLUGIN_CAPABILITIES = Object.freeze([
   'approval',   // 高风险动作的 owner 授权（控制台按 approvals 清单批准，可按次/按时长）
   'media',      // 宿主侧下载 / ffprobe / ffmpeg 合流（插件不执行命令）
   'quota',      // 宿主按插件/动作/天强制配额
-  'feed'        // 向生活层提交"见闻候选"（不能调模型、不能发消息；宿主决定要不要用）
+  'feed',       // 向生活层提交"见闻候选"（不能调模型、不能发消息；宿主决定要不要用）
+  // ── v3：接进连续对话工作流（见 src/plugins/agent-caps.js） ──
+  'llm',        // 用插件设置里选的「副 API」跑模型（Key 只在宿主里解析；每天有次数上限）
+  'context',    // 给会话挂背景，主模型每轮读到（放 user 内容，有过期时间）
+  'wake'        // 请主模型对某个会话主动唤醒一次（发不发由主模型决定；有间隔与每日上限）
 ]);
 
 export const V2_CAPABILITIES = Object.freeze(['secrets', 'approval', 'media', 'quota', 'feed']);
+export const V3_CAPABILITIES = Object.freeze(['llm', 'context', 'wake']);
 
 const FIELD_TYPES = Object.freeze(['text', 'number', 'boolean', 'select', 'secret']);
 const KEY_RE = /^[a-z][A-Za-z0-9_]{0,31}$/;
@@ -359,6 +364,10 @@ export function parsePluginManifest(raw, { dir = '' } = {}) {
   if (apiVersion < 2) {
     const v2 = capabilities.filter((cap) => V2_CAPABILITIES.includes(cap));
     if (v2.length) return { ok: false, error: `apiVersion 1 不能声明 ${v2.join(' / ')}（这些能力需要 apiVersion 2）` };
+  }
+  if (apiVersion < 3) {
+    const v3 = capabilities.filter((cap) => V3_CAPABILITIES.includes(cap));
+    if (v3.length) return { ok: false, error: `apiVersion ${apiVersion} 不能声明 ${v3.join(' / ')}（这些能力需要 apiVersion 3）` };
   }
 
   // entry 必须落在插件目录内：这是唯一一处把 manifest 里的字符串拿去拼路径的地方，

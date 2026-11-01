@@ -34,7 +34,12 @@ function settingsFormHtml(data) {
   const groups = data.schema?.groups || [];
   // 常驻登录徽标：打开面板就能看到“当前登录是谁”，不用点检测按钮
   const login = data.loginInfo || null;
-  const loginBadge = login
+  // 不是"登录类"插件（probe 没有 login 字段、只给一句 summary，如陪伴插件的"此刻在做什么"）：
+  // 徽标显示状态而不是"当前登录：未登录"，也不放「扫码登录」—— 那两样只对账号类插件（B 站等）有意义
+  const statusMode = Boolean(login) && login.login === undefined && typeof login.summary === 'string';
+  const loginBadge = statusMode
+    ? `<div class="pd-login-badge${login.ok === true ? ' is-on' : ''}">状态：${esc(login.summary)}</div>`
+    : login
     ? `<div class="pd-login-badge${login.login ? ' is-on' : ''}">当前登录：${login.login
       ? `${esc(String(login.uname || '已登录'))}（${new Date(Number(login.measuredAt) || Date.now()).toLocaleTimeString()} 实测有效）`
       : esc(String(login.note || '未登录'))}</div>`
@@ -132,8 +137,8 @@ function settingsFormHtml(data) {
   return `${secretError}${loginBadge}${groupsHtml}${pendingHtml}${approvalHtml}${writesHtml}
     <div class="pd-settings-actions">
       <button type="button" class="btn btn-primary btn-small" data-pd-settings-save="${esc(data.id)}">保存设置</button>
-      <button type="button" class="btn btn-small" data-pd-probe="${esc(data.id)}">检测登录</button>
-      <button type="button" class="btn btn-small" data-pd-qr-login="${esc(data.id)}">扫码登录</button>
+      <button type="button" class="btn btn-small" data-pd-probe="${esc(data.id)}">${statusMode ? '检测' : '检测登录'}</button>
+      ${statusMode ? '' : `<button type="button" class="btn btn-small" data-pd-qr-login="${esc(data.id)}">扫码登录</button>`}
       <span class="pd-settings-status" data-pd-settings-status></span>
     </div>`;
 }
@@ -388,6 +393,10 @@ async function probePlugin(id) {
     const ownerNote = info.owner?.configured
       ? (info.owner.matches ? `｜主人绑定一致（UID ${info.owner.configured}）` : `｜⚠ 当前账号不是绑定的主人 UID ${info.owner.configured}，写操作会被拒绝`)
       : '';
+    if (info.login === undefined && typeof info.summary === 'string') {
+      setSettingsStatus(id, `检测结果：${info.summary}`, info.ok === true ? 'success' : '');
+      return;
+    }
     const line = info.login === true
       ? `登录有效（${info.uname || '已登录'}${info.mid ? `，UID ${info.mid}` : ''}）${ownerNote}`
       : (info.apiOk === false ? 'B 站接口不可达' : `${String(info.note || '未登录')}${ownerNote}`);

@@ -93,23 +93,12 @@ Windows 上执行 `.cmd/.bat` 时加 `LAB_BRIDGE_SHELL=1`。接收端默认只�
 - `tarot`：22 张大阿卡纳，单张指引或过去/现在/未来三张，正逆位随机。
 - 结果由代码决定，模型只负责用自己的口吻说出来——不会同一个人一会儿 90 一会儿 12。
 
-## 陪伴（移植自 AstrBot「我会永远陪着你」）
+## 陪伴 → 改为独立插件
 
-参考：[astrbot_plugin_private_companion](https://github.com/menglimi/astrbot_plugin_private_companion)。按本项目重写，只取核心玩法；
-原插件的心情 / 精力 / 睡眠状态上游已有（`core/persona-state.js`），不重复。代码：`src/extensions/companion.js`，页面：侧栏「陪伴」。
-
-- **私聊日记（按日期）**：每个私聊每天记一篇"那天大体发生了什么"——概括、发生的事、对方状态、待跟进的事。
-  长期记忆因此不只是一张人物画像。后台每 5 分钟巡检：当天消息够数、距上次写超过 `diaryRefreshHours` 就补写（未完稿）；
-  凌晨 3 点后把昨天定稿。最近 `diaryInjectDays` 天自动进私聊的每轮上下文（放 user 内容，不动 system 前缀）；
-  更早的由模型调 `recall_diary`（按日期 `YYYY-MM-DD` / `MM-DD` 或关键词）去翻。数据：`data/companion/diary.json`。
-- **每日日程**：每天按人设排一份 6~9 段的生活日程；陪伴对象私聊时把"此刻在做的事"作为背景。
-- **重要日子**：`MM-DD + 名称（+ 只对某个 QQ）`，当天进背景并触发一次问候。
-- **低频主动问候**：候选按「重要日子 → 起床后早安 → 跟进昨天日记里的待跟进 → 饭点 → 久未联系」挑一条；
-  依次过 免打扰时段 → 每日上限（低频 1 / 适中 3 / 较勤 5）→ 距上次间隔 → **上一条没回 24 小时内不再追**。
-  真正说什么由聊天主链路决定（`orchestrator.wake(chatKey, { proactive, wakeNote })`，和冷场开话题同一条路），
-  模型判断不合适会安静结束。先记账再唤醒，失败不自动补发。
-- 指令（私聊、陪伴对象本人或管理员）：`/陪伴 状态 | 日程 | 日记 [日期或关键词] | 日期`。
-- 陪伴对象留空 = 只陪管理员（`admin.ownerUin`）。日记范围可选"所有私聊 / 只给陪伴对象"。
+「我会永远陪着你」（原作 menglimi）已改为 QQ Agent 插件，代码在
+[yyyyyfl6/astrbot_plugin_private_companion](https://github.com/yyyyyfl6/astrbot_plugin_private_companion/tree/qq-agent-port/qq-agent)
+的 `qq-agent/`（已获原作者授权）：副 API 维护角色的生活长任务并挂进私聊背景，按不规则间隔提示主模型主动联系，私聊按日期记日记。
+它依赖插件接口 apiVersion 3（`llm` / `context` / `wake`，见 [PLUGINS.md](PLUGINS.md)）。宿主里原先的内置「陪伴」页与 `companion` 配置段已移除。
 
 ## 生图参考图（提示词触发）
 
@@ -148,14 +137,14 @@ Windows 上执行 `.cmd/.bat` 时加 `LAB_BRIDGE_SHELL=1`。接收端默认只�
 | 位置 | 改动 |
 | --- | --- |
 | `src/tools/tools.js` | `buildToolDefs()` 末尾追加 `extensionToolDefs()` |
-| `src/core/orchestrator.js` | 工具过滤加 `extensionToolAvailable()`（权限判断复用上游已有的 `ctx.triggerEntries`）；每轮 user 内容加 `extensionPromptText()`（陪伴的日记 / 日程 / 重要日子） |
+| `src/core/orchestrator.js` | 工具过滤加 `extensionToolAvailable()`（权限判断复用上游已有的 `ctx.triggerEntries`）；每轮 user 内容加 `pluginContextFor()`（插件 v3 挂的背景） |
 | `src/tools/tools-core.js` | `generate_image` 调用前问一次 `getImageRefs().resolve()`，命中就带参考图 |
 | `src/llm/image-gen.js` | `generateImage({ reference })`：请求体 / `/images/edits` 两种带图形状 |
 | `src/core/providers.js` | `removeProvider` / `renameProvider`，新建可带名称 |
-| `src/console/app.js` | `initExtensions`（读写包一层 `skins.scope`；陪伴拿 `orchestrator.wake`）/ `ExtensionCommands.consume`（紧跟人格切换指令）/ 路由 / 启停；`registerPersonaRoutes` |
+| `src/console/app.js` | `initExtensions`（读写包一层 `skins.scope`）；`PluginRegistry` 的 `getAgent`（插件 v3 的主动唤醒走 `orchestrator.wake`）/ `ExtensionCommands.consume`（紧跟人格切换指令）/ 路由 / 启停；`registerPersonaRoutes` |
 | `src/core/config-legacy.js` | 三个配置段与谷歌 / Edge 搜索的默认值（全部关闭） |
 
-回滚：把各配置段（chatSummary / labBridge / funTools / companion / imageRefs）的 `enabled` 关掉即恢复原行为；数据文件保留，删掉 `data/lab-bridge/`、`data/companion/`、`data/image-refs/` 即彻底清除。
+回滚：把各配置段（chatSummary / labBridge / funTools / imageRefs）的 `enabled` 关掉即恢复原行为；数据文件保留，删掉 `data/lab-bridge/`、`data/image-refs/` 即彻底清除。
 
 ## 界面
 

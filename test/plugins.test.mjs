@@ -43,7 +43,7 @@ test('manifest 校验 fail-closed：坏形状逐一被拒，并给出可读原�
   const dir = path.join(FIXTURES, 'good');
   const cases = [
     [{ ...base, id: 'Bad_Id' }, /id 只能是/],
-    [{ ...base, apiVersion: 3 }, /apiVersion 不匹配/],
+    [{ ...base, apiVersion: 4 }, /apiVersion 不匹配/],
     [{ ...base, name: '' }, /name 不能为空/],
     [{ ...base, version: 'v1' }, /version 必须是/],
     [{ ...base, capabilities: [] }, /capabilities 必须是非空数组/],

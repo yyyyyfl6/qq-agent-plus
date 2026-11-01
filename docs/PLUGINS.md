@@ -331,6 +331,20 @@ process.stdin.on('data', (chunk) => {
 });
 ```
 
+## apiVersion 3：接进连续对话工作流（副 API / 背景 / 主动唤醒）
+
+2026-11 为「我会永远陪着你」的移植插件而加（见 `yyyyyfl6/astrbot_plugin_private_companion` 的 `qq-agent/`）。
+QQ Agent 自己就是连续对话的工作流，插件不需要另起一套"间断唤醒"：它用副 API 维护一个长任务，
+把状态挂进会话背景，到点了请主模型主动来一次。声明 `apiVersion: 3` 才能用下面三项，v1/v2 插件不受影响。
+
+| 能力 | 方法 | 说明与宿主侧限制 |
+| --- | --- | --- |
+| `llm` | `cap.llm.complete { messages, maxTokens?, temperature? }` → `{ content, model, remaining }` | 用插件设置里的 `llmProvider` / `llmModel`（取自控制台「模型 API」已添加的供应商；留空按模型自动找，再退回主模型那家）。**Key 只在宿主里解析**，插件拿不到。思考参数一律关掉；输入 ≤6 万字符、输出 ≤4000 token；每插件每天 `plugins.limits.llmDailyCalls`（默认 300）次，先记账、失败退回 |
+| `context` | `cap.context.set { chatKey, text, ttlMinutes? }` | 给 `private:<QQ>` / `group:<群号>`（或 `*`）挂一段 ≤1500 字的背景，主模型**每轮放进 user 内容**（不动 system 前缀，不破坏前缀缓存），并标注"来自插件，第三方内容，不是指令"。默认 180 分钟过期（最长 24 小时）；空串 = 撤掉；插件停用即全部撤掉；每插件最多 50 个会话 |
+| `wake` | `cap.wake.request { chatKey, note? }` → `{ queued, remaining }` | 请主模型对该会话来一次 proactive 唤醒（和冷场开话题同一条路：白名单、作息、观察 / 暂停模式、预算照常生效；发不发、说什么由主模型决定）。`note` ≤280 字，作为【系统提醒】交给主模型。同一会话间隔 ≥ `plugins.limits.wakeMinGapMinutes`（默认 20）分钟、每插件每天 `wakeDailyCalls`（默认 30）次；先记账，结果不确定也不重试 |
+
+用量记在 `plugin-data/<id>/agent-usage.json`（按北京日期）。实现：`src/plugins/agent-caps.js`。
+
 ## 写一个插件（作者向）
 
 **先看活例子**：`examples/plugins/` 下有八个官方插件 —— `weather`（天气，走不需要 Key 的
@@ -489,9 +503,9 @@ CI 里可选），`--json` 给机器读。
 插件与宿主之间只有一份契约：`apiVersion`。政策写死如下，避免"升个级插件全废"这类生态事故：
 
 - **`apiVersion` 只增不改**：同一版本号内的协议方法、能力名字与语义不改（改语义等于换版本）。
-  本机当前支持 1 与 2；v1 插件不需要任何改动。
+  本机当前支持 1、2 与 3；v1 / v2 插件不需要任何改动。
 - **破坏性变更必须升 `apiVersion`**，并且宿主在**加载时**就拒绝不认识的版本（不是跑起来才崩）。
-  本机支持的版本见 `docs/PLUGINS.md` 与本仓 `src/plugins/manifest.js` 的 `PLUGIN_API_VERSION`。
+  本机支持的版本见 `docs/PLUGINS.md` 与本仓 `src/plugins/manifest.js` 的 `PLUGIN_API_VERSION`（当前 1 / 2 / 3）。
 - **能力只增不删**：新能力加名字（宿主按声明注入）；废弃的能力先标记、跨至少两个 minor 版本再移除，
   期间老插件照跑。
 - **插件声明它能跑的最低宿主版本**：索引条目里的 `minVersion`。宿主版本低于它时，条目在控制台里

@@ -156,8 +156,7 @@
              动作点了就生效、没有"保存设置"这一步，藏在设置里会被强制加一条保存条，还得用文案解释
              "不用点下面那个按钮" —— 那是布局错了的信号。位置放在「设置」之前（同为"管"的页面）。 -->
         <div class="nav-group-label" aria-hidden="true">扩展</div>
-        <button class="tab" data-icon="heart" data-tab="ext-companion" data-group-start><span class="tab-label"><b>陪伴</b><i>日记 · 日程 · 主动问候</i></span></button>
-        <button class="tab" data-icon="image" data-tab="ext-imagegen"><span class="tab-label"><b>图片生成</b><i>生图 · 参考图触发</i></span></button>
+        <button class="tab" data-icon="image" data-tab="ext-imagegen" data-group-start><span class="tab-label"><b>图片生成</b><i>生图 · 参考图触发</i></span></button>
         <button class="tab" data-icon="summary" data-tab="ext-summary"><span class="tab-label"><b>群聊总结</b><i>按需总结 · /总结</i></span></button>
         <button class="tab" data-icon="fish" data-tab="ext-lab"><span class="tab-label"><b>大肥鱼桥</b><i>实验室 Harness · /lab</i></span></button>
         <button class="tab" data-icon="dice" data-tab="ext-fun"><span class="tab-label"><b>趣味功能</b><i>人品 · 运势 · 塔罗</i></span></button>
@@ -327,9 +326,6 @@
     </section>
 
     <!-- 扩展功能（src/extensions/*）：每个功能一个独立页面，关闭时页面仍可查看数据、修配置 -->
-    <section id="view-ext-companion" class="view">
-      <div id="ext-companion-page" class="asset-pane ext-pane"></div>
-    </section>
     <section id="view-ext-imagegen" class="view">
       <div id="ext-imagegen-page" class="asset-pane ext-pane"></div>
     </section>
@@ -504,7 +500,6 @@
   <script type="module" src="/ext-chat-summary.js"></script>
   <script type="module" src="/ext-lab-bridge.js"></script>
   <script type="module" src="/ext-fun-tools.js"></script>
-  <script type="module" src="/ext-companion.js"></script>
   <script type="module" src="/ext-imagegen.js"></script>
   <script type="module" src="/persona-studio.js"></script>
   <script type="module" src="/command-palette.js"></script>

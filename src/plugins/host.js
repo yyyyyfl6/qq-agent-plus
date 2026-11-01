@@ -14,6 +14,7 @@ import {
 } from './protocol.js';
 import { pluginLaunchSpec, probeIsolation, networkIsolationSupported } from './isolation.js';
 import { createCapabilities } from './capabilities.js';
+import { clearPluginContext, createAgentCapabilities } from './agent-caps.js';
 
 // 默认时间参数：测试会覆盖成小值，生产用这一套。
 export const HOST_DEFAULTS = Object.freeze({
@@ -51,7 +52,7 @@ export class PluginHost {
    * @param deps     注入点（测试用）：spawn / spawnSyncImpl / checkEntry / now
    */
   constructor({
-    manifest, dataDir, log = () => {}, getSettings = () => ({}), getSender = () => null,
+    manifest, dataDir, log = () => {}, getSettings = () => ({}), getSender = () => null, getAgent = () => null,
     spawn = spawnChild, spawnSyncImpl = spawnSync, nodePath = process.execPath,
     timeouts = {}, capabilities = null, now = () => Date.now(), requireIsolation = true,
     networkIsolation = true, requireNetworkIsolation = false, limits = {},
@@ -87,6 +88,11 @@ export class PluginHost {
       approveAll, httpMock,
       getSender      // send 能力用：插件发言必须走机器人自己那条队列（守卫全在里面）
     });
+    // v3：副 API / 背景挂载 / 主动唤醒（只有声明了对应能力才会被鉴权放行，见 #onCapability）
+    if (!capabilities && (manifest.capabilities || []).some((cap) => ['llm', 'context', 'wake'].includes(cap))) {
+      this.agentCaps = createAgentCapabilities({ pluginId: this.id, manifest, dataDir, getSettings, getAgent, log, now, limits: this.limits });
+      Object.assign(this.caps.methods, this.agentCaps.methods);
+    }
 
     this.state = 'idle';           // idle | starting | running | stopping | stopped | failed
     this.starting = false;         // 重入保护（与 state 分开：崩溃重启时 state 也是 starting）
@@ -388,6 +394,7 @@ export class PluginHost {
       this.state = 'stopped';
     }
     this.caps.flush();
+    clearPluginContext(this.id);   // 停用即撤掉它挂在会话上的背景
   }
 
   /** 等某个子进程退出（最多 ms 毫秒）。已经退了的立刻返回。 */

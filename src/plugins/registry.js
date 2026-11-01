@@ -97,7 +97,8 @@ export class PluginRegistry {
    */
   constructor({
     root, dataDir, log = () => {}, getConfig = () => ({}), hostFactory = null, timeouts = {},
-    probe = probeIsolation, scheduleIntervalMs = 15000, getIndexRevoked = () => [], getSender = () => null
+    probe = probeIsolation, scheduleIntervalMs = 15000, getIndexRevoked = () => [], getSender = () => null,
+    getAgent = () => null
   } = {}) {
     this.root = root;
     this.dataDir = dataDir;
@@ -114,6 +115,8 @@ export class PluginRegistry {
     // 发送队列（插件声明 send 能力后由宿主注入）：**必须是机器人自己那条队列** ——
     // 插件发言要与非活跃时间、观察/暂停模式、群白名单、禁言预检、限频、outbox 记账共用同一套守卫。
     this.getSender = typeof getSender === 'function' ? getSender : () => null;
+    // v3：主链路（主动唤醒）。由控制台注入 orchestrator；测试 / plugin-dev 里没有就拒绝 wake
+    this.getAgent = typeof getAgent === 'function' ? getAgent : () => null;
     this.hosts = new Map();      // id -> PluginHost
     this.discovered = [];        // [{ id, dir, manifest, error }]
     this.opChain = Promise.resolve(); // 起停/重载/安装的串行队列（见 #serialize）
@@ -342,6 +345,7 @@ export class PluginRegistry {
         requireNetworkIsolation: cfg.requireNetworkIsolation,
         limits: cfg.limits,
         getSender: () => this.getSender(),
+        getAgent: () => this.getAgent(),
         getSettings: () => this.#config().settings[item.id] ?? {}
       });
   }
