@@ -113,7 +113,7 @@ import { readProactiveAttempts, readProactiveState, writeProactiveAttempt, write
 import { buildSystemPrompt, buildUserPrompt, isAtMe, resolveContextTier } from '../llm/prompt.js';
 import { chatCompletion, chatCompletionWithRetry, addUsage, emptyUsage, isRetryableError } from '../llm/llm.js';
 import { buildToolDefs, toOpenAiTools, executeTool, platformToolAllowed } from '../tools/tools.js';
-import { extensionToolAvailable } from '../extensions/index.js';
+import { extensionPromptText, extensionToolAvailable } from '../extensions/index.js';
 import { normalizeMid } from '../tools/tools-core.js';
 import { skillGateMessage } from '../skills/registry.js';
 import { visionEnabled } from '../llm/vision-scan.js';
@@ -2138,6 +2138,8 @@ export class Orchestrator {
     const humanLines = [
       personaStateLine,
       livingRecall.text,
+      // 扩展背景（陪伴：私聊日记 / 今日日程 / 重要日子）；与长期记忆同理放 user 内容，不动 system 前缀
+      extensionPromptText(chatKey),
       memeDensityPrompt(cfg),
       memesForPrompt(chatKey, triggerText, { level: cfg?.humanize?.memeUse?.level })
     ].filter(Boolean).join('\n\n');

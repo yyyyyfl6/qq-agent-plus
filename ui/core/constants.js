@@ -296,6 +296,9 @@ const MODEL_SERVICES_UI = [
   { id: 'opencode', label: 'OpenCode（Go 订阅）', baseUrl: 'https://opencode.ai/zen/go/v1', hosts: ['opencode.ai', 'api.opencode.ai'], levels: ['low', 'medium', 'high', 'max'], canDisable: null,
     defaultNote: '随模型（官方客户端文档：OpenAI 系约 none…xhigh）',
     note: '官方文档（客户端）：用 OpenAI 风格 reasoningEffort（Anthropic 系则是 thinking.budgetTokens）；但 Zen/Go 的 API 请求字段未文档化——先「测试思考能力」实测，不接受会被安全兜底自动去掉。Go 订阅模型名形如 opencode-go/xxx；非 Go 订阅改地址为 https://zen/v1 见官网。' },
+  { id: 'vertex', label: 'Google Vertex AI（服务账号 JSON）', baseUrl: 'https://aiplatform.googleapis.com/v1/projects/{project}/locations/global/endpoints/openapi', hosts: ['aiplatform.googleapis.com'], levels: ['low', 'medium', 'high'], canDisable: null,
+    keyKind: 'service-account',
+    note: 'API Key 一栏粘贴整份服务账号 JSON（需要「Vertex AI 用户」角色）；{project} 自动换成 JSON 里的 project_id。模型例：google/gemini-2.5-flash、google/gemini-2.5-pro。只连 Google 官方域名，用的是你 GCP 项目的额度 / 赠金。' },
   { id: 'custom', label: '自定义 / 自建（OpenAI 兼容）', baseUrl: '', hosts: [], levels: [], canDisable: null,
     note: '表外渠道：填你的服务地址；档位可在「自定义档位映射」里自定义（填了就会出档位条），其余参数用「额外请求参数」。' }
 ];

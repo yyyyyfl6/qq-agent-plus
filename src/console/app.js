@@ -750,6 +750,8 @@ export function createApp({
     sender: {
       sendTextBatch: (chatKey, messages, options) => skins.scope(chatKey, () => sender.sendTextBatch(chatKey, messages, options))
     },
+    // 陪伴的主动消息走聊天主链路（和冷场开话题同一种 proactive 唤醒）：人设 / 记忆 / 发送全都复用
+    wake: (chatKey, options) => orchestrator.wake(chatKey, options),
     log
   });
   // 专属指令（/总结、/lab …）：与人格切换指令同一形态，唤醒前消费
@@ -2360,7 +2362,7 @@ export function createApp({
   router.add('GET', '/api/qzone-interactions/status', async (req, res) => json(res, 200, qzoneInteractions.status()));
   router.add('GET', '/api/group-game/status', async (req, res) => json(res, 200, groupGame.status()));
   router.add('GET', '/api/group-digest/status', async (req, res) => json(res, 200, groupDigest.status()));
-  registerExtensionRoutes(router, { json, readBody, keyEndpointAllowed });
+  registerExtensionRoutes(router, { json, readBody, keyEndpointAllowed, generateImage, resolveApiKey });
   router.add('GET', '/api/admin-briefing/status', async (req, res) => json(res, 200, adminBriefing.status()));
   router.add('GET', '/api/tts/presets', async (req, res) => json(res, 200, { ok: true, services: TTS_SERVICES }));
   // 「平台能力」页的元数据：键 → 标签 / 它管的工具 / 默认取向（"默认关"的三项在 UI 上要标注）。

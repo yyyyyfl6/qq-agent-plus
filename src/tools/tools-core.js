@@ -5,6 +5,7 @@
 // 工具命名去掉了 qq_ 前缀（更短，省 token）。
 import crypto from 'node:crypto';
 import { getConfig, imageGenAvailable, imageGenMaxPerHour } from '../core/config.js';
+import { getImageRefs } from '../extensions/image-refs.js';
 import { imageType } from '../core/image-type.js';
 import { nextAtFromHHMM, normalizeRepeat, nextOccurrenceAt } from '../core/reminders.js';
 import { synthesizeSpeech, ttsConfigured } from '../llm/tts.js';
@@ -804,7 +805,8 @@ export function buildToolDefs() {
         properties: {
           prompt: { type: 'string', description: '画面描述：主体 + 风格 + 氛围（如"一只橘猫戴着草帽坐在海边，卡通风格"）' },
           note: { type: 'string', description: '可选：给这张图起的短语（存进表情库便于以后找）' },
-          send: { type: 'boolean', description: '传 false：这次只存进表情库、不发送；不传时按图片生成设置里的「生成后直接发送」处理' }
+          send: { type: 'boolean', description: '传 false：这次只存进表情库、不发送；不传时按图片生成设置里的「生成后直接发送」处理' },
+          reference: { type: 'string', description: '可选：参考图名称。配置了参考图时，对方的话命中触发词（如"画你自己"）会自动带上，一般不用填' }
         },
         required: ['prompt']
       },
@@ -828,16 +830,24 @@ export function buildToolDefs() {
               ? '本会话的画图额度用完了（每小时有上限），过一会儿再画'
               : '画图额度用完了（全局每小时有上限，这是按张计费的）');
           }
-          let buffer; let revisedPrompt;
+          let buffer; let revisedPrompt; let referenceNote;
           const label = String(args.note || '').trim() || prompt;
           let entry;
+          // 参考图：对方原话（或模型写的画面描述）命中触发词时，把那张图一起交给生图模型
+          const ref = getImageRefs()?.resolve({
+            userText: String(ctx.session?.triggerText || ''),
+            prompt,
+            reference: String(args.reference || ''),
+            model: cfg.imageGen?.model
+          }) || null;
           try {
-            ({ buffer, revisedPrompt } = await generateImage({
+            ({ buffer, revisedPrompt, referenceNote } = await generateImage({
               cfg,
               apiCfg: cfg.api,
               apiKey: resolveApiKey(cfg),
               prompt,
-              signal: ctx.signal
+              signal: ctx.signal,
+              reference: ref ? { buffer: ref.buffer, mime: ref.mime, mode: ref.mode, field: ref.field, hint: ref.item.hint } : null
             }));
             // 落库：走与"控制台上传的自定义表情"同一条路（addManual 自己校验格式与体积并落盘）
             entry = ctx.stickers.addManual({
@@ -861,6 +871,7 @@ export function buildToolDefs() {
               note: entry.localNote,
               sent: false,
               kind: '已存进表情库（未发送）',
+              ...(ref ? { reference: referenceNote || `参考了「${ref.item.label}」` } : {}),
               next: '需要发送时用 send_sticker 传这个 id'
             });
           }
@@ -883,6 +894,7 @@ export function buildToolDefs() {
               note: entry.localNote,
               sent: true,
               messageId: sent?.message_id ?? null,
+              ...(ref ? { reference: referenceNote || `参考了「${ref.item.label}」` } : {}),
               kind: '已发送并存入表情库'
             });
           } catch (error) {

@@ -138,12 +138,17 @@ export async function generateImage({
   prompt,
   signal = null,
   fetchFn = fetch,
-  modelscopePollMs = MODELSCOPE_POLL_MS
+  modelscopePollMs = MODELSCOPE_POLL_MS,
+  // 参考图（extensions/image-refs.js）：{ buffer, mime, mode: 'body'|'edits', field, hint }
+  reference = null
 } = {}) {
   const g = cfg?.imageGen || cfg || {};
   const base = imageGenBaseUrl(g, apiCfg);
   const model = String(g.model || '').trim();
-  const body = String(prompt || '').trim().slice(0, MAX_PROMPT_CHARS);
+  const refHint = reference?.buffer?.length
+    ? `（请参考所给图片里的形象${reference.hint ? `：${String(reference.hint).slice(0, 160)}` : '，保持外貌特征一致'}）`
+    : '';
+  const body = `${String(prompt || '').trim()}${refHint}`.trim().slice(0, MAX_PROMPT_CHARS);
   if (!base) throw new Error('未配置图片生成的服务地址（设置 → 图片生成；留空表示与聊天模型同一家，那边也要有地址）');
   if (!model) throw new Error('未配置图片生成的模型（如 gpt-image-1 / seedream-3.0）');
   if (!body) throw new Error('生图提示词为空');
@@ -179,28 +184,56 @@ export async function generateImage({
   try {
     // 免 Key 的 pollinations 形状单独走一条：提示词在 URL 路径里、GET 取图字节
     // （它那个长得像 OpenAI 的 POST /openai/images/generations **不看 body**，别用）
+    const hasRef = Boolean(reference?.buffer?.length);
     if (preset?.shape === 'pollinations') {
-      return await pollinationsImage({ base, body, model, size, controller, fetchFn });
+      const out = await pollinationsImage({ base, body: String(prompt || '').trim().slice(0, MAX_PROMPT_CHARS), model, size, controller, fetchFn });
+      return hasRef ? { ...out, referenceNote: '这家服务不支持参考图，按纯文字画的' } : out;
     }
     if (preset?.shape === 'modelscope') {
-      return await modelscopeImage({ base, body, model, size, extra, auth, controller, fetchFn, pollMs: modelscopePollMs });
+      const refExtra = hasRef ? { image_url: [`data:${reference.mime || 'image/png'};base64,${reference.buffer.toString('base64')}`] } : {};
+      return await modelscopeImage({ base, body, model, size, extra: { ...extra, ...refExtra }, auth, controller, fetchFn, pollMs: modelscopePollMs });
     }
-    const res = await fetchFn(`${base}/images/generations`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(auth.key ? { authorization: `Bearer ${auth.key}` } : {})
-      },
-      body: JSON.stringify({
-        model,
-        prompt: body,
-        n: 1,
-        ...formatParam,
-        ...(size ? { size } : {}),
-        ...requestExtra
-      }),
-      signal: controller.signal
-    });
+    let res;
+    if (hasRef && reference.mode === 'edits') {
+      // OpenAI 形状的图像编辑：multipart，image 是文件。额外参数只带标量（multipart 放不了嵌套对象）。
+      const form = new FormData();
+      form.append('model', model);
+      form.append('prompt', body);
+      form.append('n', '1');
+      if (size) form.append('size', size);
+      if (formatParam.response_format) form.append('response_format', formatParam.response_format);
+      for (const [key, value] of Object.entries(requestExtra)) {
+        if (['string', 'number', 'boolean'].includes(typeof value)) form.append(key, String(value));
+      }
+      const mime = reference.mime || 'image/png';
+      form.append('image', new Blob([reference.buffer], { type: mime }), `reference.${mime.split('/')[1] || 'png'}`);
+      res = await fetchFn(`${base}/images/edits`, {
+        method: 'POST',
+        headers: { ...(auth.key ? { authorization: `Bearer ${auth.key}` } : {}) },
+        body: form,
+        signal: controller.signal
+      });
+    } else {
+      const field = /^[a-z_][a-z0-9_]{0,30}$/i.test(String(reference?.field || '')) ? reference.field : 'image';
+      const refBody = hasRef ? { [field]: `data:${reference.mime || 'image/png'};base64,${reference.buffer.toString('base64')}` } : {};
+      res = await fetchFn(`${base}/images/generations`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(auth.key ? { authorization: `Bearer ${auth.key}` } : {})
+        },
+        body: JSON.stringify({
+          model,
+          prompt: body,
+          n: 1,
+          ...formatParam,
+          ...(size ? { size } : {}),
+          ...refBody,
+          ...requestExtra
+        }),
+        signal: controller.signal
+      });
+    }
     const text = await readTextBounded(res, IMAGE_RESPONSE_MAX_BYTES);
     let parsed = null;
     try { parsed = JSON.parse(text); } catch { /* 下面按原文报错 */ }

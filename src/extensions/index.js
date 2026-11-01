@@ -9,16 +9,22 @@
 import { ChatSummaryRuntime, chatSummaryToolDefs, registerChatSummaryRoutes } from './chat-summary.js';
 import { LabBridgeRuntime, labBridgeToolDefs, registerLabBridgeRoutes } from './lab-bridge.js';
 import { funToolDefs, registerFunToolsRoutes } from './fun-tools.js';
+import { CompanionRuntime, companionToolDefs, registerCompanionRoutes } from './companion.js';
+import { ImageRefs, registerImageRefsRoutes } from './image-refs.js';
 
 const runtimes = {
   chatSummary: null,
-  labBridge: null
+  labBridge: null,
+  companion: null,
+  imageRefs: null
 };
 
-export function initExtensions({ dataDir, store, sender, log = console.log } = {}) {
-  // 各模块自己的日志都带 [chat-summary] / [lab-bridge] 前缀
+export function initExtensions({ dataDir, store, sender, wake = null, log = console.log } = {}) {
+  // 各模块自己的日志都带 [chat-summary] / [lab-bridge] / [companion] 前缀
   runtimes.chatSummary = new ChatSummaryRuntime({ store, sender, log });
   runtimes.labBridge = new LabBridgeRuntime({ dataDir, sender, log });
+  runtimes.companion = new CompanionRuntime({ dataDir, store, wake, log });
+  runtimes.imageRefs = new ImageRefs({ dataDir });
   return runtimes;
 }
 
@@ -28,17 +34,29 @@ export function extensionRuntimes() {
 
 export function startExtensions() {
   runtimes.labBridge?.start();
+  runtimes.companion?.start();
 }
 
 export function stopExtensions() {
   runtimes.labBridge?.stop();
+  runtimes.companion?.stop();
+}
+
+/** 每轮注入 user 内容的扩展背景（陪伴：私聊日记 / 今日日程 / 重要日子）。失败返回空串，不影响聊天。 */
+export function extensionPromptText(chatKey) {
+  try {
+    return runtimes.companion?.promptText(chatKey) || '';
+  } catch {
+    return '';
+  }
 }
 
 export function extensionToolDefs() {
   return [
     ...chatSummaryToolDefs(() => runtimes.chatSummary),
     ...labBridgeToolDefs(() => runtimes.labBridge),
-    ...funToolDefs()
+    ...funToolDefs(),
+    ...companionToolDefs(() => runtimes.companion)
   ];
 }
 
@@ -47,6 +65,7 @@ export function extensionToolAvailable(def, { cfg, kind, chatKey } = {}) {
   if (!def?.extension) return true;
   if (def.extension === 'chatSummary' && !runtimes.chatSummary) return false;
   if (def.extension === 'labBridge' && !runtimes.labBridge) return false;
+  if (def.extension === 'companion' && !runtimes.companion) return false;
   try {
     return typeof def.available === 'function' ? def.available({ cfg, kind, chatKey }) === true : true;
   } catch {
@@ -58,4 +77,6 @@ export function registerExtensionRoutes(router, deps) {
   registerChatSummaryRoutes(router, { ...deps, getRuntime: () => runtimes.chatSummary });
   registerLabBridgeRoutes(router, { ...deps, getRuntime: () => runtimes.labBridge });
   registerFunToolsRoutes(router, deps);
+  registerCompanionRoutes(router, { ...deps, getRuntime: () => runtimes.companion });
+  registerImageRefsRoutes(router, { ...deps, getRuntime: () => runtimes.imageRefs });
 }
