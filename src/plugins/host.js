@@ -261,6 +261,20 @@ export class PluginHost {
     return this.#request(HOST_METHODS.probe, {}, Math.min(15000, this.timeouts.callTimeoutMs));
   }
 
+  /** v3 入站 HTTP：把一条外部请求交给插件（宿主已做路径 / 体积 / 频率校验），插件回 { status, body }。 */
+  async inbound(request, { timeoutMs = 10000 } = {}) {
+    const maxConcurrency = Math.max(1, Number(this.limits.concurrency) || 4);
+    if (this.inFlight >= maxConcurrency) {
+      throw Object.assign(new Error(`插件 ${this.id} 并发已满`), { code: 'E_BUSY' });
+    }
+    this.inFlight += 1;
+    try {
+      return await this.#request(HOST_METHODS.inbound, request, timeoutMs);
+    } finally {
+      this.inFlight = Math.max(0, this.inFlight - 1);
+    }
+  }
+
   /** 让插件执行一个工具调用。超时/进程不可用/超频都会抛带 code 的错误。 */
   async callTool(name, args, { timeoutMs, context = null } = {}) {
     this.#allowCall('callTool');

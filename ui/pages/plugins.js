@@ -40,7 +40,7 @@ const CAP_LABELS = {
   approval: '高风险动作需批准',
   media: '下载与转码媒体',
   quota: '受每日配额限制',
-  feed: '提供见闻候选', llm: '用副 API 调模型', context: '给会话挂背景', wake: '请求主动唤醒'
+  feed: '提供见闻候选', llm: '用副 API 调模型', context: '给会话挂背景', wake: '请求主动唤醒', inbound: '接收设备推送'
 };
 
 // 「发布插件」里那三条路的地址：**一处定义**（页面与用例引用同一份，改仓库名不会两边对不上）。
@@ -55,7 +55,7 @@ const PUBLISH = {
 const CAP_ICONS = {
   tools: 'sliders', observe: 'chat', schedule: 'clock', http: 'globe',
   log: 'file', storage: 'database', config: 'gear', send: 'zap',
-  secrets: 'idcard', approval: 'shield', media: 'play', quota: 'gauge', feed: 'chat', llm: 'sparkles', context: 'file', wake: 'clock'
+  secrets: 'idcard', approval: 'shield', media: 'play', quota: 'gauge', feed: 'chat', llm: 'sparkles', context: 'file', wake: 'clock', inbound: 'globe'
 };
 
 // 权限的"人话解释"：市场页面靠这一栏让使用者判断"要不要信它"。CAP_LABELS 是短词（卡面/台账用），
@@ -73,7 +73,7 @@ const CAP_DETAILS = {
   approval: '高风险动作需批准：点赞/评论这类写操作要先由管理员在插件详情里批准，过期或次数用完自动失效',
   media: '下载与转码媒体：下载与 ffmpeg 合流都由宿主执行（插件进程不能自己跑命令），有体积上限',
   quota: '受每日配额限制：宿主按插件+动作+当天计数，超过上限直接拒绝',
-  feed: '提供见闻候选：把条目提交给生活层队列（不能调模型、不能直接发消息；机器人自己决定用不用）', llm: '用副 API 调模型：按它设置里选的供应商 / 模型（取自「模型 API」里已添加的供应商）跑后台任务；Key 只在宿主里用，插件拿不到；每天有次数上限，会产生费用', context: '给会话挂背景：它能给指定会话挂一段文字，主模型每轮都会读到（按第三方背景对待，不当指令；有过期时间，停用插件即撤掉）', wake: '请求主动唤醒：它能请主模型对某个会话主动来一次（发不发、说什么由主模型决定；白名单、作息、预算照常生效；有间隔与每日上限）'
+  feed: '提供见闻候选：把条目提交给生活层队列（不能调模型、不能直接发消息；机器人自己决定用不用）', llm: '用副 API 调模型：按它设置里选的供应商 / 模型（取自「模型 API」里已添加的供应商）跑后台任务；Key 只在宿主里用，插件拿不到；每天有次数上限，会产生费用', context: '给会话挂背景：它能给指定会话挂一段文字，主模型每轮都会读到（按第三方背景对待，不当指令；有过期时间，停用插件即撤掉）', wake: '请求主动唤醒：它能请主模型对某个会话主动来一次（发不发、说什么由主模型决定；白名单、作息、预算照常生效；有间隔与每日上限）', inbound: '接收设备推送：手机等外部设备可以直接向它发数据（/plugin-hooks/<id>/…，可开独立端口；不走控制台令牌，由插件自己校验配对令牌；宿主限体积与频率）'
 };
 
 const STATE_LABELS = {

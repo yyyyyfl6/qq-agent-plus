@@ -62,6 +62,7 @@ import { resolveOfficialPrice, listOfficialPrices, listModelAliases, isPeakHour,
 import { initPriceFeed, refreshPriceFeed, priceFeedStatus } from '../pricing/price-feed.js';
 import { probeChannelPrices, capPrices } from '../pricing/price-probe.js';
 import { initChannelPrices, refreshChannelFeed, removeChannelFeed, channelPriceStatus, maybeAutoProbeChannel } from '../pricing/channel-prices.js';
+import { createInboundHandler } from '../plugins/inbound.js';
 import { currentProviders, setProviderKey, testAllProviders, testOneProvider, testModelChat, probeThinking, fetchModelsFrom, upsertProvider, addModelsToProvider, removeModelFromProvider, removeProvider, renameProvider } from '../core/providers.js';
 import { personaStateSnapshot } from '../core/persona-state.js';
 import { resolvePersona } from '../personas.js';
@@ -682,6 +683,10 @@ export function createApp({
     // 插件 v3 的主动唤醒：走编排器同一条 proactive 唤醒（白名单 / 作息 / 预算守卫都在里面）
     getAgent: () => ({ wake: (chatKey, options) => orchestrator.wake(chatKey, options) })
   });
+  // 插件 v3 的入站 HTTP（/plugin-hooks/<id>/…）：手机等外部设备推数据给插件。不走控制台令牌，
+  // 鉴权由插件做；宿主在 src/plugins/inbound.js 里限体积 / 频率、只转发白名单请求头。
+  const pluginInbound = createInboundHandler({ getRegistry: () => pluginRegistry, getConfig, log: moduleLog('plugins') });
+  let pluginInboundServer = null;
   // OneBot 入站新鲜度告警：连接还在但 10 分钟没有任何事件/心跳（半开连接/上游卡死）——
   // 只在主进程里看着，一次发作只通知一次，恢复后复位。
   {
@@ -6233,6 +6238,7 @@ export function createApp({
 
   async function handleHttp(req, res) {
     // 全部 API 路由都在路由表里；未命中的 /api/ 由表的 fallthrough 回 404（文案与旧一致）
+    if (String(req.url || '').startsWith('/plugin-hooks/') && await pluginInbound.handle(req, res)) return;
     if (await router.handle(req, res)) return;
     const pathname = new URL(req.url, 'http://127.0.0.1').pathname;
 
@@ -6425,6 +6431,8 @@ export function createApp({
       const rulesBeforeStart = [...indexRevokedRules()].sort().join('\n');
       await pluginRegistry.start();
       pluginsStarted = true;
+      // 独立入站端口（plugins.inbound.listen）：只提供插件路径，控制台仍只在本机 / 隧道里
+      pluginInboundServer = pluginInbound.listen();
       // 暖加载可能恰好在 start 期间完成（pluginsStarted 还是 false，那次没有触发重排）：
       // 启动完成后再比一次，名单变了就按新名单重排
       const rulesAfterStart = [...indexRevokedRules()].sort().join('\n');
@@ -6484,6 +6492,8 @@ export function createApp({
     adminBriefing.stop();
     // 插件子进程要在 onebot 关闭之前停掉：停机后不该再有插件在读消息
     mcpManager.stop();
+    await pluginInboundServer?.close().catch(() => {});
+    pluginInboundServer = null;
     await pluginRegistry.stop();
     await qzoneInteractions.abort();
     autoUpdate.stop();

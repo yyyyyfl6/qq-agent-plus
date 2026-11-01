@@ -774,6 +774,9 @@ export const DEFAULT_CONFIG = {
   plugins: {
     // 总开关。关着 = 一个插件都不加载（装了但不开也是这样，落地没有任何副作用）。
     enabled: false,
+    // 插件 v3 入站 HTTP 的独立端口（只提供 /plugin-hooks/…，不暴露控制台）。默认关。
+    // defaultPlugin：根路径（/pair、/status …）交给哪个插件 —— 手机陪伴终端用 http://服务器:6322 直连。
+    inbound: { listen: false, host: '0.0.0.0', port: 6322, defaultPlugin: '' },
     // 允许运行的插件 id。**默认空 = 一个都不跑**：装上 ≠ 授权，授权是这份显式清单。
     // 插件目录约定 $DATA_DIR/plugins/<id>/（数据目录不会被版本更新覆盖，见 deploy.sh 的保留清单）。
     enabledIds: [],

@@ -553,6 +553,33 @@ export class PluginRegistry {
     return ok ? { ok: true, running: true } : { ok: false, error: this.hosts.get(id)?.lastError || '启动失败' };
   }
 
+  /**
+   * v3 入站 HTTP：宿主的 /plugin-hooks/<id>/… 转来的请求。**默认拒**与工具同口径：总开关、enabledIds、
+   * 撤回、manifest 声明了 inbound —— 任一不满足就当作不存在（404，不泄露"这里装了什么插件"）。
+   * 返回 { status, body }；插件超时 / 崩溃 → 502。
+   */
+  async inbound(id, request) {
+    const cfg = this.#config();
+    const host = this.hosts.get(String(id || ''));
+    if (!cfg.enabled || !host || !this.#shouldRun(host.id, cfg, host.manifest.version)
+      || !host.manifest.capabilities.includes('inbound')) {
+      return { status: 404, body: { ok: false, message: 'not found' } };
+    }
+    const ready = host.state === 'running' ? host : await this.#ensureRunning(host.id);
+    if (!ready || ready.state !== 'running') return { status: 503, body: { ok: false, message: '插件未在运行' } };
+    try {
+      const result = await ready.inbound(request);
+      const status = Number(result?.status);
+      return {
+        status: Number.isInteger(status) && status >= 200 && status <= 599 ? status : 200,
+        body: result?.body === undefined ? { ok: true } : result.body
+      };
+    } catch (error) {
+      this.log(`插件 ${host.id} 处理入站请求失败：${error?.message ?? error}`);
+      return { status: error?.code === 'E_BUSY' ? 503 : 502, body: { ok: false, message: '插件处理失败' } };
+    }
+  }
+
   observe(event) {
     const cfg = this.#config();
     if (!cfg.enabled) return 0;

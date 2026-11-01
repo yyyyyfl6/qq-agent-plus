@@ -22,6 +22,8 @@ export const HOST_METHODS = Object.freeze({
   ping: 'ping',
   // v2.1：控制台"检测"按钮用 —— 插件可选实现，返回登录态/依赖自检之类的应用层状态
   probe: 'probe',
+  // v3：入站 HTTP（cap 'inbound'）—— 宿主把 /plugin-hooks/<id>/… 的请求转给插件，插件回 { status, body }
+  inbound: 'inbound',
   shutdown: 'shutdown'
 });
 

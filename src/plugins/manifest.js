@@ -49,11 +49,12 @@ export const PLUGIN_CAPABILITIES = Object.freeze([
   // ── v3：接进连续对话工作流（见 src/plugins/agent-caps.js） ──
   'llm',        // 用插件设置里选的「副 API」跑模型（Key 只在宿主里解析；每天有次数上限）
   'context',    // 给会话挂背景，主模型每轮读到（放 user 内容，有过期时间）
-  'wake'        // 请主模型对某个会话主动唤醒一次（发不发由主模型决定；有间隔与每日上限）
+  'wake',       // 请主模型对某个会话主动唤醒一次（发不发由主模型决定；有间隔与每日上限）
+  'inbound'     // 接收外部设备发来的 HTTP 请求（宿主转发 /plugin-hooks/<id>/…；鉴权由插件做，宿主限体积与频率）
 ]);
 
 export const V2_CAPABILITIES = Object.freeze(['secrets', 'approval', 'media', 'quota', 'feed']);
-export const V3_CAPABILITIES = Object.freeze(['llm', 'context', 'wake']);
+export const V3_CAPABILITIES = Object.freeze(['llm', 'context', 'wake', 'inbound']);
 
 const FIELD_TYPES = Object.freeze(['text', 'number', 'boolean', 'select', 'secret']);
 const KEY_RE = /^[a-z][A-Za-z0-9_]{0,31}$/;
