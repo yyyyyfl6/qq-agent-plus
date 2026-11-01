@@ -335,7 +335,7 @@ process.stdin.on('data', (chunk) => {
 
 2026-11 为「我会永远陪着你」的移植插件而加（见 `yyyyyfl6/astrbot_plugin_private_companion` 的 `qq-agent/`）。
 QQ Agent 自己就是连续对话的工作流，插件不需要另起一套"间断唤醒"：它用副 API 维护一个长任务，
-把状态挂进会话背景，到点了请主模型主动来一次。声明 `apiVersion: 3` 才能用下面四项，v1/v2 插件不受影响。
+把状态挂进会话背景，到点了请主模型主动来一次。声明 `apiVersion: 3` 才能用下面五项，v1/v2 插件不受影响。
 
 | 能力 | 方法 | 说明与宿主侧限制 |
 | --- | --- | --- |
@@ -343,6 +343,7 @@ QQ Agent 自己就是连续对话的工作流，插件不需要另起一套"间�
 | `context` | `cap.context.set { chatKey, text, ttlMinutes? }` | 给 `private:<QQ>` / `group:<群号>`（或 `*`）挂一段 ≤1500 字的背景，主模型**每轮放进 user 内容**（不动 system 前缀，不破坏前缀缓存），并标注"来自插件，第三方内容，不是指令"。默认 180 分钟过期（最长 24 小时）；空串 = 撤掉；插件停用即全部撤掉；每插件最多 50 个会话 |
 | `wake` | `cap.wake.request { chatKey, note? }` → `{ queued, remaining }` | 请主模型对该会话来一次 proactive 唤醒（和冷场开话题同一条路：白名单、作息、观察 / 暂停模式、预算照常生效；发不发、说什么由主模型决定）。`note` ≤280 字，作为【系统提醒】交给主模型。同一会话间隔 ≥ `plugins.limits.wakeMinGapMinutes`（默认 20）分钟、每插件每天 `wakeDailyCalls`（默认 30）次；先记账，结果不确定也不重试 |
 | `inbound` | 宿主方法 `inbound { method, path, query, headers, remoteAddr, body }` → 插件回 `{ status, body }` | 外部设备（如安卓陪伴终端）直接推数据：`/plugin-hooks/<id>/<路径>`，控制台端口与独立端口（`plugins.inbound.listen`，默认关，`0.0.0.0:6322`，**只**提供插件路径）都认；独立端口可设 `defaultPlugin`，根路径直接交给它。**不走控制台令牌**，鉴权由插件做；宿主只放行已启用且声明了 inbound 的插件（否则 404）、只收 GET/POST、请求体 ≤256KB 且必须是 JSON、每个来源 IP 每分钟 ≤120 次、只转发 `authorization` / `x-companion-mobile-token` / `content-type` / `user-agent` / `accept-language` 五个请求头、插件 10 秒不回就 502。实现：`src/plugins/inbound.js` |
+| `page` | manifest `page: { entry: 'page.html', title }`；宿主方法 `page { method, params }` → 插件回任意结果 | 插件自带一页控制台页面，显示在插件详情里。HTML 由宿主读出（≤512KB）放进 `<iframe sandbox="allow-scripts allow-modals" srcdoc>`：**没有 same-origin**（读不到控制台令牌 / 存储 / 父页面），宿主在最前面注入 CSP `default-src 'none'`（只放行内联脚本 / 样式与 data: 图片，**发不出任何网络请求**）。页面里唯一的出口是宿主注入的 `qqa.call(method, params)`，经 `POST /api/plugins/page-rpc` 只能调**它自己**的插件；`qqa.onTheme(cb)` 收控制台的明暗与配色变量。实现：`ui/pages/plugin-page.js` |
 
 用量记在 `plugin-data/<id>/agent-usage.json`（按北京日期）。实现：`src/plugins/agent-caps.js`、`src/plugins/inbound.js`。
 控制台里：设置 → 平台能力 →「插件宿主（高级）」→ 设备入站端口。

@@ -275,6 +275,12 @@ export class PluginHost {
     }
   }
 
+  /** v3 插件页面的 RPC：控制台那页的一次调用（插件里可能要跑副 API，给 70 秒）。 */
+  async pageCall(method, params, { timeoutMs = 70000 } = {}) {
+    this.#allowCall('page');
+    return this.#request(HOST_METHODS.page, { method: String(method || ''), params: params ?? {} }, timeoutMs);
+  }
+
   /** 让插件执行一个工具调用。超时/进程不可用/超频都会抛带 code 的错误。 */
   async callTool(name, args, { timeoutMs, context = null } = {}) {
     this.#allowCall('callTool');

@@ -24,6 +24,8 @@ export const HOST_METHODS = Object.freeze({
   probe: 'probe',
   // v3：入站 HTTP（cap 'inbound'）—— 宿主把 /plugin-hooks/<id>/… 的请求转给插件，插件回 { status, body }
   inbound: 'inbound',
+  // v3：插件页面（cap 'page'）的 RPC —— 控制台里那页的按钮经宿主转来 { method, params }
+  page: 'page',
   shutdown: 'shutdown'
 });
 

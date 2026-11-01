@@ -580,6 +580,32 @@ export class PluginRegistry {
     }
   }
 
+  /** v3 插件页面：取 HTML（宿主读插件目录里的文件，≤512KB）。没声明 / 没启用 → null。 */
+  pageSource(id) {
+    const cfg = this.#config();
+    const host = this.hosts.get(String(id || ''));
+    if (!cfg.enabled || !host || !this.#shouldRun(host.id, cfg, host.manifest.version) || !host.manifest.page?.entry) return null;
+    try {
+      const stat = fs.statSync(host.manifest.page.entry);
+      if (stat.size > 512 * 1024) return { title: host.manifest.page.title, error: '插件页面超过 512KB' };
+      return { title: host.manifest.page.title, html: fs.readFileSync(host.manifest.page.entry, 'utf8') };
+    } catch (error) {
+      return { title: host.manifest.page.title, error: `读不到插件页面：${error?.code || error?.message || error}` };
+    }
+  }
+
+  /** v3 插件页面的 RPC。与工具同口径默认拒；返回插件给的结果（宿主不解释）。 */
+  async pageCall(id, method, params) {
+    const cfg = this.#config();
+    const host = this.hosts.get(String(id || ''));
+    if (!cfg.enabled || !host || !this.#shouldRun(host.id, cfg, host.manifest.version) || !host.manifest.capabilities.includes('page')) {
+      throw Object.assign(new Error('插件没有启用或没有页面'), { code: 'E_NOT_FOUND' });
+    }
+    const ready = host.state === 'running' ? host : await this.#ensureRunning(host.id);
+    if (!ready || ready.state !== 'running') throw Object.assign(new Error(`插件未在运行（${ready?.lastError || '按需启动失败'}）`), { code: 'E_DOWN' });
+    return ready.pageCall(method, params);
+  }
+
   observe(event) {
     const cfg = this.#config();
     if (!cfg.enabled) return 0;
@@ -1211,6 +1237,8 @@ export class PluginRegistry {
               approvals: item.manifest.approvals || [],
               quotas: item.manifest.quotas || {},
               httpDomains: item.manifest.httpDomains || [],
+              // v3：插件页面（只给标题，HTML 走 /api/plugins/page 单独取）
+              page: item.manifest.page ? { title: item.manifest.page.title } : null,
               tools: item.manifest.tools.map((t) => t.name),
               schedule: item.manifest.schedule.map((s) => ({
                 name: s.name,

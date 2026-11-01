@@ -3452,6 +3452,29 @@ export function createApp({
   });
 
   // 应用层自检（"检测登录"按钮）：懒启动的插件会顺手把进程带起来
+  // v3 插件页面：HTML 由控制台放进沙箱 iframe（allow-scripts、opaque origin、CSP 断网），
+  // 页面里的按钮只能经这条 RPC 调**它自己**的插件（不能调宿主别的接口，也拿不到控制台令牌）。
+  router.add('GET', '/api/plugins/page', async (req, res, params, url) => {
+    const id = String(url.searchParams.get('id') || '').trim();
+    if (!pluginIdValid(id)) return json(res, 400, { ok: false, error: '插件 id 不合法' });
+    const page = pluginRegistry.pageSource(id);
+    if (!page) return json(res, 404, { ok: false, error: '这个插件没有页面，或还没启用' });
+    if (page.error) return json(res, 500, { ok: false, error: page.error });
+    return json(res, 200, { ok: true, title: page.title, html: page.html });
+  });
+  router.add('POST', '/api/plugins/page-rpc', async (req, res) => {
+    const body = await readBody(req).catch(() => ({}));
+    const id = String(body.id || '').trim();
+    const method = String(body.method || '');
+    if (!pluginIdValid(id)) return json(res, 400, { ok: false, error: '插件 id 不合法' });
+    if (!/^[a-z][A-Za-z0-9_.]{0,40}$/.test(method)) return json(res, 400, { ok: false, error: 'method 不合法' });
+    try {
+      const result = await pluginRegistry.pageCall(id, method, body.params && typeof body.params === 'object' ? body.params : {});
+      return json(res, 200, { ok: true, result: result ?? null });
+    } catch (error) {
+      return json(res, error?.code === 'E_NOT_FOUND' ? 404 : 400, { ok: false, error: String(error?.message ?? error).slice(0, 400) });
+    }
+  });
   router.add('POST', '/api/plugins/probe', async (req, res) => {
     const body = await readBody(req).catch(() => ({}));
     const id = String(body.id || '').trim();

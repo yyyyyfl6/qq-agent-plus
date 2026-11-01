@@ -26,6 +26,7 @@ import {
   startQrLogin, pollQrOnce, setSettingsStatus, stopQrPoll
 } from './plugin-settings.js';
 import { loadPendingBanner } from './plugin-pending.js';
+import { hydratePluginPage, pageBlockHtml } from './plugin-page.js';
 
 const CAP_LABELS = {
   tools: '给模型加工具',
@@ -478,7 +479,6 @@ function renderPluginsPage() {
 }
 
 const statusText = () => $('#plugins-status');
-
 let statusTimer = null;
 /**
  * 插件页底部状态条：把"正在安装 / 已安装 / 失败"做成跟主题一致的状态胶囊。
@@ -761,7 +761,7 @@ function renderPluginDetail(item, installed, skipped) {
     : esc(item.description || '（这个插件没写说明）')}</div>
             ${screenshots.length ? `<div class="pd-shots">${screenshots.map((url) => `<img src="${esc(url)}" alt="" loading="lazy" referrerpolicy="no-referrer" />`).join('')}</div>` : ''}
           </div>
-          ${hasPluginSettings(own) ? `<div class="pd-block plugin-settings-block" data-pd-settings="${esc(item.id)}">
+          ${pageBlockHtml(own)}${hasPluginSettings(own) ? `<div class="pd-block plugin-settings-block" data-pd-settings="${esc(item.id)}">
             <h4 class="pd-block-title">插件设置</h4>
             <div class="pd-settings-body"><span class="plugin-note">正在读取设置…</span></div>
           </div>` : ''}
@@ -1043,7 +1043,7 @@ function renderIndex(index, installed) {
     box.className = '';                       // 详情不是网格（否则内容宽度会被网格列裁窄）
     box.innerHTML = renderPluginDetail(detail, installed, skipped);
     // 设置面板的数据挂在装机记录里（schema 是 manifest 的一部分）：详情先渲染骨架，再异步填表单。
-    const hydrating = Promise.resolve(hydratePluginSettings(detail.id));
+    const hydrating = Promise.resolve(hydratePluginSettings(detail.id)); void hydratePluginPage(detail.id);
     if (pendingJumpTarget === detail.id) {
       const targetId = pendingJumpTarget; pendingJumpTarget = '';
       void hydrating.then(() => { if (pluginDetailId === targetId) document.querySelector('.pd-approval-row.is-pending')?.scrollIntoView({ block: 'center', behavior: 'smooth' }); }, () => {});
