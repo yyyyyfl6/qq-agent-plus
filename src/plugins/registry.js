@@ -554,56 +554,16 @@ export class PluginRegistry {
   }
 
   /**
-   * v3 入站 HTTP：宿主的 /plugin-hooks/<id>/… 转来的请求。**默认拒**与工具同口径：总开关、enabledIds、
-   * 撤回、manifest 声明了 inbound —— 任一不满足就当作不存在（404，不泄露"这里装了什么插件"）。
-   * 返回 { status, body }；插件超时 / 崩溃 → 502。
+   * v3（inbound / page，逻辑在 v3.js）：默认拒与工具同口径 —— 总开关、enabledIds、撤回、manifest 声明了该能力，
+   * 任一不满足返回 null。start=true 时按需拉起：{ host, ready }（ready 为 null 表示起不来，error 说明原因）。
    */
-  async inbound(id, request) {
+  async v3Host(id, capability, { start = true } = {}) {
     const cfg = this.#config();
     const host = this.hosts.get(String(id || ''));
-    if (!cfg.enabled || !host || !this.#shouldRun(host.id, cfg, host.manifest.version)
-      || !host.manifest.capabilities.includes('inbound')) {
-      return { status: 404, body: { ok: false, message: 'not found' } };
-    }
+    if (!cfg.enabled || !host || !this.#shouldRun(host.id, cfg, host.manifest.version) || !host.manifest.capabilities.includes(capability)) return null;
+    if (!start) return { host, ready: null };
     const ready = host.state === 'running' ? host : await this.#ensureRunning(host.id);
-    if (!ready || ready.state !== 'running') return { status: 503, body: { ok: false, message: '插件未在运行' } };
-    try {
-      const result = await ready.inbound(request);
-      const status = Number(result?.status);
-      return {
-        status: Number.isInteger(status) && status >= 200 && status <= 599 ? status : 200,
-        body: result?.body === undefined ? { ok: true } : result.body
-      };
-    } catch (error) {
-      this.log(`插件 ${host.id} 处理入站请求失败：${error?.message ?? error}`);
-      return { status: error?.code === 'E_BUSY' ? 503 : 502, body: { ok: false, message: '插件处理失败' } };
-    }
-  }
-
-  /** v3 插件页面：取 HTML（宿主读插件目录里的文件，≤512KB）。没声明 / 没启用 → null。 */
-  pageSource(id) {
-    const cfg = this.#config();
-    const host = this.hosts.get(String(id || ''));
-    if (!cfg.enabled || !host || !this.#shouldRun(host.id, cfg, host.manifest.version) || !host.manifest.page?.entry) return null;
-    try {
-      const stat = fs.statSync(host.manifest.page.entry);
-      if (stat.size > 512 * 1024) return { title: host.manifest.page.title, error: '插件页面超过 512KB' };
-      return { title: host.manifest.page.title, html: fs.readFileSync(host.manifest.page.entry, 'utf8') };
-    } catch (error) {
-      return { title: host.manifest.page.title, error: `读不到插件页面：${error?.code || error?.message || error}` };
-    }
-  }
-
-  /** v3 插件页面的 RPC。与工具同口径默认拒；返回插件给的结果（宿主不解释）。 */
-  async pageCall(id, method, params) {
-    const cfg = this.#config();
-    const host = this.hosts.get(String(id || ''));
-    if (!cfg.enabled || !host || !this.#shouldRun(host.id, cfg, host.manifest.version) || !host.manifest.capabilities.includes('page')) {
-      throw Object.assign(new Error('插件没有启用或没有页面'), { code: 'E_NOT_FOUND' });
-    }
-    const ready = host.state === 'running' ? host : await this.#ensureRunning(host.id);
-    if (!ready || ready.state !== 'running') throw Object.assign(new Error(`插件未在运行（${ready?.lastError || '按需启动失败'}）`), { code: 'E_DOWN' });
-    return ready.pageCall(method, params);
+    return ready?.state === 'running' ? { host, ready } : { host, ready: null, error: ready?.lastError || host.lastError || '按需启动失败' };
   }
 
   observe(event) {

@@ -83,3 +83,18 @@ test('每个来源 IP 每分钟 120 次', async () => {
     assert.equal((await fetch(`${s.base}/plugin-hooks/phone/health`)).status, 200);
   } finally { await s.close(); }
 });
+
+test('独立端口按插件设置开：只给 enabledIds 里 inboundListen=true 的插件，根路径交给它', async () => {
+  const reg = fakeRegistry();
+  const cfg = { plugins: { enabled: true, enabledIds: ['phone', 'other'], settings: { phone: { inboundListen: true, inboundHost: '127.0.0.1', inboundPort: 0 }, other: { inboundListen: false } } } };
+  const h = createInboundHandler({ getRegistry: () => reg, getConfig: () => cfg });
+  assert.equal(createInboundHandler({ getRegistry: () => reg, getConfig: () => ({ plugins: { ...cfg.plugins, enabled: false } }) }).listen().length, 0, '总开关关着不开端口');
+  cfg.plugins.settings.phone.inboundPort = 47000 + Math.floor(Math.random() * 1000);
+  const servers = h.listen();
+  try {
+    assert.deepEqual(servers.map((s) => s.id), ['phone']);
+    await new Promise((r) => (servers[0].server.listening ? r() : servers[0].server.once('listening', r)));
+    const r = await fetch(`http://127.0.0.1:${cfg.plugins.settings.phone.inboundPort}/status`);
+    assert.deepEqual((await r.json()).data, { path: '/status' });
+  } finally { await Promise.all(servers.map((s) => s.close())); }
+});

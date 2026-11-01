@@ -1117,14 +1117,7 @@ async function saveConfig({ quiet = false } = {}) {
         totalMemoryMb: numKeep(val('#cfg-plugin-total-memory', c.plugins?.limits?.totalMemoryMb ?? 0), c.plugins?.limits?.totalMemoryMb, 0, 8192, 0)
       },
       networkIsolation: chk('#cfg-plugin-netiso', c.plugins?.networkIsolation !== false),
-      requireNetworkIsolation: chk('#cfg-plugin-requirenetiso', c.plugins?.requireNetworkIsolation === true),
-      // 设备入站端口（插件 v3 inbound）：重启后生效
-      inbound: {
-        listen: chk('#cfg-plugin-inbound-listen', c.plugins?.inbound?.listen === true),
-        host: String(val('#cfg-plugin-inbound-host', c.plugins?.inbound?.host ?? '0.0.0.0') || '').trim() || '0.0.0.0',
-        port: numKeep(val('#cfg-plugin-inbound-port', c.plugins?.inbound?.port ?? 6322), c.plugins?.inbound?.port, 1, 65535, 6322),
-        defaultPlugin: String(val('#cfg-plugin-inbound-default', c.plugins?.inbound?.defaultPlugin ?? '') || '').trim().toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 32)
-      }
+      requireNetworkIsolation: chk('#cfg-plugin-requirenetiso', c.plugins?.requireNetworkIsolation === true)
     };
   }
 

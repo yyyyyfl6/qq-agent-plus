@@ -473,11 +473,11 @@ test('真实 DOM 冒烟：「平台能力」页的开关/配额/按群覆盖能�
     const renderedIds = [...window.document.querySelectorAll('#settings-form input[type="checkbox"]')]
       .map((el) => el.id).filter(Boolean).sort();
     // 门控键 + 三个"行为开关"（正在输入 / 标已读 / 日报卡片 —— 它们不是工具门控，但仍归这一页）
-    // + 插件宿主高级区的两个隔离开关与设备入站端口开关（同样归这一页，不参与门控键表）
+    // + 插件宿主高级区的两个隔离开关（同样归这一页，不参与门控键表）
     assert.deepEqual(renderedIds,
       [...PLATFORM_GATE_KEYS.map((k) => `cfg-platform-${k.toLowerCase()}`),
         'cfg-typing', 'cfg-platform-readreceipts', 'cfg-platform-forwardcards',
-        'cfg-plugin-netiso', 'cfg-plugin-requirenetiso', 'cfg-plugin-inbound-listen'].sort(),
+        'cfg-plugin-netiso', 'cfg-plugin-requirenetiso'].sort(),
       '「平台能力」页的开关集合与服务端门控键表不一致（服务端加键、UI 没跟上就会红）');
     // 每个键都要有"它管的工具"占位（工具名由 /api/platform/gates 异步补）
     const slots = [...window.document.querySelectorAll('[data-gate-tools]')].map((el) => el.dataset.gateTools).sort();

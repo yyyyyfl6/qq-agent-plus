@@ -1,10 +1,10 @@
 // 插件 v3 的入站 HTTP（能力 `inbound`）：让外部设备（如「我会永远陪着你」移植插件配套的安卓陪伴终端）
 // 直接把数据推给插件。
 //
-//   路径：/plugin-hooks/<插件id>/<其余路径>     —— 控制台端口与独立端口都认
-//   独立端口（plugins.inbound.listen = true，默认 0.0.0.0:6322）：**只**提供插件路径，不暴露控制台；
-//   设了 plugins.inbound.defaultPlugin 时，根路径（/pair、/status …）直接交给那个插件 ——
-//   原插件的手机网关就是 6322 端口、根路径，配套 App 不用改地址格式。
+//   路径：/plugin-hooks/<插件id>/<其余路径>     —— 控制台端口上认
+//   独立端口：插件设置里 inboundListen = true（端口 inboundPort，默认 6322）时，宿主替**这个插件**单开一个端口，
+//   **只**提供它的路径、根路径（/pair、/status …）直接交给它，不暴露控制台 ——
+//   原插件的手机网关就是 6322 端口、根路径，配套 App 不用改地址格式。开关放在插件自己的设置里，宿主配置不加键。
 //
 // 这条路**不走控制台令牌**（手机拿不到也不该拿到控制台令牌）：鉴权由插件自己做（配对令牌 → 会话令牌）。
 // 所以宿主在这里守住它能守的：插件必须已启用且声明了 inbound（否则一律 404，不泄露装了什么）、
@@ -48,7 +48,7 @@ function readBody(req) {
 
 /**
  * @param getRegistry  () => PluginRegistry（有 inbound(id, request)）
- * @param getConfig    () => 完整配置（读 plugins.inbound.defaultPlugin）
+ * @param getConfig    () => 完整配置（读 plugins.enabled / enabledIds / settings[id].inboundListen）
  */
 export function createInboundHandler({ getRegistry, getConfig = () => ({}), log = () => {}, now = () => Date.now() } = {}) {
   const registryOf = getRegistry;
@@ -116,24 +116,29 @@ export function createInboundHandler({ getRegistry, getConfig = () => ({}), log 
     return true;
   }
 
-  /** 独立端口（只提供插件路径）。返回 { close() }；没开就返回 null。 */
+  /** 按插件设置给要求独立端口的插件各开一个端口（根路径交给它）。返回 [{ id, close() }]。 */
   function listen() {
-    const cfg = configOf()?.plugins?.inbound || {};
-    if (cfg.listen !== true) return null;
-    const host = String(cfg.host || '0.0.0.0');
-    const port = Math.min(65535, Math.max(1, Number(cfg.port) || 6322));
-    const server = http.createServer((req, res) => {
-      const rootPlugin = String(configOf()?.plugins?.inbound?.defaultPlugin || '').trim();
-      handle(req, res, { rootPlugin }).then((handled) => {
-        if (!handled) send(res, 404, { ok: false, message: 'not found' });
-      }).catch((error) => {
-        log(`[plugins] 入站请求出错：${error?.message ?? error}`);
-        try { send(res, 500, { ok: false, message: 'internal error' }); } catch { /* 已经写过 */ }
+    const plugins = configOf()?.plugins || {};
+    if (plugins.enabled !== true) return [];
+    const servers = [];
+    for (const id of (Array.isArray(plugins.enabledIds) ? plugins.enabledIds : []).filter((v) => ID_RE.test(String(v)))) {
+      const st = plugins.settings?.[id] || {};
+      if (st.inboundListen !== true) continue;
+      const host = String(st.inboundHost || '0.0.0.0').trim() || '0.0.0.0';
+      const port = Math.min(65535, Math.max(1024, Number(st.inboundPort) || 6322));
+      const server = http.createServer((req, res) => {
+        handle(req, res, { rootPlugin: id }).then((handled) => {
+          if (!handled) send(res, 404, { ok: false, message: 'not found' });
+        }).catch((error) => {
+          log(`[plugins] 入站请求出错：${error?.message ?? error}`);
+          try { send(res, 500, { ok: false, message: 'internal error' }); } catch { /* 已经写过 */ }
+        });
       });
-    });
-    server.on('error', (error) => log(`[plugins] 入站端口 ${host}:${port} 启动失败：${error?.message ?? error}`));
-    server.listen(port, host, () => log(`[plugins] 插件入站端口已监听 ${host}:${port}（只提供 /plugin-hooks/…${cfg.defaultPlugin ? `，根路径交给 ${cfg.defaultPlugin}` : ''}）`));
-    return { close: () => new Promise((resolve) => server.close(() => resolve())), server };
+      server.on('error', (error) => log(`[plugins] 插件 ${id} 的入站端口 ${host}:${port} 启动失败：${error?.message ?? error}`));
+      server.listen(port, host, () => log(`[plugins] 插件 ${id} 的入站端口已监听 ${host}:${port}（只提供这个插件的路径）`));
+      servers.push({ id, server, close: () => new Promise((resolve) => server.close(() => resolve())) });
+    }
+    return servers;
   }
 
   return { handle, listen };

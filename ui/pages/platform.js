@@ -210,19 +210,6 @@ ${QUOTA_ROWS.map(([key, label, dflt]) => `          <tr>
       <div class="hint">内存上限是 V8 堆上限，不是 RSS；调用上限是每分钟工具调用次数。两项都只影响插件进程，不影响主程序。
         Windows / macOS 没有网络命名空间，打开「要求网络隔离」等于禁用全部插件。
         更严格的权限隔离（<code>plugins.requireIsolation</code>）保持配置默认的 fail-closed，不在界面开放关闭。</div>
-      <h4 class="plat-subtitle" style="margin:14px 0 6px">设备入站端口（插件 v3 的 inbound）</h4>
-      <div class="checkbox-row"><input type="checkbox" id="cfg-plugin-inbound-listen" ${c.plugins?.inbound?.listen === true ? 'checked' : ''} />
-        <label for="cfg-plugin-inbound-listen">开一个独立端口给手机等设备连（只提供插件路径，不暴露控制台）</label></div>
-      <div class="field-row">
-        <div class="field"><label for="cfg-plugin-inbound-host">监听地址</label>
-          <input type="text" id="cfg-plugin-inbound-host" value="${esc(c.plugins?.inbound?.host ?? '0.0.0.0')}" placeholder="0.0.0.0" /></div>
-        <div class="field"><label for="cfg-plugin-inbound-port">端口</label>
-          <input type="number" id="cfg-plugin-inbound-port" min="1" max="65535" value="${esc(c.plugins?.inbound?.port ?? 6322)}" /></div>
-        <div class="field"><label for="cfg-plugin-inbound-default">根路径交给哪个插件（id，可空）</label>
-          <input type="text" id="cfg-plugin-inbound-default" value="${esc(c.plugins?.inbound?.defaultPlugin ?? '')}" placeholder="private-companion" /></div>
-      </div>
-      <div class="hint">手机陪伴终端填 <code>http://服务器地址:端口</code>（设了根路径插件时）或 <code>http://服务器地址:端口/plugin-hooks/插件id</code>。
-        这个端口要能从手机访问（安全组 / 防火墙放行，或放在 HTTPS 反向代理后面）；鉴权由插件的配对令牌负责，宿主限请求体积与频率。改了要<strong>重启服务</strong>才生效。</div>
     </section>
 
     <div class="hint" style="margin-top:2px">
