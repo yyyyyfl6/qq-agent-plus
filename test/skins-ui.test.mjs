@@ -1,0 +1,101 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { test } from 'node:test';
+import { DEFAULT_SKINS, normalizeSkins, parseSkinCommand, resolveSkinConfig } from '../src/skins/skins.js';
+
+let Window;
+try { ({ Window } = await import('happy-dom')); } catch (e) { if (e.code !== 'ERR_MODULE_NOT_FOUND') throw e; }
+
+test('personality buttons create, edit and reload preset/model/command pairs without duplicate settings', { skip: !Window }, async (t) => {
+  const window = new Window({ url: 'http://localhost' });
+  window.document.write(fs.readFileSync(new URL('../ui/skins.html', import.meta.url), 'utf8').replace(/<script[^>]*>\s*<\/script>/g, ''));
+  let settings = normalizeSkins({ ...structuredClone(DEFAULT_SKINS), enabled: true });
+  settings.list[0].provider = 'ds'; settings.list[1].provider = 'gm';
+  const providers = [{ id: 'ds', name: '同站多模型', models: ['deepseek-flash', 'gemini-added'] }];
+  const customs = [{ name: '测试预设', text: '第三个人格的角色设定' }];
+  let binding = 'fish'; let fail = false; let failChats = false; const writes = [];
+  const old = { document: globalThis.document, fetch: globalThis.fetch, confirm: globalThis.confirm };
+  globalThis.document = window.document; globalThis.confirm = () => true;
+  globalThis.fetch = async (route, options = {}) => {
+    if (fail || (failChats && route === '/api/chat-skins')) return { ok: false, status: 409, json: async () => ({ error: '测试失败' }) };
+    if (options.method === 'POST') {
+      const body = JSON.parse(options.body); writes.push({ route, body });
+      if (route === '/api/skins') settings = normalizeSkins(body.skins, customs);
+      else if (route === '/api/chat-skins') binding = body.skinId;
+      else assert.fail(`人格页不应写入 ${route}`);
+    }
+    const response = route === '/api/skins' ? { skins: structuredClone(settings), providers, templates: { blue_fish: { name: '鱼' }, hajimi: { name: '猫' }, custom_0: { name: '测试预设' } }, globalApi: { model: 'global-chat' } }
+      : { chats: [{ chatKey: 'group:1', skinId: binding }], changed: true, handoffStatus: 'failed', handoffError: 'HTTP 401：认证失败' };
+    return { ok: true, status: 200, json: async () => response };
+  };
+  t.after(() => { Object.assign(globalThis, old); window.happyDOM.abort(); });
+  const { initSkinsPage } = await import('../ui/skins.js');
+  await initSkinsPage();
+  const doc = window.document;
+  const waitFor = async (check) => {
+    for (let i = 0; i < 100 && !check(); i++) await new Promise((r) => setTimeout(r, 10));
+    assert.ok(check(), '点击后的界面状态未完成');
+  };
+  assert.ok(!doc.querySelector('#provider-settings'), '人格页不应重复提供商设置');
+  assert.ok(!doc.querySelector('#preset-settings'), '人格页不应重复预设设置');
+  assert.equal(doc.querySelectorAll('.persona-card').length, 2);
+  doc.querySelector('#skin-add').click();
+  assert.equal(doc.querySelector('#persona-dialog').open, true);
+  doc.querySelector('#persona-name').value = '第三人格';
+  doc.querySelector('#persona-preset').value = 'custom_0';
+  doc.querySelector('#persona-provider').value = 'ds';
+  doc.querySelector('#persona-provider').dispatchEvent(new window.Event('change'));
+  assert.ok(doc.querySelector('#persona-model-options').innerHTML.includes('gemini-added'));
+  doc.querySelector('#persona-model').value = 'gemini-added';
+  doc.querySelector('#persona-commands').value = '变成第三人格\n/third';
+  doc.querySelector('#persona-save').click();
+  await waitFor(() => settings.list.length === 3 && !doc.querySelector('#persona-dialog').open);
+  const id = settings.list[2].id;
+  assert.equal(settings.list[2].templateId, 'custom_0');
+  assert.equal(settings.list[2].model, 'gemini-added');
+  assert.deepEqual(settings.list[2].commands, ['变成第三人格', '/third']);
+  assert.equal(parseSkinCommand('/third', { skins: settings, customPersonas: customs }).skinId, id);
+  const resolved = resolveSkinConfig({ skins: settings, customPersonas: customs, providers: [{ ...providers[0], baseURL: 'https://example.invalid/v1' }], providerKeys: { ds: 'test-key' }, api: {}, persona: {} }, id);
+  assert.equal(resolved.api.model, 'gemini-added');
+  assert.equal(resolved.persona.roleText, customs[0].text);
+  await initSkinsPage();
+  assert.equal(doc.querySelectorAll('.persona-card').length, 3);
+  doc.querySelectorAll('[data-edit]')[2].click();
+  assert.equal(doc.querySelector('#persona-name').value, '第三人格');
+  assert.equal(doc.querySelector('#persona-commands').value, '变成第三人格\n/third');
+  doc.querySelector('#persona-name').value = '第四名字';
+  doc.querySelector('#persona-model').value = 'deepseek-flash';
+  doc.querySelector('#persona-commands').value = '切到第四名字';
+  doc.querySelector('#persona-save').click();
+  await waitFor(() => settings.list[2].label === '第四名字' && !doc.querySelector('#persona-dialog').open);
+  assert.equal(settings.list[2].id, id, '编辑人格必须保留定位历史的 ID');
+  assert.equal(settings.list[2].model, 'deepseek-flash');
+  assert.equal(parseSkinCommand('切到第四名字', { skins: settings, customPersonas: customs }).skinId, id);
+  assert.equal(parseSkinCommand('/third', { skins: settings, customPersonas: customs }), null);
+  doc.querySelector('#skin-add').click();
+  const count = writes.length;
+  doc.querySelector('#persona-cancel').click();
+  assert.equal(doc.querySelector('#persona-dialog').open, false);
+  assert.equal(writes.length, count);
+  doc.querySelector('#skins-summary-model').value = 'summary-other';
+  doc.querySelector('#skins-handoff').checked = false;
+  doc.querySelector('#skins-save').click();
+  await waitFor(() => settings.handoffOnSwitch.model === 'summary-other');
+  assert.equal(settings.list.length, 3);
+  const row = doc.querySelector('[data-chat]'); row.querySelector('select').value = id;
+  row.querySelector('button').click();
+  await waitFor(() => binding === id && doc.querySelector('#skin-switch-status').textContent.includes('HTTP 401'));
+  doc.querySelectorAll('[data-edit]')[2].click(); fail = true;
+  doc.querySelector('#persona-name').value = '不应保存';
+  doc.querySelector('#persona-save').click();
+  await waitFor(() => doc.querySelector('#persona-error').textContent.includes('测试失败'));
+  assert.equal(doc.querySelector('#persona-dialog').open, true);
+  assert.equal(settings.list[2].label, '第四名字');
+  assert.equal(doc.querySelector('#persona-save').disabled, false);
+  doc.querySelector('#persona-cancel').click(); fail = false; failChats = true;
+  await initSkinsPage();
+  assert.match(doc.querySelector('#skin-switch-status').textContent, /会话读取失败/);
+  doc.querySelector('#skin-add').click();
+  assert.equal(doc.querySelector('#persona-dialog').open, true, '会话接口失败不应阻止新增人格');
+  doc.querySelector('#persona-cancel').click();
+});

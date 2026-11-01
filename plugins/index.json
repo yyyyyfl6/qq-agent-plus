@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "note": "**官方索引已经搬到独立仓库**：https://github.com/sakurawwwxh/qq-agent-plugins —— 索引与包都在那边（本目录只留这份说明，避免有人照着过期副本发布）。控制台默认的 plugins.indexUrl 已指向它。要查/改官方索引请去那个仓库；`node scripts/plugin-index-check.mjs <索引文件>` 仍然可以用来体检任意一份索引。",
+  "plugins": []
+}

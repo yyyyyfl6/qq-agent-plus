@@ -7,6 +7,7 @@ import vm from 'node:vm';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { toClassicScript } from './helpers/ui-module-source.mjs';
+import { scanDirForMarkdownStars } from './helpers/ui-markdown-stars.mjs';
 
 // 必须指到临时数据目录：这个用例会 import src/console/app.js，控制台启动时会把身份与
 // 异常两个试点的 SQLite 建在 DATA_DIR 下。不重定向就会动到开发机（甚至部署机）自己的
@@ -34,7 +35,14 @@ const htmlFilesUpToApp = () => {
 // 用 app.js 单文件去断言会假红（"这里没有"其实是"搬到别处了"）。按 index.html 顺序全量拼接。
 const code = htmlScriptFiles().map((f) => fs.readFileSync(path.join(ROOT, 'ui', f), 'utf8')).join('\n');
 
-// ── 极简 DOM 桩 ──
+// 把一个元素挂到某个父容器下（焦点守卫用例需要 contains 成立）
+function makeElIn(parent, id) {
+  const el = makeEl(id);
+  parent.children.push(el);
+  return el;
+}
+
+// ── 极简 DOM 桩 ──// ── 极简 DOM 桩 ──
 function makeEl(id = '', cls = '') {
   const el = {
     id,
@@ -62,15 +70,20 @@ function makeEl(id = '', cls = '') {
     querySelector: (sel) => { el._q ||= {} ; el._q[sel] ||= makeEl(); return el._q[sel]; },
     querySelectorAll: () => [],
     appendChild(c) { el.children.push(c); return c; },
+    // 滑块（ui/core/nav-pill.js）要往容器第一个位置插自己；侧栏那套要读 data-* 开关。
+    // 真浏览器里这两个方法永远在，桩缺了会让整页渲染直接抛（2026-10-08 踩到）
+    insertBefore(c) { el.children.unshift(c); return c; },
     remove() {},
     closest: () => null,
     setAttribute() {},
     getAttribute: () => null,
+    hasAttribute: () => false,
+    removeAttribute() {},
     focus() {},
     scrollIntoView() {},
     getBoundingClientRect: () => ({ top: 0, left: 0, width: 100, height: 20 }),
     insertAdjacentHTML() {},
-    contains: () => false,
+    contains(node) { return this === node || this.children.includes(node); },
     scrollTop: 0, scrollHeight: 100, clientHeight: 50
   };
   el.classList = {
@@ -486,6 +499,7 @@ try {
   const momentsHtml = ctx.renderDailyMomentsSection(cfg);
   const momentControls = [
     'cfg-moments-enabled', 'cfg-moments-catchup',
+    'cfg-moments-source', 'cfg-moments-autopublish',
     'cfg-moments-hour', 'cfg-moments-minute', 'cfg-moments-visibility',
     'cfg-moments-min-messages', 'cfg-moments-max-groups',
     'cfg-moments-max-messages', 'cfg-moments-images',
@@ -692,7 +706,9 @@ try {
     && experimentalOffHtml.includes('id="cfg-incident-pilot-enabled"')
     && !/id="cfg-identity-pilot-enabled" checked/.test(experimentalOffHtml)
     && /id="cfg-identity-pilot-enabled" checked/.test(experimentalOnHtml)
-    && experimentalOnHtml.includes('id="cfg-slang-pilot-enabled" checked')
+    && /id="cfg-slang-pilot-enabled" disabled/.test(experimentalOnHtml)
+    && !/id="cfg-slang-pilot-enabled" checked/.test(experimentalOnHtml)
+    && /id="launch-slang-feature" disabled/.test(experimentalOnHtml)
     && experimentalOnHtml.includes('id="cfg-incident-pilot-enabled" checked')
     && experimentalOffHtml.includes('id="launch-identity-feature"')
     && experimentalOffHtml.includes('固化上线')
@@ -900,7 +916,7 @@ try {
     && saverHtml.includes('档位读 80/50/30 条')
     && saverHtml.includes('<strong>80</strong>') && saverHtml.includes('（被夹住）')
     && saverHtml.includes('单次运行最大工具轮数')
-    && store.get('#settings-sidebar').innerHTML.includes('省 Token');
+    && store.get('#settings-sidebar').innerHTML.includes('Token 节省');
   saverOk ? pass++ : fail++;
   console.log('  ' + (saverOk ? 'OK   ' : 'FAIL ') + '省 Token 分区：三档选择 + 生效值对照表 + 设置菜单入口');
 
@@ -918,6 +934,7 @@ try {
     // 存量值 24 如实回显
     && /<input type="range" id="cfg-sticker-max"[^>]*min="1" max="60" step="0\.1"[^>]*value="24"/.test(chatHtml)
     && /<span class="slider-now" id="cfg-sticker-max-now">24<\/span>/.test(chatHtml)
+    && /<input type="number" id="cfg-pastchars"[^>]*min="100" max="100000"[^>]*value="24000"/.test(chatHtml)
     && !/<select id="cfg-sticker-max"/.test(chatHtml);
   openSwitchesOk ? pass++ : fail++;
   console.log('  ' + (openSwitchesOk ? 'OK   ' : 'FAIL ') + '设置页：主动开口三个开关 + 表情清单条数滑条');
@@ -943,6 +960,13 @@ try {
   collectUiOk ? pass++ : fail++;
   console.log('  ' + (collectUiOk ? 'OK   ' : 'FAIL ')
     + '设置页：收藏开关（一个开关管自动+主动）+ 每小时上限滑条（存量/混合值如实回显）');
+  // 收藏判定标准（v0.8.4 的配置面补上控制台入口）：多行文本域；留空 = 内置默认；
+  // 存量值如实回显且转义（内容可含 < > & 与换行）
+  const criteriaHtml = ctx.renderChatSection({ ...cfg, sticker: { ...cfg.sticker, collectCriteria: '只收 <梗图> & 表情' } });
+  const criteriaOk = /<textarea id="cfg-sticker-collect-criteria"[^>]*>\s*<\/textarea>/.test(defaultHtml)
+    && criteriaHtml.includes('只收 &lt;梗图&gt; &amp; 表情');
+  criteriaOk ? pass++ : fail++;
+  console.log('  ' + (criteriaOk ? 'OK   ' : 'FAIL ') + '设置页：收藏判定标准文本域（留空回显 + 存量值转义）');
   // 存量的超范围值（手改过 config.json 的 500）落到 60 档，不会渲染出 500 这种选项
   const overHtml = ctx.renderChatSection({ ...cfg, sticker: { ...cfg.sticker, promptMaxStickers: 500 } });
   // 断言只看贴纸那个滑条（同一段里发送上限的默认值就是 500，不能全局查 value="500"）
@@ -1282,7 +1306,87 @@ try {
       + (slotOk ? '' : ` -> ${slotNotes.join('；')}`));
   }
 
-  // 语音合成 Key：并入统一开关后的三件事（2026-10-01 审查的两条 low）
+  // 切换「语音转文字」服务预设只可就地更新，**不许整块重画**（2026-10-03 全量审查）：
+  // 整块重画会把同分区里用户还没保存的输入（TTS 音色、图片生成模型…）统统退回后端上次保存的值
+  // —— 与 2026-10-02「屏蔽名单搜索框只能输一个字」同族。
+  {
+    ctx.bindSettingsEvents(cfg);
+    const ttsVoice = document.querySelector('#cfg-tts-voice');
+    const imgModel = document.querySelector('#cfg-img-model');
+    ttsVoice.value = 'unsaved-voice';
+    imgModel.value = 'unsaved-image-model';
+    const svc = document.querySelector('#cfg-asr-service');
+    svc.value = 'groq';
+    for (const h of [...(svc?._listeners?.change || [])]) h();
+    const kept = ttsVoice.value === 'unsaved-voice'
+      && imgModel.value === 'unsaved-image-model'
+      && document.querySelector('#cfg-asr-key')?.value === '';
+    if (kept) { pass++; console.log('  OK    切换语音识别服务预设不会清空同分区其它未保存的输入'); }
+    else {
+      fail++;
+      console.log(`  FAIL  切换识别服务预设吞掉了未保存输入（voice=${ttsVoice.value} imgModel=${imgModel.value}）`);
+    }
+  }
+
+  // 生图每小时上限：保存口径必须与运行期 imageGenMaxPerHour 一致（非正数/坏值按默认 6）。
+  // 以前前端是 clampInt 式的 Math.max(1, …)：手填 -5 会存成"每小时 1 张"，比默认更严格。
+  {
+    const normalize = ctx.normalizeImageGenMax || sandbox.normalizeImageGenMax;
+    const cases = [[-5, 6], [0, 6], ['x', 6], [999, 100], [3.7, 4], [8, 8]];
+    const bad = typeof normalize !== 'function'
+      ? 'normalizeImageGenMax 没导出'
+      : cases.filter(([input, want]) => normalize(input) !== want).map(([i, w]) => `${i}→${normalize(i)}（期望 ${w}）`).join('，');
+    if (!bad) { pass++; console.log('  OK    生图每小时上限的收口与运行期同口径（非正数按 6，不是夹到 1）'); }
+    else { fail++; console.log(`  FAIL  生图每小时上限的收口与运行期不一致：${bad}`); }
+  }
+
+  // 后台重拉时若焦点落在区域内某个输入框里，这一轮重写要让路（setHtmlIfChanged 的焦点守卫）
+  {
+    const setter = ctx.setHtmlIfChanged || sandbox.setHtmlIfChanged;
+    // ⚠️ 先判存在再调用：原先在跑完所有 setter(...) 之后才判 typeof —— 一旦它被删/改名，
+    // 会抛 TypeError 被外层 catch 吞成一条"抛错"，后面上百条断言直接不执行、诊断信息也丢了
+    //（2026-10-05 全审）。
+    if (typeof setter !== 'function') {
+      fail++; console.log('  FAIL  setHtmlIfChanged 没导出（后面的断言无法执行）');
+    } else {
+      const box = document.querySelector('#edit-guard-box');
+      const field = makeElIn(box, 'gi-1');
+      field.tagName = 'INPUT';
+      field.value = 'typed-by-user';
+      box.children.push(field);
+      setter(box, '<b>v1</b>');
+      const before = String(box.innerHTML);
+      const prevActive = document.activeElement;
+      document.activeElement = field;
+      const wrote = setter(box, '<b>v2</b>');
+      document.activeElement = prevActive;
+      const blocked = wrote === false && String(box.innerHTML) === before && field.value === 'typed-by-user';
+      if (blocked) { pass++; console.log('  OK    后台重拉不会覆盖正在输入的那一块（焦点在输入框里时让路）'); }
+      else { fail++; console.log(`  FAIL  焦点守卫没起作用（wrote=${wrote}）`); }
+    }
+  }
+
+  // 源码钉子：切语音服务预设的回调里不许出现 renderSettings() —— 垫片表达不了"输入框被换掉"
+  // （上面那条行为断言在这个垫片下抓不住这一类回归，静态钉子才抓得住）
+  {
+    const src = fs.readFileSync(new URL('../ui/pages/settings-bind.js', import.meta.url), 'utf8');
+    const start = src.indexOf("serviceSel.addEventListener('change'");
+    const end = start >= 0 ? src.indexOf('syncAsrFields();', start) : -1;
+    // ⚠️ 锚点自己失效时必须报红：indexOf 返回 -1 时 `slice(-1, end)` 会切出空串，
+    // 「没找到 renderSettings()」于是恒真 —— 把被测的回调整段删掉反而变绿
+    //（2026-10-05 全审：钉子的锚点退化）+ 反方向 `end = -1` 会切到文件尾造成假红。
+    if (start < 0 || end <= start) {
+      fail++; console.log('  FAIL  找不到语音服务切换回调（钉子锚点失效，先修测试再谈回归）');
+    } else {
+      // 先剥掉 // 注释：这段代码里正好有一句"这里**不能** renderSettings()"，不剥会自己误判
+      const code = src.slice(start, end).replace(/\/\/[^\n]*/g, '');
+      const reRender = /renderSettings\(\)/.test(code);
+      if (reRender) { fail++; console.log('  FAIL  切换语音识别服务预设又调了 renderSettings()（会清空同分区未保存输入）'); }
+      else { pass++; console.log('  OK    切换语音识别服务预设的回调里没有整块重画（源码钉子）'); }
+    }
+  }
+
+  // 语音合成 Key：并入统一开关后的三件事（2026-10-01 审查的两条 low）  // 语音合成 Key：并入统一开关后的三件事（2026-10-01 审查的两条 low）
   //  · 「显示」向 /api/tts/key 要明文时要带上当前选中的那家（它按服务分家存 Key）；
   //  · 用户手输了一半就点「显示」：**不许**用回读值盖掉他没保存的输入，也不该白发请求；
   //  · 「隐藏」不许把用户刚输入（或刚粘上）的新 Key 盖成 ****** —— 服务端把 ****** 当
@@ -1453,6 +1557,36 @@ try {
   console.log('  ' + (mapOk ? 'OK   ' : 'FAIL ') + '设置页：保存时模式/服务正确映射成 provider/baseUrl/model/Key 归属'
     + (mapOk ? '' : ` -> ${mapNotes.join('；')}`));
 
+  // 收藏判定标准：改文本域 → 保存 → POST 体里带着 sticker.collectCriteria；空白存成空串（=内置默认）。
+  // 夹具先放一个非空存量值：否则"空白时回退已保存值"的错误实现也会绿（2026-10-10 审查 P2）。
+  // （"控件缺失回退已保存值"那一支在垫片里测不了：querySelector 对未知选择器会惰性造元素。）
+  {
+    let ok = true;
+    const notes = [];
+    const view = { ...cfg, sticker: { ...cfg.sticker, collectCriteria: '旧的判定标准' } };
+    vm.runInContext("state.settingsSection = 'chat';", ctx);
+    vm.runInContext(`state.config = ${JSON.stringify(view)};`, ctx);
+    for (const [value, want] of [['只收干净卡通和梗图', '只收干净卡通和梗图'], ['   ', '']]) {
+      document.querySelector('#cfg-sticker-collect-criteria').value = value;
+      let posted = null;
+      const fetchBefore = sandbox.fetch;
+      sandbox.fetch = async (url, options) => {
+        if (String(url).includes('/api/config') && options?.method === 'POST') {
+          posted = JSON.parse(options.body);
+          return { ok: true, status: 200, json: async () => ({ config: view }), text: async () => '' };
+        }
+        return { ok: true, status: 200, json: async () => ({}), text: async () => '' };
+      };
+      try { await ctx.saveConfig({ quiet: true }); } catch (error) { notes.push(`saveConfig 抛错 ${error?.message}`); }
+      sandbox.fetch = fetchBefore;
+      const got = posted?.sticker?.collectCriteria;
+      if (got !== want) { ok = false; notes.push(`${JSON.stringify(value)} → ${JSON.stringify(got)}（期望 ${JSON.stringify(want)}）`); }
+    }
+    ok ? pass++ : fail++;
+    console.log('  ' + (ok ? 'OK   ' : 'FAIL ') + '设置页：收藏判定标准保存进 sticker.collectCriteria（空白 = 内置默认）'
+      + (ok ? '' : ` -> ${notes.join('；')}`));
+  }
+
   // 切换服务预设时凭据按"这家存过没有"自动填回（2026-10-02 用户要求"切预设时 Key 跟着切换"）：
   // 存过 → 掩码（保存时服务端取回这家存过的那把）；没存过 → 留空等填；都不再一律清空 + 报"要重填"。
   {
@@ -1534,6 +1668,8 @@ try {
     vm.runInContext(`state.config = ${JSON.stringify({ ...cfg, memory: { ...(cfg.memory || {}), discoverMinMessages: 20, discoverMaxMembers: 3 } })};`, ctx);
     document.querySelector('#cfg-mem-discover-min').value = '8';
     document.querySelector('#cfg-mem-discover-max').value = '5';
+    document.querySelector('#cfg-mem-private-shared').checked = true;
+    document.querySelector('#cfg-mem-cross-scope-shared').checked = true;
     const before = sandbox.fetch;
     sandbox.fetch = async (url, options) => {
       if (String(url).includes('/api/config') && options?.method === 'POST') {
@@ -1545,7 +1681,10 @@ try {
     try { await ctx.saveConfig({ quiet: true }); } catch { /* 看 patch */ }
     sandbox.fetch = before;
     const memOk = posted?.memory?.discoverMinMessages === 8 && posted?.memory?.discoverMaxMembers === 5
-      && code.includes('id="cfg-mem-discover-min"') && code.includes('id="cfg-mem-discover-max"');
+      && posted?.memory?.privateSharedContext === true
+      && posted?.memory?.crossScopeSharedContext === true
+      && code.includes('id="cfg-mem-discover-min"') && code.includes('id="cfg-mem-discover-max"')
+      && code.includes('id="cfg-mem-private-shared"') && code.includes('id="cfg-mem-cross-scope-shared"');
     memOk ? pass++ : fail++;
     console.log('  ' + (memOk ? 'OK   ' : 'FAIL ') + '设置页：记忆整理可设"发现新人的最少发言条数/单次最多发现几人"并落到 memory.*'
       + (memOk ? '' : ` -> ${JSON.stringify(posted?.memory)}`));
@@ -1835,20 +1974,43 @@ try {
   //    identity-pilot-update，不能退回只标 stickers/slang）；③ 资产/身份回声监听器带着守卫。
   const featuresSrc = fs.readFileSync(path.join(ROOT, 'ui', 'pages', 'features.js'), 'utf8');
   const appSrc = fs.readFileSync(path.join(ROOT, 'ui', 'app.js'), 'utf8');
-  const wrapCount = (featuresSrc.match(/withAssetWrite\(async/g) || []).length;
-  const finishCount = (featuresSrc.match(/await finishAssetMutation\(/g) || []).length;
+  // 批量表情维护（runStickerBulkAction）以单个在途窗口包住多次逐项写入，结束时只整页重拉一次，
+  // 没有逐项 finishAssetMutation —— 这是唯一被豁免的封装点；把它整段摘掉后再数，
+  // 其余每个普通保存点仍必须严格一一配对（PR #66 复审：不允许"+1 就行"的数字放宽）。
+  const bulkAt = featuresSrc.indexOf('async function runStickerBulkAction');
+  const bulkEnd = bulkAt >= 0 ? featuresSrc.indexOf('function openSlangAssetEditor', bulkAt) : -1;
+  const singleWriteSrc = bulkAt >= 0 && bulkEnd > bulkAt
+    ? featuresSrc.slice(0, bulkAt) + featuresSrc.slice(bulkEnd)
+    : featuresSrc;
+  const wrapCount = (singleWriteSrc.match(/withAssetWrite\(async/g) || []).length;
+  const finishCount = (singleWriteSrc.match(/await finishAssetMutation\(/g) || []).length;
   const guardHit = (name) => {
     const at = appSrc.indexOf(`addEventListener('${name}'`);
     return at >= 0 && appSrc.slice(at, at + 900).includes('assetWriteInFlight');
   };
   const guardPins = wrapCount >= 5 && wrapCount === finishCount
+    && bulkAt >= 0 && bulkEnd > bulkAt
+    && featuresSrc.slice(bulkAt, bulkEnd).includes('withAssetWrite(async')
+    && featuresSrc.slice(bulkAt, bulkEnd).includes('loadAssetObservatory()')
     && featuresSrc.includes("const inFlight = { kind, id: String(entry.id ?? entry.userId ?? '') };")
     && featuresSrc.includes('state.assetDeleteInFlight = inFlight;')
     && featuresSrc.includes('if (state.assetDeleteInFlight === inFlight) state.assetDeleteInFlight = null;')
     && guardHit('asset-update') && guardHit('identity-pilot-update');
   guardPins ? pass++ : fail++;
   console.log('  ' + (guardPins ? 'OK   ' : 'FAIL ')
-    + `写入/删除在途守卫的源码约定保持（保存点包裹 ${wrapCount}/${finishCount}）`);
+    + `写入/删除在途守卫的源码约定保持（保存点包裹 ${wrapCount}/${finishCount} + 批量窗口豁免）`);
+
+  const zipImagesSrc = fs.readFileSync(path.join(ROOT, 'ui', 'core', 'zip-images.js'), 'utf8');
+  const batchPins = featuresSrc.includes('unzipStickerImages(file)')
+    && zipImagesSrc.includes("new DecompressionStream('deflate-raw')")
+    && zipImagesSrc.includes("typeof DecompressionStream === 'undefined'")
+    && featuresSrc.includes('id="sticker-batch-progress"')
+    && featuresSrc.includes('id="asset-sticker-bulk-analyze"')
+    && featuresSrc.includes('id="asset-sticker-bulk-delete"')
+    && featuresSrc.includes("'/api/assets/stickers/analyze'")
+    && fs.readFileSync(path.join(ROOT, 'src', 'console', 'app.js'), 'utf8').includes('if (body.stickerId)');
+  batchPins ? pass++ : fail++;
+  console.log('  ' + (batchPins ? 'OK   ' : 'FAIL ') + '表情包 ZIP 导入、多选批量操作与进度接口存在');
 
   // 滑条填充色不能靠 background transition 动画（2026-10-02 用户反馈"一卡一卡"）：
   // 线性渐变之间无法插值，浏览器会在过渡结束才整段切换 —— 拖动时填充追不上滑块、
@@ -2939,21 +3101,34 @@ try {
           console.log('  ' + (badOk ? 'OK   ' : 'FAIL ') + '不存在的接口确实 404（/api/usage/prices）');
           await realApp.stop();
 
-          // 切到别的 range 时，旧数据不能冒用（range 对不上会显示错的区间）
-          vm.runInContext("state.usageRange = 'today';", ctx);
-          usageBox.innerHTML = '';
-          let usedOld = false;
+          // 缓存路径的 range 校验：**两个方向都要测**，而且不能先把缓存清掉。
+          // 旧版是 `state.usageLastData = null` 之后断言"renderUsagePage 被调过" —— 那只证明
+          // force 刷新会渲染，把 usage.js 的 `range === range` 校验删掉照样全绿
+          //（2026-10-05 全审：断言恒真）。这里改成看"同步段"（缓存在 await 之前决定）：
+          //   ① 同 range → 同步段就该画一版（缓存命中）；② 换 range → 同步段一次都不该画。
+          let earlyRenders = 0;
           const origPage = ctx.renderUsagePage || sandbox.renderUsagePage;
-          ctx.renderUsagePage = sandbox.renderUsagePage = (...a) => { usedOld = true; return origPage(...a); };
-          // 先清掉缓存，模拟"新 range 没有旧数据"
-          vm.runInContext('state.usageLastData = null;', ctx);
-          usageBox.innerHTML = '';
-          await loadUsage({ force: true });
+          ctx.renderUsagePage = sandbox.renderUsagePage = (...a) => { earlyRenders += 1; return origPage(...a); };
+          vm.runInContext("state.tab = 'usage'; state.usageRange = '7';", ctx);
+          vm.runInContext("state.usageLastData = { range: '7', stats: state.usageStats || {}, st: {}, prices: {} };", ctx);
+          const sameRangeLoad = loadUsage({ force: true });
+          const sameRangeEarly = earlyRenders;
+          await sameRangeLoad;
+
+          earlyRenders = 0;
+          vm.runInContext("state.usageRange = 'today';", ctx);
+          const staleRangeLoad = loadUsage({ force: true });
+          const staleRangeEarly = earlyRenders;
+          await staleRangeLoad;
           ctx.renderUsagePage = sandbox.renderUsagePage = origPage;
           vm.runInContext("state.usageRange = '7';", ctx);
-          const ok3 = usedOld;
-          ok3 ? pass++ : fail++;
-          console.log('  ' + (ok3 ? 'OK   ' : 'FAIL ') + '切换 range 会重新渲染（不误用旧区间数据）');
+
+          const okSame = sameRangeEarly === 1;
+          okSame ? pass++ : fail++;
+          console.log('  ' + (okSame ? 'OK   ' : 'FAIL ') + '同 range 的旧数据会被立即画出来（正向对照）');
+          const okStale = staleRangeEarly === 0;
+          okStale ? pass++ : fail++;
+          console.log('  ' + (okStale ? 'OK   ' : 'FAIL ') + '切换 range 不误用旧区间数据（缓存必须被 range 校验挡住）');
         } catch (e) {
           fail++; console.log('  FAIL 抛错: ' + (e && e.message));
         } finally {
@@ -3105,6 +3280,415 @@ try {
       + (okSync ? '' : ' -> ' + JSON.stringify(mismatch)));
   }
 
+  // ── 插件页（左侧顶层 tab，2026-10-16 从「设置 → 插件」搬出来）──
+  //    渲染 + 列表来自接口 + 点「启用」打到 /api/plugins/toggle；
+  //    这一页的动作**不走保存按钮**（点了就生效），所以验的是"渲染 + 委托 + 请求体"。
+  //    ⚠️ 搬到顶层之后它**不再经过 renderSettings 的越界检查**：那条用例查的是"设置页某分区
+  //    点保存会不会写出别的分区的键"，插件页已经不在这条路径上了（它自己的写入全是 /api/plugins/*）。
+  {
+    const originalFetch = sandbox.fetch;
+    const posts = [];
+    const indexEntry = {
+      id: 'demo', name: '示例插件', version: '1.2.0', description: '一句话说明',
+      capabilities: ['tools'], tags: ['官方', '工具'], downloadUrl: 'https://example.com/demo.tar.gz', sha256: 'a'.repeat(64),
+      updatedAt: '2026-10-01', downloads: 12
+    };
+    const otherEntry = {
+      id: 'weather', name: '天气', version: '1.0.0', description: '查天气',
+      capabilities: ['tools', 'http'], tags: ['工具'], category: '工具', downloadUrl: 'https://example.com/w.tar.gz', sha256: 'b'.repeat(64),
+      // 详情页要显示"它能做什么 / 它要哪些权限"：正文、截图、外链都放进来，好断言它们真的渲染了。
+      // README 故意写成**真 markdown**（标题/列表/链接/围栏/一个 javascript: 链接）：插件 README
+      // 走 formatMinimalMarkdown 的 rich 档，这条 fixture 就是那条通路的形状钉（含"不给 javascript: 放行"）。
+      // updatedAt 故意写成**完整 ISO 时间**：第三方索引给的不一定是 `YYYY-MM-DD`，
+      // 拼 `T00:00:00` 会拼成非法日期、函数退回原样显示 —— 页面上就会顶着一串 ISO。
+      updatedAt: '2026-10-16T09:30:00Z', downloads: 3,
+      readme: [
+        '# 天气（weather）',
+        '这是天气插件的说明正文第一句。第二段。',
+        '',
+        '## 用法',
+        '- 直接问「今天天气」',
+        '- 也可以问 `天气 北京`',
+        '',
+        '1. 装好之后在群里直接问',
+        '2. 要换默认城市，去控制台改配置',
+        '',
+        '数据来自 [Open-Meteo](https://open-meteo.com/)。',
+        '',
+        '```js',
+        '// 围栏里的 # 和 - 是字面量',
+        '# 不是标题',
+        '```',
+        '',
+        '[点我](javascript:alert(1))',
+        // URL 里带 `*`：三趟替换顺序跑在同一串上（链接先、加粗后）—— 若 URL 的字符类允许 `*`，
+        // 加粗那趟就会从 href 内部一直吃到行尾，把刚生成的标签结构撕坏。
+        '坏链接 [x](https://ex.com/a**b)** 结束',
+        '',
+        // 跨行的加粗对（真 README 里就有：`…会注明**实际用了哪家、\n汇率是哪一天的**。`）——
+        // 逐行做行内处理的话这一对永远配不上，页面上会明晃晃留着两个星号。
+        '跨行加粗：**这一对星号',
+        '横跨了两行**。',
+        '',
+        // 软换行（行尾无空格）合成一行、中文之间不插空格；行尾两个空格才是硬换行
+        '软换行这两行',
+        '要合成一段',
+        '硬换行在这里  ',
+        '这里起新行'
+      ].join('\n'),
+      screenshots: ['https://example.com/shot.png'],
+      homepage: 'https://example.com/home'
+    };
+    const revokedEntry = {
+      id: 'spam', name: '被撤的插件', version: '1.0.0', description: '发广告',
+      capabilities: ['tools'], downloads: 1,
+      // updatedAt 给一个**解析不了的值**：relativeTime 的兜底是"原样显示"，不能被悄悄吃掉
+      //（既不能变空、也不能变 NaN —— 页面上顶着一串原文本，总比什么都没有强）
+      updatedAt: '不确定',
+      revoked: '被举报：往群里发广告', compatible: false, reason: '已被撤回：被举报：往群里发广告',
+      downloadUrl: 'https://example.com/s.tar.gz', sha256: 'c'.repeat(64)
+    };
+    // 第四条：撤回 + **没装**。与上面那条（撤回 + 已装）配成一对 —— 这两种情况动作区的话
+    // 必须不一样（"不能安装" vs "已安装但不会被加载"），只留一条的话那个分支永远是死的。
+    // 第五条：只有契约强制字段（id/version/sha/地址），没有 name / description / tags。
+    // 第三方索引完全可能这样写 —— 卡片和详情必须用 id 兜底，不能顶一行空白。
+    const bareEntry = {
+      id: 'bare-one', version: '0.1.0', description: '',
+      capabilities: ['tools'], downloadUrl: 'https://example.com/b.tar.gz', sha256: 'e'.repeat(64)
+    };
+    const retiredEntry = {
+      id: 'retired', name: '退休插件', version: '0.2.0', description: '没人维护了',
+      capabilities: ['tools'], tags: ['社区'], updatedAt: '2026-08-01',
+      revoked: '作者申请下架', compatible: false, reason: '已被撤回：作者申请下架',
+      downloadUrl: 'https://example.com/r.tar.gz', sha256: 'd'.repeat(64)
+    };
+    const installedState = {
+      enabled: true, requireIsolation: true, indexUrl: 'https://example.com/index.json',
+      isolation: { supported: true, fs: true, childProcess: true, worker: true, net: false, env: false },
+      plugins: [{
+        id: 'demo', installed: true, enabled: false, error: '',
+        manifest: {
+          name: '示例插件', version: '1.0.0', description: '',
+          capabilities: ['tools', 'observe'], tools: ['ping', 'seen'], schedule: []
+        },
+        status: { state: 'running', netIsolated: false, unconfined: true, rssKb: 2048, limits: {} },
+        install: { source: '索引：官方', url: 'https://example.com/demo.tar.gz', sha256: 'a'.repeat(64), version: '1.0.0', publisher: 'alice', signatureVerified: true, installedAt: Date.now(), upgraded: false },
+        revoked: '', lazy: false
+      }, {
+        // 已装 + 被撤回（撤回名单来自索引、装机状态在本机，这是真实存在的组合）
+        id: 'spam', installed: true, enabled: false, error: '',
+        manifest: { name: '被撤的插件', version: '1.0.0', description: '', capabilities: ['tools'], tools: ['push'], schedule: [] },
+        status: { state: 'stopped', netIsolated: false, unconfined: true, rssKb: 0, limits: {} },
+        install: { source: '索引：官方', url: 'https://example.com/s.tar.gz', sha256: 'c'.repeat(64), version: '1.0.0', publisher: 'bob', signatureVerified: true, installedAt: Date.now(), upgraded: false },
+        revoked: '被举报：往群里发广告', lazy: false, backups: []
+      }]
+    };
+    sandbox.fetch = async (url, options = {}) => {
+      const target = String(url);
+      const method = String(options?.method || 'GET').toUpperCase();
+      if (method === 'POST') {
+        posts.push({ target, body: options.body ? JSON.parse(options.body) : null });
+        return { ok: true, status: 200, json: async () => ({ ok: true, ...installedState }) };
+      }
+      if (target.includes('/api/plugins/index')) {
+        return { ok: true, status: 200, json: async () => ({ ok: true, plugins: [indexEntry, otherEntry, revokedEntry, retiredEntry, bareEntry], skipped: [], sources: [{ url: 'https://example.com/index.json', name: '官方', ok: true, count: 5 }] }) };
+      }
+      if (target.includes('/api/plugins')) {
+        return { ok: true, status: 200, json: async () => ({ ...installedState }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    };
+    vm.runInContext("state.tab = 'plugins';", ctx);
+    await vm.runInContext('loadPluginsPage({ force: true })', ctx);
+    // 三块是异步填的（loadPluginsPage → refreshPlugins），等一拍让桩的 Promise 落地
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const sectionHtml = String(document.getElementById('plugins-page')?.innerHTML || '');
+    const installedHtml = String(document.getElementById('plugins-installed')?.innerHTML || '');
+    const indexHtml = String(document.getElementById('plugins-index')?.innerHTML || '');
+    const isolationText = String(document.getElementById('plugins-isolation')?.textContent || '');
+    const facetsHtml = String(document.getElementById('plugins-facets')?.innerHTML || '');
+    const rendered = sectionHtml.includes('id="plugins-head"')        // 顶栏页头（页面化之后的锚点）
+      && installedHtml.includes('示例插件')
+      && installedHtml.includes('data-plugin-action="enable"')
+      && installedHtml.includes('给模型加工具')
+      && indexHtml.includes('已安装')                     // 索引里已装的那项显示"已安装"而不是再给个安装按钮
+      && sectionHtml.includes('第三方代码')
+      && isolationText.includes('网络')                   // 如实说明网络这一项的实际情况
+      && installedHtml.includes('发布者 alice（签名已验证）')   // 发布者/验签结论要真的到界面（这条链路漏搬过一次）
+      // 「已装」的行也要能点进详情（用户反馈：那一页点了没反应）。与目录卡片同一套属性
+      && /data-plugin-open="demo"[^>]*tabindex="0"[^>]*role="button"/.test(installedHtml)
+      && installedHtml.includes('未隔离')                  // 降级运行（unconfined）要在界面上标出来，不能只在日志里
+      && installedHtml.includes('网络未隔离')               // 这个桩没网络隔离，要如实说
+      && sectionHtml.includes('id="plugins-search"')      // 搜索框
+      // 四组筛选全在左栏里：范围 / 分类 / 标签 / 其他。标签原来单独横铺在卡片上方
+      // （#plugins-tags），2026-10-17 用户指出那位置难看 —— 参照里筛选都在侧栏。
+      && facetsHtml.includes('标签') && facetsHtml.includes('data-plugin-tag')
+      && facetsHtml.includes('范围') && facetsHtml.includes('分类')
+      && !sectionHtml.includes('id="plugins-tags"')
+      // 而且它得**看得见**：全局 `[hidden] { display:none !important }` 会压过内联 display，
+      // 所以必须查属性而不是 style（2026-10-16 审查就是这样抓到一个"永远不可见"的真 bug）
+
+      && installedHtml.includes('升级到 v1.2.0')           // 索引里有更新版本 → 给升级入口
+      // 撤回条目：说"已被撤回"（含原因），且**不许出现"本机装不了"**
+      // （只查 includes('已撤回') 是假断言：名字后面那个 pill 也是"已撤回"三个字，
+      //   把操作格改回"本机装不了"照样绿 —— 变异验证抓到的）
+      && indexHtml.includes('已被撤回：被举报')
+      && !indexHtml.includes('本机装不了')
+      && sectionHtml.includes('id="plugins-sort"');         // 市场排序控件
+
+    // 点「启用」：走 #plugins-page 上的事件委托 → POST /api/plugins/toggle
+    const enableBtn = { dataset: { pluginAction: 'enable', pluginId: 'demo' }, disabled: false };
+    const delegate = (document.getElementById('plugins-page')?._listeners?.click || [])[0];
+    let toggled = false;
+    if (delegate) {
+      // closest 要按选择器回答（真实的 closest 就是这样）：点的是「启用」按钮，它不在标签 chip 里。
+      // 桩写成 closest 恒返回 enableBtn 会变成「任意选择器都命中」——新增的标签筛选支路会把它当成标签点击
+      // closest 要按选择器回答：点的是「启用」按钮，它不在标签 chip / 详情入口里。
+      // （这个桩已经是第二次被新支路绊到 —— 以后这里再加属性选择器，记得同步这条）
+      const notMe = ['data-plugin-tag', 'data-plugin-open', 'data-plugin-close'];
+      await delegate({ target: { closest: (sel) => (notMe.some((attr) => String(sel).includes(attr)) ? null : enableBtn) } });
+      toggled = posts.some((entry) => entry.target.includes('/api/plugins/toggle')
+        && entry.body?.id === 'demo' && entry.body?.enabled === true);
+    }
+    // 搜索：typing 之后只剩匹配的那条（纯前端过滤，不因此多发请求）
+    let filtered = false;
+    let requestsDuringSearch = 0;
+    const searchInput = document.getElementById('plugins-search');
+    const inputListener = (searchInput?._listeners?.input || [])[0];
+    if (inputListener) {
+      const before = posts.length;
+      searchInput.value = '天气';
+      await inputListener({ target: searchInput });
+      requestsDuringSearch = posts.length - before;
+      const afterHtml = String(document.getElementById('plugins-index')?.innerHTML || '');
+      filtered = afterHtml.includes('天气') && !afterHtml.includes('示例插件');
+    }
+    // 离开插件页再回来（渲染第二次）：搜索框必须还是活的 —— 它挂在每次渲染都会被换掉的元素上，
+    // 只绑一次的话第二次进来输入框就没反应了（而旧的搜索词还生效，列表看起来"莫名其妙少了一半"）
+    vm.runInContext("state.tab = 'control';", ctx);
+    await vm.runInContext('switchTab', ctx) && vm.runInContext("switchTab('control')", ctx);
+    vm.runInContext("state.tab = 'plugins';", ctx);
+    await vm.runInContext('loadPluginsPage({ force: true })', ctx);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    let reRenderSearch = false;
+    const search2 = document.getElementById('plugins-search');
+    const input2 = (search2?._listeners?.input || [])[0];
+    if (input2) {
+      search2.value = '天气';
+      await input2({ target: search2 });
+      const html2 = String(document.getElementById('plugins-index')?.innerHTML || '');
+      reRenderSearch = html2.includes('天气') && !html2.includes('示例插件');
+      search2.value = '';
+      await input2({ target: search2 });
+    }
+
+    // 这几次点击都不是"标签 chip / 详情入口"上的点击 —— 桩的 closest 要按这个回答
+    // （真实 DOM 的 closest 只返回带该属性的元素；桩要是恒返回按钮，新支路就会把它当成别的点击）
+    const notAction = ['data-plugin-tag', 'data-plugin-open', 'data-plugin-close'];
+    const closestFor = (button) => ({ closest: (sel) => (notAction.some((attr) => String(sel).includes(attr)) ? null : button) });
+
+    // 升级：点了要发 /api/plugins/install（body 里是 id）
+    let upgradePosted = false;
+    const upgradeBtn = { dataset: { pluginAction: 'upgrade', pluginId: 'demo' }, disabled: false };
+    const delegate2 = (document.getElementById('plugins-page')?._listeners?.click || [])[0];
+    if (delegate2) {
+      const before = posts.length;
+      await delegate2({ target: closestFor(upgradeBtn) });
+      upgradePosted = posts.slice(before).some((entry) => entry.target.includes('/api/plugins/install') && entry.body?.id === 'demo');
+    }
+
+    // 手动安装：地址/sha256 形状不对时**不许**发请求（前端先拦一道）
+    let manualBlocked = false;
+    const manualBtn = { dataset: { pluginAction: 'install-url', pluginId: '' }, disabled: false };
+    const urlBox = document.getElementById('plugins-manual-url');
+    const shaBox = document.getElementById('plugins-manual-sha');
+    if (urlBox && shaBox && delegate2) {
+      const before = posts.length;
+      urlBox.value = 'ftp://x/y.tar.gz';
+      shaBox.value = 'zz';
+      await delegate2({ target: closestFor(manualBtn) });
+      manualBlocked = posts.length === before;
+    }
+
+    // ── 发布插件（作者入口）：页签在、指南里三类命令与三条渠道都在、外链只走 https ──
+    //   控制台跑在使用者服务器上，没有他 GitHub 的写权限 —— 所以这一页**只给命令与提交入口**，
+    //   不能做成一个假的"发布"按钮。这条用例钉的就是"入口真存在且说的是真话"。
+    let publishEntry = false;
+    {
+      const pub = sectionHtml.includes('data-plugin-pane="publish"')
+        && sectionHtml.includes('发布插件')
+        && sectionHtml.includes('data-plugin-pane-body="publish"')
+        && sectionHtml.includes('node scripts/plugin-create.mjs')
+        && sectionHtml.includes('node scripts/plugin-dev.mjs')
+        && sectionHtml.includes('node scripts/plugin-pack.mjs')
+        // 三条分发渠道各一句：官方索引 / 自己的索引 / 直接给包
+        && sectionHtml.includes('plugins.indexUrls')
+        && sectionHtml.includes('qq-agent-plugins')
+        && sectionHtml.includes('手动安装')
+        && sectionHtml.includes('docs/PLUGINS.md')
+        // 入口的形状：做成按钮，不是第四个页签（页签样式会被读成"又一个筛选面"）
+        && sectionHtml.includes('plugin-publish-cta')
+        && !sectionHtml.includes('plugin-tab-publish')
+        // 索引来源挪到列表尾部（顶部只留拉取失败的告警）—— 顺序也要对：
+        // 卡片容器在来源落款之前，告警槽在卡片之前
+        && sectionHtml.includes('plugin-index-foot') && sectionHtml.includes('plugin-index-warn')
+        && sectionHtml.indexOf('id="plugins-index"') < sectionHtml.indexOf('id="plugins-sources"')
+        && sectionHtml.indexOf('id="plugins-index-warn"') < sectionHtml.indexOf('id="plugins-index"')
+        // 外链只许 https：这里是唯一会跳出控制台的地方，http 会让中间人换掉目标
+        && !/href="http:\/\//.test(sectionHtml);
+      // 页签**能不能切过去**这一条放在 ui-smoke 里测：这个文件的 DOM 是手写桩，
+      // `querySelectorAll` 恒返回 []、也没有 hidden 属性 API —— 在这里写"元素可见"永远为真。
+      publishEntry = pub;
+    }
+
+    // ── 市场排序：默认"最近更新"与"按下载量"必须给出**相反**的顺序（维度要是空的，这里就一样了）──
+    //    断言只用这两个维度：它们的比较对象是 ISO 文本与数字，跟本机 collation 无关。
+    //    （"按名字"用的是 localeCompare，中文名之间的先后随 locale 变 —— zh-CN 与 en 下相反，
+    //      拿它写死期望值就是一条跟着机器变的用例。）
+    const sortedByUpdated = indexHtml.indexOf('天气') < indexHtml.indexOf('示例插件');   // 天气更新于更近
+    let sortedByDownloads = false;
+    const sortSelect = document.getElementById('plugins-sort');
+    const sortListener = (sortSelect?._listeners?.change || [])[0];
+    if (sortListener) {
+      sortSelect.value = 'downloads';
+      await sortListener({ target: sortSelect });
+      const byDownloads = String(document.getElementById('plugins-index')?.innerHTML || '');
+      sortedByDownloads = byDownloads.indexOf('示例插件') < byDownloads.indexOf('天气');   // 12 > 3
+      sortSelect.value = 'updated';
+      await sortListener({ target: sortSelect });
+      const backToUpdated = String(document.getElementById('plugins-index')?.innerHTML || '');
+      // 切回来还要复原（选中项驱动渲染，不是单向的）
+      sortedByDownloads = sortedByDownloads && backToUpdated.indexOf('天气') < backToUpdated.indexOf('示例插件');
+    }
+
+    // ── 详情页：点插件名进去看 README / 逐条权限，再返回列表 ──
+    //   这一段原来**一条断言都没有**（桩的 closest 对 data-plugin-open 恒返回 null），于是详情渲染里
+    //   一个 TDZ 的 ReferenceError 一直藏在"点了没反应"里 —— 整页从未渲染成功过。
+    let detailOpened = false;
+    let detailClosed = false;
+    let tagChipWorks = false;
+    let revokedInstalled = false;
+    let revokedDetail = false;
+    const openSpan = { dataset: { pluginOpen: 'weather' } };
+    const revokedOpen = { dataset: { pluginOpen: 'spam' } };
+    const retiredOpen = { dataset: { pluginOpen: 'retired' } };
+    const closeSpan = { dataset: { pluginClose: '1' } };
+    const detailDelegate = (document.getElementById('plugins-page')?._listeners?.click || [])[0];
+    if (detailDelegate) {
+      await detailDelegate({
+        target: { closest: (sel) => (String(sel).includes('data-plugin-open') ? openSpan : null) }
+      });
+      const detailHtml = String(document.getElementById('plugins-index')?.innerHTML || '');
+      // 通用不变量：**任何 href 属性里都不许出现 `<`** —— 属性逃逸、以及“标签被别的替换趟撕坏”
+      // 两种改坏法都会撞上它（happy-dom 之外的浏览器也认这条）。
+      const badHref = /href="[^"]*</.test(detailHtml);
+      detailOpened = detailHtml.includes('这是天气插件的说明正文第一句')
+        && detailHtml.includes('它要哪些权限')
+        && detailHtml.includes('给模型加工具：模型可以在对话里调用它')          // 权限的人话解释（市场立信任靠它）
+        && detailHtml.includes('联网（经宿主）：它的网络请求走宿主这条路')
+        && detailHtml.includes('← 返回目录')      // 分节名从「插件市场」收敛成「目录」，返回入口跟着改口径
+        && detailHtml.includes('https://example.com/shot.png')                    // 截图字段要真的渲染
+        && detailHtml.includes('https://example.com/home')                        // 外链（过协议白名单后仍要在）
+        && detailHtml.includes('sha256')                                          // 装之前看得到内容指纹
+        // ── 版式（第六版：面包屑 + 色带 Hero + 正文/侧栏两栏，照 VS Code 市场详情页）──
+        && detailHtml.includes('plugin-crumbs')                                   // 面包屑：知道自己在哪一层
+        && detailHtml.includes('plugin-hero')                                     // Hero 色带：大图标/大名字/一行统计/主按钮
+        && detailHtml.includes('plugin-detail-aside')                             // 右栏：标签/资源/作者/指纹
+        && detailHtml.includes('<h3 class="plugin-detail-name">天气</h3>')         // 名字是页面的 h1 位（不是 320px 栏里的小字）
+        && detailHtml.includes('<button class="btn btn-primary" data-plugin-action="install" data-plugin-id="weather">安装</button>')  // 主动作就在 Hero 里（不在正文底部）
+        // ── README 的 rich markdown（title 真成标题、列表真成列表、链接真能点）──
+        && detailHtml.includes('<h3 class="md-h">天气（weather）</h3>')            // `#` 降一档成 h3（页面 h1 由 hero 占）
+        && detailHtml.includes('<h4 class="md-h">用法</h4>')                      // `##` → h4
+        && detailHtml.includes('<ul class="md-ul"><li>直接问「今天天气」</li>')     // `- x` → 真列表项
+        && detailHtml.includes('<a href="https://open-meteo.com/" target="_blank" rel="noopener noreferrer">Open-Meteo</a>')
+        && detailHtml.includes('<li>也可以问 <code>天气 北京</code></li>')          // 列表项里的行内码也渲染了
+        && detailHtml.includes('<ol class="md-ol"><li>装好之后在群里直接问</li><li>要换默认城市，去控制台改配置</li></ol>')  // 有序列表归块
+        && detailHtml.includes('<p class="md-p">数据来自 <a href=')                 // 空行分段：正文成 <p>（不再是一堆裸文本行）
+        && detailHtml.includes('更新于 ') && !detailHtml.includes('T09:30')    // updatedAt 走了相对时间（不顶着 ISO：第三方索引给的就是完整时间）
+        && detailHtml.includes('# 不是标题')                                       // 围栏里的 # 保持字面量（没被当标题）
+        && detailHtml.includes('href="javascript:') === false                     // 非 http(s) 链接**不给放行**
+        && detailHtml.includes('[点我](javascript:alert(1))')                      // 而是原样留在文本里（信息还在，门关着）
+        && !badHref                                                                // href 里没被别的替换趟钻进去
+        && detailHtml.includes('<strong>这一对星号横跨了两行</strong>')                // 跨行的 ** 也能配上（逐行处理会漏）
+        // 这四行之间没有空行 → 属于**同一个段落**：软换行合成一行、行尾两空格才是 <br>
+        && detailHtml.includes('<p class="md-p">软换行这两行要合成一段硬换行在这里<br>这里起新行</p>')
+        // 详情替换掉的是**目录列表本身**（目录卡片没了、详情在），而不是"别的插件名一个字都不许出现"
+        // —— 详情底部现在有「相关插件」（同分类/同标签的条目，参照里每个插件详情页都有这一节），
+        // 那里出现别的插件名是正常的。
+        // ⚠️ 这里用**字符串**判定而不是 querySelector：happy-dom 对 `#a .b` 这种后代选择器的
+        // querySelector 会返回一个非 null 的怪东西（同一选择器 querySelectorAll 是 0、
+        // firstElementChild 是 null），拿它当断言会得到一个永远为假的判定。
+        && !detailHtml.includes('plugin-card')
+        // 相关插件（同标签的 demo）：参照里每个详情页都有这一节；它恒空或被砍掉时这条要红
+        && detailHtml.includes('plugin-related') && detailHtml.includes('示例插件')
+        // 右栏四块的分节名（标签/资源/作者/出处与指纹）—— 右栏被整个删掉时这里要红
+        && detailHtml.includes('出处与指纹') && detailHtml.includes('源码 / 主页');
+
+      // ── 详情里的标签 chip：点了要**回到按标签筛过的目录**，不能原地重画同一个详情 ──
+      //   （原来的实现只改 pluginFilter.tag 就重画，于是页面纹丝不动、目录还落进筛选态；
+      //     分面栏在详情里是藏着的，用户看不出筛选是什么时候被设上的）
+      const tagSpan = { dataset: { pluginTag: '工具' } };
+      await detailDelegate({
+        target: { closest: (sel) => (String(sel).includes('data-plugin-tag') ? tagSpan : null) }
+      });
+      const tagged = String(document.getElementById('plugins-index')?.innerHTML || '');
+      tagChipWorks = !tagged.includes('plugin-detail') && tagged.includes('plugin-card');
+      // 再点一次同一个标签把它关掉（否则筛选态会跟到后面的断言里）
+      await detailDelegate({
+        target: { closest: (sel) => (String(sel).includes('data-plugin-tag') ? tagSpan : null) }
+      });
+
+      // ── 被撤回的插件详情：动作区不许说"安装"，Hero 下面要挂撤回原因 ──
+      //   用 retired（撤回 + **没装**）：spam 现在装在本机，走的是下面那条"已安装"的分支
+      await detailDelegate({
+        target: { closest: (sel) => (String(sel).includes('data-plugin-open') ? retiredOpen : null) }
+      });
+      const revokedHtml = String(document.getElementById('plugins-index')?.innerHTML || '');
+      revokedDetail = revokedHtml.includes('已被撤回，不能安装')
+        && revokedHtml.includes('已被撤回：作者申请下架')                   // 原因要出现在 Hero 的告警行里
+        && !revokedHtml.includes('data-plugin-action="install"')          // 撤回的条目**一个安装按钮都不许有**
+        && revokedHtml.includes('更新于 ') && !revokedHtml.includes('2026-08-01')   // 能解析的走相对时间，不露原文
+        && revokedHtml.includes('plugin-warn bad');                       // 告警行有专属类（红色那档）
+
+      // ── 已装 + 被撤回：那句话必须换成"不会被加载"，且只给卸载（不给启停/回退）──
+      //   撤回名单来自索引、装机状态在本机，这是真实存在的组合；给它说"不能安装"是错的。
+      await detailDelegate({
+        target: { closest: (sel) => (String(sel).includes('data-plugin-open') ? openSpan : null) }
+      });
+      await detailDelegate({
+        target: { closest: (sel) => (String(sel).includes('data-plugin-open') ? revokedOpen : null) }
+      });
+      const bannedHtml = String(document.getElementById('plugins-index')?.innerHTML || '');
+      revokedInstalled = bannedHtml.includes('已安装，但已被撤回：不会被加载')
+        && !bannedHtml.includes('已被撤回，不能安装')                      // 已装的不许说"不能安装"
+        && bannedHtml.includes('data-plugin-action="uninstall"')           // 卸载要留着（撤回的正该清掉）
+        && !bannedHtml.includes('data-plugin-action="enable"')             // 启停/回退一个都不给
+        && !bannedHtml.includes('data-plugin-action="disable"')
+        && !bannedHtml.includes('data-plugin-action="rollback"');
+      await detailDelegate({
+        target: { closest: (sel) => (String(sel).includes('data-plugin-close') ? closeSpan : null) }
+      });
+      const backHtml = String(document.getElementById('plugins-index')?.innerHTML || '');
+      detailClosed = backHtml.includes('示例插件') && backHtml.includes('天气');
+    }
+
+    sandbox.fetch = originalFetch;
+    const ok = rendered && toggled && filtered && requestsDuringSearch === 0
+      && reRenderSearch && upgradePosted && manualBlocked
+      && sortedByUpdated && sortedByDownloads && detailOpened && detailClosed
+      // 缺 name 的条目要用 id 顶上，而不是渲染成空白卡片
+      && indexHtml.includes('<span class="plugin-name">bare-one</span>')   // 缺 name → 可见标题用 id（不是只有 data 属性里有）
+      && tagChipWorks && revokedDetail && revokedInstalled && publishEntry;
+    ok ? pass++ : fail++;
+    console.log('  ' + (ok ? 'OK   ' : 'FAIL ')
+      + '设置页插件分区（渲染=' + rendered + '，点启用→toggle=' + toggled + '，搜索过滤=' + filtered
+      + '，二次渲染后搜索=' + reRenderSearch + '，升级发请求=' + upgradePosted + '，坏输入拦住=' + manualBlocked
+      + '，排序=' + [sortedByUpdated, sortedByDownloads].join('/') + '，详情=' + detailOpened + '/' + detailClosed
+      + '，标签chip=' + tagChipWorks + '，撤回详情=' + revokedDetail + '，撤回+已装=' + revokedInstalled
+      + '，发布入口=' + publishEntry + '）'
+      + (ok ? '' : ' -> 委托=' + Boolean(delegate) + ' posts=' + posts.length));
+  }
+
   // ── 保存分支回归（2026-09-28 审查 P1）：控件在哪个页面，patch 就得在哪一段构造 ——
   //    曾经把 tts / groupGame 的保存块放进 moments 分支，等于在看得见控件的页面上点保存什么都不会存。
   {
@@ -3124,6 +3708,10 @@ try {
       ['groupGame', ['groupGame']],
       ['moments', ['groupDigest']],
       ['reminders', ['reminders']],
+      ['messageTypes', ['messageTypes']],
+      // 插件页：动作全走 /api/plugins/*（点了就生效），所以这一页**一个配置键都不该写**。
+      // 空数组 = 只跑"越界检查"那一半：别的页保存时也不许把 plugins 带上。
+      ['plugins', []],
       // 闲聊页（chat）是"控件最多的那页"：新加的收藏三件套就走这一段构造，
       // 列全它写出的键，顺手把"贴纸键从 chat 段写出去"钉住。
       ['chat', ['wakeDelayMinMs', 'wakeDelayMaxMs', 'wakeDelayMs', 'drainDelayMs', 'maxConcurrentRuns',
@@ -3306,41 +3894,52 @@ try {
       + `出错提示后退回同样内容能重新渲染（缓存复位=${okRecover}，控制页结构标志归零=${okHub}）`);
   }
 
-  // ── 群友备注的写入形状（2026-09-29 审查 P1）──
+  // ── 群友备注的写入形状（2026-09-29 审查 P1；2026-10-10 多写方跟进）──
   //    备注写回必须走 __replace__ 整体替换：普通深合并删不掉键，"清空/删除备注"会看着成功、实际没变。
-  //    控制台只有 saveMemberNote 一个写入口（会话记忆页与人物记忆页共用），这里钉住它的三种调用。
+  //    memberNotes 现在有两个写入方（控制台 + 群里让机器人用 set_member_note 记），所以
+  //    saveMemberNote 每次提交前都会重取一次现值再拼整表 —— 用**动态的服务端表**演：
+  //    POST 的 __replace__ 结果会写回"服务端"，GET 返回它的当前值。
   {
     const originalFetch = sandbox.fetch;
     const posts = [];
+    let serverNotes = { '42': '老张', '43': '小李' };
     sandbox.fetch = async (url, options = {}) => {
       const method = String(options.method || 'GET').toUpperCase();
       const body = options.body ? JSON.parse(options.body) : null;
       posts.push({ url: String(url), method, body });
       if (method === 'GET') {
         // /api/config 的 GET 直接返回配置本身（控制台就是这么用的）
-        return { ok: true, status: 200, json: async () => ({ memberNotes: { '42': '服务端上的老张' } }) };
+        return { ok: true, status: 200, json: async () => ({ memberNotes: { ...serverNotes } }) };
       }
-      return { ok: true, status: 200, json: async () => ({ ok: true, config: { memberNotes: body.memberNotes.__replace__ } }) };
+      serverNotes = { ...(body?.memberNotes?.__replace__ || {}) };
+      return { ok: true, status: 200, json: async () => ({ ok: true, config: { memberNotes: { ...serverNotes } } }) };
     };
+
+    // 群里刚用 set_member_note 记过一条（控制台的旧快照里没有）：写入时必须带上它，
+    // 不许被旧快照整表覆盖（2026-10-10 复核的丢数据场景）
+    serverNotes['77'] = '群里刚记的';
 
     vm.runInContext("state.config = { memberNotes: { '42': '老张', '43': '小李' } };", ctx);
     await ctx.saveMemberNote('42', '张三');
     const setBody = posts.at(-1)?.body;
     const okSet = setBody?.memberNotes?.__replace__?.['42'] === '张三'
       && setBody.memberNotes.__replace__['43'] === '小李'
+      && setBody.memberNotes.__replace__['77'] === '群里刚记的'
       && setBody.memberNotes['42'] === undefined;   // 普通对象形态会让服务端把旧值并回来
 
     await ctx.saveMemberNote('42', '');              // 传空串 = 删除这条备注
     const delBody = posts.at(-1)?.body;
     const okDel = Boolean(delBody?.memberNotes?.__replace__) && !('42' in delBody.memberNotes.__replace__)
-      && delBody.memberNotes.__replace__['43'] === '小李';
+      && delBody.memberNotes.__replace__['43'] === '小李'
+      && delBody.memberNotes.__replace__['77'] === '群里刚记的';
 
-    // state.config 还没拉到就先取一次现值打底：否则 __replace__ 会把服务端已有的备注整体清掉
+    // state.config 还没拉到（或已过期）也先取一次现值打底：否则 __replace__ 会把服务端已有
+    // 的备注（含群里刚记的）整体清掉
     vm.runInContext('state.config = null;', ctx);
     await ctx.saveMemberNote('43', '小李子');
     const guardBody = posts.at(-1)?.body;
     const okGuard = guardBody?.memberNotes?.__replace__?.['43'] === '小李子'
-      && guardBody.memberNotes.__replace__['42'] === '服务端上的老张';
+      && guardBody.memberNotes.__replace__['77'] === '群里刚记的';
 
     // 还原：后面还有用例要按正常配置渲染分区（state.config 为 null 时 renderApiSection 会抛错）
     vm.runInContext(`state.config = ${JSON.stringify(cfg)};`, ctx);
@@ -3348,7 +3947,7 @@ try {
     const ok = okSet && okDel && okGuard;
     ok ? pass++ : fail++;
     console.log('  ' + (ok ? 'OK   ' : 'FAIL ')
-      + `备注写入走 __replace__（新增=${okSet}，删除=${okDel}，配置未加载时不误清=${okGuard}）`);
+      + `备注写入走 __replace__（新增=${okSet}，删除=${okDel}，未加载/多写方时不误清=${okGuard}）`);
   }
 
   // ── 存档页 / 顶栏刷新的合并（2026-09-29 审查 P2）──
@@ -3367,7 +3966,7 @@ try {
     const originalRefreshStatus2 = originalRefreshStatus;
     let statusCalls = 0;
     sandbox.refreshStatus = () => { statusCalls++; };
-    // 存档页另有一条每 4 秒的列表轮询（startListPoller，见 ui/app.js:1834）：不把它挪开，
+    // 存档页另有一条每 4 秒的列表轮询（startListPoller，ui/app.js 里启动的那个）：不把它挪开，
     // 它就会在观测窗口里插一脚，"5 次事件只刷一轮"的断言会变成看运气。
     sandbox.refreshIntervalMs = () => 3600 * 1000;
     ctx.startListPoller();
@@ -3423,7 +4022,8 @@ try {
     const afterStale = String(detail.innerHTML || '');
     sandbox.fetch = originalFetch;
 
-    const rendered = /的记忆/.test(afterFresh);                        // 防止用例空转（成功路径真跑到了）
+    // 标题 2026-10-19 改成「… 的会话记忆」：哨兵跟着标题走，别再用旧文案"的记忆"空转
+    const rendered = /的会话记忆/.test(afterFresh);                     // 防止用例空转（成功路径真跑到了）
     const ok = rendered && afterStale === afterFresh;
     ok ? pass++ : fail++;
     console.log('  ' + (ok ? 'OK   ' : 'FAIL ')
@@ -3460,11 +4060,18 @@ try {
   {
     const originalFetch = sandbox.fetch;
     const posts = [];
+    // 迷你服务端：GET /api/config 返回配置本身（控制台就是这么用的），POST 按 __replace__ 真回写。
+    // 不回写的话，"清空一个已存在的备注"这条分支永远走不到。
+    let serverNotes = {};
     sandbox.fetch = async (url, options = {}) => {
       const method = String(options.method || 'GET').toUpperCase();
-      posts.push({ url: String(url), method, body: options.body ? JSON.parse(options.body) : null });
-      if (method === 'GET') return { ok: true, status: 200, json: async () => ({ files: [], memberNotes: {} }) };
-      return { ok: true, status: 200, json: async () => ({ ok: true, config: { memberNotes: {} } }) };
+      const body = options.body ? JSON.parse(options.body) : null;
+      posts.push({ url: String(url), method, body });
+      if (method === 'GET') {
+        return { ok: true, status: 200, json: async () => ({ files: [], memberNotes: { ...serverNotes } }) };
+      }
+      if (body?.memberNotes?.__replace__) serverNotes = { ...body.memberNotes.__replace__ };
+      return { ok: true, status: 200, json: async () => ({ ok: true, config: { memberNotes: { ...serverNotes } } }) };
     };
     // 这个页面脚本在真实控制台里随 index.html 加载；这里在同一个 vm 里执行它，
     // 然后直接触发"保存"按钮绑定的那个处理器。
@@ -3481,16 +4088,253 @@ try {
     if (handler) await handler({ currentTarget: saveBtn });
     const body = posts.find((p) => p.method === 'POST')?.body;   // 之后还会跟一次 GET（刷新名单）
     const statusText = String(document.getElementById('gm-anynote-status')?.textContent || '');
-    sandbox.fetch = originalFetch;
 
     const ok = Boolean(handler)
       && body?.memberNotes?.__replace__?.['12345'] === '沉默群友'
-      && statusText.includes('已保存')
+      && statusText.includes('备注已保存')
+      // 只查"已保存"不够：这次修复的要点就是把它和"名单里没有这个 QQ"分开说，
+      // 断言不钉住后半句的话，把区分删掉用例照样绿（2026-10-13）。
+      && statusText.includes('上面的名单里没有这个 QQ')
       && noteInput.value === '';
     ok ? pass++ : fail++;
     console.log('  ' + (ok ? 'OK   ' : 'FAIL ')
       + `按 QQ 设备注：走 __replace__ 写入口并回报状态（状态="${statusText}"）`
       + (ok ? '' : ' -> ' + JSON.stringify(body) + ' handler=' + Boolean(handler)));
+
+    // 清空备注走的是删除分支，状态必须说"已删除"，不能混进上面那两句里的任何一句。
+    // ⚠️ 这几段都要跑在**本段自己装的假服务端**上：早先这里把 fetch 提前还原了，
+    //    后面补的删除/空备注断言就全跑在空桩上（hadNote 恒 false，删除分支永远绿）。
+    noteInput.value = '';
+    posts.length = 0;
+    if (handler) await handler({ currentTarget: saveBtn });
+    const clearedStatus = String(document.getElementById('gm-anynote-status')?.textContent || '');
+    const clearedOk = clearedStatus.includes('已删除：12345');
+    clearedOk ? pass++ : fail++;
+    console.log('  ' + (clearedOk ? 'OK   ' : 'FAIL ')
+      + `按 QQ 设备注：清空备注走删除分支（状态="${clearedStatus}"）`);
+
+    // 本来就没有备注时不该回"已删除"（审查提的：什么都没删就别报删除）。
+    qqInput.value = '99999';
+    posts.length = 0;
+    if (handler) await handler({ currentTarget: saveBtn });
+    const emptyStatus = String(document.getElementById('gm-anynote-status')?.textContent || '');
+    const emptyOk = emptyStatus.includes('本来就没有备注：99999');
+    emptyOk ? pass++ : fail++;
+    console.log('  ' + (emptyOk ? 'OK   ' : 'FAIL ')
+      + `按 QQ 设备注：本来没有备注时不说"已删除"（状态="${emptyStatus}"）`);
+
+    // 非法 QQ：只提示、不发请求（改了那个正则而没人挡，这里要红）
+    qqInput.value = 'abc';
+    posts.length = 0;
+    if (handler) await handler({ currentTarget: saveBtn });
+    const badStatus = String(document.getElementById('gm-anynote-status')?.textContent || '');
+    const badOk = badStatus.includes('QQ 号要填纯数字') && !posts.some((p) => p.method === 'POST');
+    badOk ? pass++ : fail++;
+    console.log('  ' + (badOk ? 'OK   ' : 'FAIL ')
+      + `按 QQ 设备注：非法 QQ 只提示、不发请求（状态="${badStatus}"）`);
+    sandbox.fetch = originalFetch;   // 本段的所有场景都跑完了，最后再还原
+  }
+
+  // ── 人物记忆页「按 QQ 设备注」：名单里已经有印象的人，不该再提示"不在名单里"（2026-10-13）──
+  //    与上一条配对：两条一起才钉住"两种情况说法不同"。只留一条的话，把判断反了也不会红。
+  {
+    const originalFetch = sandbox.fetch;
+    const posts = [];
+    sandbox.fetch = async (url, options = {}) => {
+      const method = String(options.method || 'GET').toUpperCase();
+      posts.push({ url: String(url), method, body: options.body ? JSON.parse(options.body) : null });
+      const target = String(url);
+      if (method === 'GET' && target.includes('/api/memory-files/group_1')) {
+        return { ok: true, status: 200, json: async () => ({
+          members: [{
+            userId: '54321', name: '老张', updatedAt: 1, sourceChatKeys: ['group:1'],
+            impressions: [{ content: '爱钓鱼', createdAt: 1, lastObservedAt: 1, sourceChatKeys: ['group:1'] }]
+          }],
+          handoff: null
+        }) };
+      }
+      if (method === 'GET') {
+        return { ok: true, status: 200, json: async () => ({
+          files: [{ chatKey: 'group:1', impressionCount: 1, memberCount: 1, hasHandoff: false, handoffExpiresAt: 0, updatedAt: 1 }],
+          memberNotes: {}
+        }) };
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true, config: { memberNotes: { '54321': '老张' } } }) };
+    };
+    // 页面脚本是 IIFE，外面拿不到它的 loadGlobalMemory：点「刷新」来让它自己把名单读进来。
+    const refreshBtn = document.getElementById('gm-refresh');
+    const refreshHandler = (refreshBtn?._listeners?.click || [])[0];
+    if (refreshHandler) await refreshHandler({ currentTarget: refreshBtn });
+    const qqInput = document.getElementById('gm-anynote-qq');
+    const noteInput = document.getElementById('gm-anynote-text');
+    const saveBtn = document.getElementById('gm-anynote-save');
+    qqInput.value = '54321';
+    noteInput.value = '老张';
+    const handler = (saveBtn?._listeners?.click || [])[0];
+    if (handler) await handler({ currentTarget: saveBtn });
+    const body = posts.find((p) => p.method === 'POST')?.body;
+    const statusText = String(document.getElementById('gm-anynote-status')?.textContent || '');
+    sandbox.fetch = originalFetch;
+
+    const ok = Boolean(refreshHandler) && Boolean(handler)
+      && body?.memberNotes?.__replace__?.['54321'] === '老张'
+      // 前半句要**从头匹配**：另一条分支的文案「备注已保存：54321（…）」里也含 "已保存：54321"，
+      // 用 includes 会把两条分支混成一条（2026-10-13 审查）。
+      && statusText.startsWith('已保存：54321')
+      && !statusText.includes('上面的名单里没有这个 QQ');
+    ok ? pass++ : fail++;
+    console.log('  ' + (ok ? 'OK   ' : 'FAIL ')
+      + `按 QQ 设备注：名单已有此人时不再提示"不在名单里"（状态="${statusText}"）`
+      + (ok ? '' : ' -> ' + JSON.stringify(body) + ' refresh=' + Boolean(refreshHandler)));
+  }
+
+  // ── 人物记忆页「新建人物印象」（2026-10-13）──
+  //   名单只列有印象的人，还没有印象的人从这儿补 —— 控制台别处没有可用的建印象入口
+  //   （会话记忆页那两个按钮按上游设计被 CSS 隐藏）。这条写入必须真能建人：
+  //   PUT 到所选来源会话、正文一行一条、且不能把已有备注顺手删掉。
+  {
+    const originalFetch = sandbox.fetch;
+    const posts = [];
+    sandbox.fetch = async (url, options = {}) => {
+      const method = String(options.method || 'GET').toUpperCase();
+      const body = options.body ? JSON.parse(options.body) : null;
+      posts.push({ url: String(url), method, body });
+      const target = String(url);
+      if (target.includes('/api/config') && method === 'GET') {
+        return { ok: true, status: 200, json: async () => ({ memberNotes: { '77777': '代号老王' }, allow: { groups: ['1'], private: [] } }) };
+      }
+      if (method === 'GET' && target.includes('/api/memory-files/group_1')) {
+        // 名单里已经有这个人（带一条既有印象）：用来钉"整体替换前会把已有印象带上"
+        return { ok: true, status: 200, json: async () => ({ members: [{ userId: '77777', name: '老王', updatedAt: 1, sourceChatKeys: ['group:1'], impressions: [{ content: '爱钓鱼', createdAt: 1, lastObservedAt: 1, sourceChatKeys: ['group:1'] }] }], handoff: null }) };
+      }
+      if (method === 'GET' && target.includes('/api/memory-files')) {
+        return { ok: true, status: 200, json: async () => ({ files: [{ chatKey: 'group:1', impressionCount: 1, memberCount: 1, hasHandoff: false, handoffExpiresAt: 0, updatedAt: 1 }], memberNotes: {} }) };
+      }
+      if (method === 'GET') return { ok: true, status: 200, json: async () => ({ files: [], memberNotes: {} }) };
+      return { ok: true, status: 200, json: async () => ({ ok: true, member: { userId: '77777' }, config: { memberNotes: { '77777': '代号老王' } } }) };
+    };
+    // 本地缓存**故意不含**备注（模拟"群里刚 set_member_note 改过、控制台还没刷新"）：
+    // 保存时若从这里读备注，就会拿空串把服务端那条删掉。
+    vm.runInContext("state.config = { memberNotes: {}, allow: { groups: ['1'], private: [] } };", ctx);
+    // 先把名单读进来（页面脚本是 IIFE，只能靠「刷新」按钮触发它自己的加载）——
+    // 这样"保存时要把已知印象带上"才有得可并。
+    const refreshBtn = document.getElementById('gm-refresh');
+    const refreshHandler = (refreshBtn?._listeners?.click || [])[0];
+    if (refreshHandler) await refreshHandler({ currentTarget: refreshBtn });
+
+    const toggleHandler = (document.getElementById('gm-newimp')?._listeners?.toggle || [])[0];
+    if (toggleHandler) await toggleHandler({ target: { open: true } });
+    const qqInput = document.getElementById('gm-newimp-qq');
+    const chatSelect = document.getElementById('gm-newimp-chat');
+    const textInput = document.getElementById('gm-newimp-text');
+    const saveBtn = document.getElementById('gm-newimp-save');
+    const saveHandler = (saveBtn?._listeners?.click || [])[0];
+    // 下拉必须真的被填上（否则"选了来源会话"这条链是断的，而用例照样绿）
+    const filledOk = Boolean(toggleHandler)
+      && String(chatSelect.innerHTML || '').includes('group:1')
+      && chatSelect.dataset.filled === '1';
+    qqInput.value = '77777';
+    chatSelect.value = 'group:1';
+
+    // ① 没选来源会话 / 非法 QQ / 内容为空：只提示，不发请求
+    chatSelect.value = '';
+    textInput.value = '爱钓鱼';
+    posts.length = 0;
+    if (saveHandler) await saveHandler({ currentTarget: saveBtn });
+    const noChat = String(document.getElementById('gm-newimp-status')?.textContent || '');
+    chatSelect.value = 'group:1';
+    qqInput.value = 'abc';
+    posts.length = 0;
+    if (saveHandler) await saveHandler({ currentTarget: saveBtn });
+    const badQq = String(document.getElementById('gm-newimp-status')?.textContent || '');
+    qqInput.value = '77777';
+    textInput.value = '   ';
+    posts.length = 0;
+    if (saveHandler) await saveHandler({ currentTarget: saveBtn });
+    const emptyStatus = String(document.getElementById('gm-newimp-status')?.textContent || '');
+    const guardOk = noChat.includes('先选一个来源会话')
+      && badQq.includes('QQ 号要填纯数字')
+      && emptyStatus.includes('印象内容不能为空')
+      && !posts.some((p) => p.method === 'PUT');
+
+    // ② 正常保存：PUT 到来源会话；备注取**服务端现值**（本地缓存里没有）；已知印象要带上
+    textInput.value = '周末常不在';
+    posts.length = 0;
+    if (saveHandler) await saveHandler({ currentTarget: saveBtn });
+    const put = posts.find((p) => p.method === 'PUT');
+    const savedStatus = String(document.getElementById('gm-newimp-status')?.textContent || '');
+    const savedOk = Boolean(put)
+      && put.url.includes('/api/memory-files/group_1/members/77777')
+      && JSON.stringify(put.body?.impressions) === JSON.stringify(['爱钓鱼', '周末常不在'])
+      && put.body?.note === '代号老王'
+      && put.body?.name === ''
+      && savedStatus.includes('已保存：77777');
+
+    // ③ 读不到服务端配置时中止，不许拿空备注去写（会删掉别人的备注）
+    //    （注意先补回内容：上一步保存成功后输入框会被清空，否则会先被"内容为空"挡下）
+    textInput.value = '再写一条';
+    sandbox.fetch = async (url, options = {}) => {
+      const method = String(options.method || 'GET').toUpperCase();
+      posts.push({ url: String(url), method, body: options.body ? JSON.parse(options.body) : null });
+      if (method === 'GET') return { ok: false, status: 500, json: async () => ({ error: 'boom' }) };
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    };
+    posts.length = 0;
+    if (saveHandler) await saveHandler({ currentTarget: saveBtn });
+    const abortStatus = String(document.getElementById('gm-newimp-status')?.textContent || '');
+    const abortOk = abortStatus.includes('已中止') && !posts.some((p) => p.method === 'PUT');
+
+    // ④ 写入前**重取服务端现值**：用户填表这几秒里机器人刚记了一条新印象（页面缓存里没有），
+    //    拿缓存的名单当基线会把那条静默删掉 —— 只有真去读服务端才拿得到它
+    textInput.value = '刚加的';
+    sandbox.fetch = async (url, options = {}) => {
+      const method = String(options.method || 'GET').toUpperCase();
+      const target = String(url);
+      posts.push({ url: target, method, body: options.body ? JSON.parse(options.body) : null });
+      if (method === 'GET' && target.includes('/api/config')) {
+        return { ok: true, status: 200, json: async () => ({ memberNotes: { '77777': '代号老王' }, allow: { groups: ['1'], private: [] } }) };
+      }
+      if (method === 'GET' && target.includes('/api/memory-files/group_1')) {
+        // 服务端此刻比页面缓存多一条（机器人刚写进去的）
+        return { ok: true, status: 200, json: async () => ({ members: [{ userId: '77777', name: '老王', impressions: [{ content: '爱钓鱼', createdAt: 1 }, { content: '刚记的', createdAt: 2 }] }] }) };
+      }
+      if (method === 'GET') return { ok: true, status: 200, json: async () => ({ files: [] }) };
+      return { ok: true, status: 200, json: async () => ({ ok: true, member: { userId: '77777', impressions: [{ content: '爱钓鱼' }, { content: '刚记的' }, { content: '刚加的' }] } }) };
+    };
+    posts.length = 0;
+    if (saveHandler) await saveHandler({ currentTarget: saveBtn });
+    const putFresh = posts.find((p) => p.method === 'PUT');
+    const freshOk = JSON.stringify(putFresh?.body?.impressions) === JSON.stringify(['爱钓鱼', '刚记的', '刚加的']);
+
+    // ⑤ 服务端截断（每位默认最多 50 条，截的是尾部 → 新加的排最后）：要说清没写进去，
+    //    并且**输入框保留内容**（原来无条件清空，用户以为写进去了）
+    textInput.value = '第二十一条';
+    sandbox.fetch = async (url, options = {}) => {
+      const method = String(options.method || 'GET').toUpperCase();
+      const target = String(url);
+      posts.push({ url: target, method, body: options.body ? JSON.parse(options.body) : null });
+      if (method === 'GET' && target.includes('/api/config')) {
+        return { ok: true, status: 200, json: async () => ({ memberNotes: {}, allow: { groups: ['1'], private: [] } }) };
+      }
+      if (method === 'GET' && target.includes('/api/memory-files/group_1')) {
+        return { ok: true, status: 200, json: async () => ({ members: [{ userId: '77777', name: '老王', impressions: [{ content: '爱钓鱼' }] }] }) };
+      }
+      if (method === 'GET') return { ok: true, status: 200, json: async () => ({ files: [] }) };
+      // 服务端只留下 1 条（模拟截到上限）→ 与提交的 2 条不一致
+      return { ok: true, status: 200, json: async () => ({ ok: true, member: { userId: '77777', impressions: [{ content: '爱钓鱼' }] } }) };
+    };
+    posts.length = 0;
+    if (saveHandler) await saveHandler({ currentTarget: saveBtn });
+    const capStatus = String(document.getElementById('gm-newimp-status')?.textContent || '');
+    const capOk = capStatus.includes('只写进去') && String(textInput.value) === '第二十一条';
+
+    sandbox.fetch = originalFetch;
+    const ok = filledOk && guardOk && savedOk && abortOk && freshOk && capOk;
+    ok ? pass++ : fail++;
+    console.log('  ' + (ok ? 'OK   ' : 'FAIL ')
+      + `人物记忆：新建人物印象（下拉已填=${filledOk}，三种早退=${guardOk}，备注取服务端现值+带上已知印象=${savedOk}，读不到配置中止=${abortOk}，写前重取服务端印象=${freshOk}，截断要如实说=${capOk}）`
+      + (ok ? '' : ' -> put=' + JSON.stringify(put?.body) + ' status=' + savedStatus + ' abort=' + abortStatus
+        + ' fresh=' + JSON.stringify(putFresh?.body?.impressions) + ' cap=' + capStatus));
   }
 
   // ── 设置分区的"菜单 id ↔ 路由 key"一致性（2026-09-29）──
@@ -3527,6 +4371,31 @@ try {
       + `设置侧边栏 ${menuIds.length} 个菜单项都能路由到自己的分区`
       + (okSecs ? '' : ' -> ' + JSON.stringify(failed)));
     vm.runInContext("state.settingsSection = 'api';", ctx);
+  }
+
+  // ⚠️ 设置页那些 .hint 是 **HTML**，不是 markdown：把 **…** 写进去浏览器会连星号一起显示
+  //（2026-10-04 复审 P3：写文案的人以为在用 markdown，实际用户看到「**密钥类字段…**」）。
+  // 判据本体在 test/helpers/ui-markdown-stars.mjs —— 那里同时被一条跨平台用例调用。
+  // 为什么要抽出去：这段原本只活在这个文件里，而它在 Windows 上会先因别的原因失败，
+  // 于是**本地永远跑不到**（2026-10-08 实证：往 appearance.js 写了一行 `** 2.4` 幂运算，
+  // 本地全绿、CI 直接红）。
+  {
+    const { offenders, probeFailures, scanned } = scanDirForMarkdownStars('ui', { relTo: '.' });
+    for (const why of probeFailures) {
+      fail++;
+      console.log('  FAIL markdown 判据自检：' + why + '（判据被改坏了）');
+    }
+    if (!probeFailures.length) {
+      pass++;
+      console.log('  OK   markdown 判据自检：带 URL 的提示行仍要检出 / 掩码不算 markdown');
+    }
+    if (offenders.length) {
+      fail++;
+      console.log('  FAIL 提示文案里混进 markdown 星号（会原样显示给用户）-> ' + offenders.join(', '));
+    } else {
+      pass++;
+      console.log('  OK   ui/ 源码里没有漏进 HTML 模板的 markdown 星号（扫了 ' + scanned + ' 个文件）');
+    }
   }
 
 } catch (e) {

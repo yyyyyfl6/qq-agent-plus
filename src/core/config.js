@@ -1,3 +1,5 @@
+import { skinScope } from '../skins/context.js';
+import { normalizeSkins } from '../skins/skins.js';
 // Production configuration adapter.
 //
 // The historical normalizer/persistence implementation remains in
@@ -6,6 +8,7 @@
 // automated slang research is retired, and admin.ownerUin is the sole
 // administrator configuration source.
 import * as legacy from './config-legacy.js';
+import { idList } from './list.js';
 import {
   ASR_DEFAULT_PROVIDER, ASR_PROVIDERS,
   asrLocalModel, findWhisperBinSync
@@ -69,7 +72,7 @@ function ensureAdminPrivateAccess(patch, current, ownerUin) {
 
   const requestedAllow = Array.isArray(patch.allow?.private)
     ? patch.allow.private.map(String)
-    : (current.allow?.private || []).map(String);
+    : idList(current.allow?.private);
   patch.allow = {
     ...(patch.allow || {}),
     private: [...new Set([...requestedAllow, ownerUin])]
@@ -77,7 +80,7 @@ function ensureAdminPrivateAccess(patch, current, ownerUin) {
 
   const requestedDeny = Array.isArray(patch.deny?.private)
     ? patch.deny.private.map(String)
-    : (current.deny?.private || []).map(String);
+    : idList(current.deny?.private);
   patch.deny = {
     ...(patch.deny || {}),
     private: requestedDeny.filter((uin) => uin !== ownerUin)
@@ -94,8 +97,9 @@ export function loadConfig() {
   return stabilize(legacy.loadConfig());
 }
 
-export function getConfig() {
-  return stabilize(legacy.getConfig(), { persist: true });
+export function getConfig({ unscoped = false } = {}) {
+  const cfg = stabilize(legacy.getConfig(), { persist: true });
+  return !unscoped && skinScope()?.resolveConfig ? skinScope().resolveConfig(cfg) : cfg;
 }
 
 /** The only administrator QQ configuration read/written by current code. */
@@ -297,6 +301,8 @@ export function updateConfig(patch) {
   const rawPatch = structuredClone(
     patch && typeof patch === 'object' ? patch : {}
   );
+  if (rawPatch.skins !== undefined) rawPatch.skins = normalizeSkins({ ...current.skins, ...rawPatch.skins,
+    handoffOnSwitch: { ...current.skins?.handoffOnSwitch, ...rawPatch.skins?.handoffOnSwitch } }, rawPatch.customPersonas || current.customPersonas);
   const requestedAdmin = normalizedRequestedAdmin(rawPatch, current);
   const autoUpdateEnabled = hasOwn(rawPatch?.autoUpdate, 'enabled')
     ? rawPatch.autoUpdate.enabled === true

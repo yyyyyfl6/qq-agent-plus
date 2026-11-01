@@ -278,5 +278,45 @@ console.log('\n=== ⑥ 快速滚到底：被节流的尾部事件必须补触发
     `${rowsBefore} -> ${rowsAfter}（没补上就是"滚得快滚不下去"那个 bug）`);
 }
 
+// ── ⑦ 工具栏动作失败要有明确反馈（2026-10-12 审查）──
+// 这五个 handler 之前是裸 await api(...)：服务端出错时静默失败、界面毫无反应
+//（同文件的「主动唤醒」一直有 try/catch）。这里让 fetch 必失败、确认框直通，
+// 逐个点一遍：handler 必须自己接住错误并提示「xx失败：<原因>」。
+console.log('\n=== ⑦ 工具栏动作失败要有明确反馈 ===');
+{
+  const cases = [
+    ['chat-read-btn', '标记已读失败'],
+    ['chat-retry-btn', '重试失败'],
+    ['chat-resolve-btn', '核对失败'],
+    ['chat-thread-close-btn', '结束线程失败'],
+    ['chat-testsend-btn', '发送失败']
+  ];
+  const alerts = [];
+  const uncaught = [];
+  const origFetch = sandbox.fetch;
+  const origAlert = sandbox.alert;
+  const savedConfirm = vm.runInContext('askForConfirmation', ctx);
+  sandbox.alert = (message) => alerts.push(String(message));
+  sandbox.fetch = async () => ({ ok: false, status: 500, json: async () => ({ error: 'boom' }) });
+  vm.runInContext('askForConfirmation = async () => true;', ctx);   // 真实现是弹窗等待点击，桩里直通
+  document.getElementById('test-send-text').value = '回归测试文本';
+  for (const [id] of cases) {
+    const clicks = listeners.get(document.getElementById(id))?.click || [];
+    if (!clicks.length) { uncaught.push(`${id}: 没有点击监听`); continue; }
+    try { await clicks[0](); } catch (error) { uncaught.push(`${id}: handler 抛出了「${error.message}」（裸 await，没接住）`); }
+  }
+  sandbox.fetch = origFetch;
+  sandbox.alert = origAlert;
+  vm.runInContext('askForConfirmation = __savedConfirm;', Object.assign(ctx, { __savedConfirm: savedConfirm }));
+  delete ctx.__savedConfirm;
+  document.getElementById('test-send-text').value = '';
+
+  check('五个 handler 都自己接住了错误（没有裸 await 抛出去）', uncaught.length === 0, uncaught.join(' | '));
+  for (const [, prefix] of cases) {
+    check(`失败提示「${prefix}：…」`, alerts.some((message) => message.startsWith(prefix) && message.includes('boom')),
+      '实际 alerts：' + JSON.stringify(alerts));
+  }
+}
+
 console.log('\n' + (fail ? 'FAILED ' + fail : 'ALL PASSED ' + pass));
 process.exit(fail ? 1 : 0);

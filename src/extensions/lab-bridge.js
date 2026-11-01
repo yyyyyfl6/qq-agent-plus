@@ -23,7 +23,7 @@ import crypto from 'node:crypto';
 import { getConfig, updateConfig } from '../core/config.js';
 import { createQuota } from '../core/quota.js';
 import {
-  clampInt, err, fetchWithTimeout, isPlainObject, ok, ownerUin, str, triggeredOnlyByOwner
+  clampInt, err, fetchWithTimeout, isPlainObject, ok, ownerUin, str, triggeredOnlyByOwner, triggerSenderIdsOf
 } from './shared.js';
 
 export const LAB_BRIDGE_DEFAULTS = Object.freeze({
@@ -39,8 +39,17 @@ export const LAB_BRIDGE_DEFAULTS = Object.freeze({
   timeoutMinutes: 30,          // 单个任务最长等多久（超了记 unknown，不自动重试）
   pollSeconds: 5,
   reportBack: true,            // 任务结束后把结果摘要主动发回下指令的会话
-  reportMaxChars: 900
+  reportMaxChars: 900,
+  // 专属指令（唤醒前消费，只认管理员；见 extensions/commands.js）
+  commands: ['/lab', '/大肥鱼']
 });
+
+/** 指令列表：去空白、去重、限长；不允许换行。 */
+function normalizeCommands(value, fallback) {
+  const list = Array.isArray(value) ? value : fallback;
+  return [...new Set(list.map((c) => String(c ?? '').trim()).filter((c) => c && c.length <= 20 && !/[\r\n]/.test(c)))].slice(0, 6);
+}
+
 
 export function labBridgeConfig(cfg = getConfig()) {
   const raw = isPlainObject(cfg?.labBridge) ? cfg.labBridge : {};
@@ -57,7 +66,8 @@ export function labBridgeConfig(cfg = getConfig()) {
     timeoutMinutes: clampInt(raw.timeoutMinutes, 1, 24 * 60, LAB_BRIDGE_DEFAULTS.timeoutMinutes),
     pollSeconds: clampInt(raw.pollSeconds, 2, 120, LAB_BRIDGE_DEFAULTS.pollSeconds),
     reportBack: raw.reportBack !== false,
-    reportMaxChars: clampInt(raw.reportMaxChars, 100, 3000, LAB_BRIDGE_DEFAULTS.reportMaxChars)
+    reportMaxChars: clampInt(raw.reportMaxChars, 100, 3000, LAB_BRIDGE_DEFAULTS.reportMaxChars),
+    commands: normalizeCommands(raw.commands, LAB_BRIDGE_DEFAULTS.commands)
   };
 }
 
@@ -247,6 +257,7 @@ export class LabBridgeRuntime {
       chatKey: str(origin.chatKey, 64),
       userId: str(origin.userId, 32),
       via: origin.via === 'console' ? 'console' : 'qq',
+      originMid: str(origin.originMid, 64),
       createdAt: this.now(),
       updatedAt: this.now(),
       finishedAt: 0,
@@ -428,7 +439,7 @@ export function labBridgeToolDefs(getRuntime) {
           return ok({ id: t.id, state: t.state });
         }
         if (action === 'run') {
-          const t = await rt.dispatch(args.task, { chatKey: ctx.chatKey, userId: ctx.triggerSenderIds?.[0], via: 'qq' });
+          const t = await rt.dispatch(args.task, { chatKey: ctx.chatKey, userId: triggerSenderIdsOf(ctx)[0], via: 'qq' });
           if (t.state === 'failed') return err(t.error);
           if (t.state === 'unknown') return ok({ id: t.id, state: t.state, note: `${t.error}。如实告诉管理员这个情况。` });
           return ok({ id: t.id, state: t.state, note: `已派给${c.name}，结束后会自动把结果发回来。简短告诉管理员一声就行。` });

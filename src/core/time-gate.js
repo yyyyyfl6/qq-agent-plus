@@ -15,6 +15,14 @@ export function isTimeActive(chatKey = '', now = Date.now()) {
   return timeControlState(getConfig().timeControl, chatKey, now).active;
 }
 
+/** 距离时间控制恢复活跃还有多久（毫秒）：未启用或当前活跃返回 0（与 isTimeActive/canRun 同口径）。 */
+export function timeUntilActive(chatKey = '', now = Date.now()) {
+  const cfg = getConfig();
+  if (cfg.timeControl?.enabled !== true) return 0;
+  const st = timeControlState(cfg.timeControl, chatKey, now);
+  return st.active ? 0 : Math.max(0, Number(st.nextActiveAt || 0) - now);
+}
+
 export function withTimeScope(chatKeys, task) {
   const keys = Array.isArray(chatKeys) ? chatKeys : [chatKeys || ''];
   return scope.run(keys, task);

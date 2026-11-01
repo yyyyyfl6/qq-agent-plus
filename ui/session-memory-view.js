@@ -11,15 +11,17 @@
       #view-memory #mem-consolidate-status,
       #view-memory #mem-load-members-btn,
       #view-memory #mem-members,
+      #view-memory .memory-members-tools,
+      #view-memory .memory-members-empty,
       #view-memory #memory-detail > .collapsible:not(.memory-handoff) {
         display:none !important;
       }
       #view-memory .session-memory-note {
         padding:10px 12px;
         margin:0 0 12px;
-        border-radius:8px;
+        border-radius:var(--r-sm);
         background:rgba(127,127,127,.08);
-        font-size:13px;
+        font-size: var(--fs-md);
         line-height:1.5;
       }
     `;
@@ -35,6 +37,8 @@
     items.querySelectorAll('.chat-item').forEach((row) => {
       const sub = row.querySelector('.chat-item-sub');
       if (!sub) return;
+      // 整理中的行是「正在整理本群记忆」，不能改写成「暂无会话交接」（即使本来有交接）。
+      if (sub.textContent.includes('正在整理')) return;
       const hasHandoff = sub.textContent.includes('有会话交接');
       const next = hasHandoff ? '有会话交接' : '暂无会话交接';
       if (sub.textContent !== next) sub.textContent = next;

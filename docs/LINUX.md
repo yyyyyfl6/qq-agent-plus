@@ -17,10 +17,20 @@ the old instance.
 
 ## Requirements
 
-- Linux with systemd user services, curl, tar, sha256sum and rsync.
-- A non-root user: `deploy-all.sh` refuses to run as root, and `deploy.sh` is
-  meant to run as the service user that owns the systemd user service.
-- A mounted local filesystem for SQLite; NFS and SMB are not supported.
+- Linux with systemd user services, curl, tar, sha256sum, rsync, xz and git
+  (the Node.js archive is `.tar.xz`).
+- A non-root service user. `install.sh` may be started as root: it creates or
+  reuses a dedicated service account (default `qqagent`, or `SUDO_USER`), then
+  re-runs the installer as that user. `deploy-all.sh` itself still refuses root.
+- Recommended resources: 2 CPU cores, 2GB RAM and 10GB free local disk. A 1GB
+  host can OOM while SnowLuma/Chromium starts; SQLite must not live on NFS/SMB.
+- Distribution tiers: tested on Ubuntu 22.04/24.04 (current production host).
+  Debian 12/13, Ubuntu 26.04, Rocky 9, AlmaLinux 9, Fedora/CentOS Stream/RHEL/Oracle/Amazon Linux,
+  Arch/Manjaro, openSUSE/SLES and openEuler/Anolis/Kylin/UOS are attempted through
+  their package manager but not tested here. Debian 12 needs Docker's official apt
+  repository for Compose v2 (its own repository only ships v1). Alpine/musl, NixOS,
+  Gentoo, Void, WSL1 and containers without systemd are unsupported. Run
+  `sh scripts/check-platform.sh` for a read-only verdict.
 - A separately managed OneBot v11 HTTP/forward WebSocket service when using
   `deploy.sh`; `deploy-all.sh` installs SnowLuma/OneBot.
 - An OpenAI Chat Completions compatible model with function calling.
@@ -29,17 +39,34 @@ the old instance.
 
 ## Full-stack Installation
 
-Run `deploy-all.sh` on a new host when SnowLuma/OneBot is not installed yet.
-Run it as a regular user, not as root: the installer refuses root and calls
+On a new host (SnowLuma/OneBot not installed yet) the recommended entry is the
+zero-question wrapper `install.sh`: it runs the same installer with every
+default answered, defers the model configuration to the web console, and ends
+with a three-step checklist (tokenized console link, QQ login page, allowlist).
+
+```bash
+bash install.sh
+# or, on a fresh VPS that only gives you root:
+sudo bash install.sh
+```
+
+The interactive installer is the same engine with the questions asked instead
+of defaulted. `install.sh` may run as root (it switches to a non-root service
+account first); `deploy-all.sh` should be run as a regular user and calls
 `sudo` only for host dependencies such as Docker and linger.
 
 ```bash
 bash deploy-all.sh
 ```
 
-The installer asks for the stack root and all five host ports. It does not ask
-for a local/LAN IP. The Agent console, SnowLuma WebUI and noVNC bind all host
-interfaces; OneBot HTTP and WebSocket bind only `127.0.0.1`. If Docker is
+The interactive installer asks for the stack root and all five host ports, plus
+the model fields — leaving the model API key blank skips model configuration
+(finish it in the console). It does not ask
+for a local/LAN IP. New installs bind the Agent console, SnowLuma WebUI and
+noVNC to `127.0.0.1` by default; pass `--publish` to bind them to `0.0.0.0`
+(and tighten the security group accordingly). Existing installations keep
+their current binding unless `--publish`/`--loopback` is passed explicitly.
+OneBot HTTP and WebSocket always bind only `127.0.0.1`. If Docker is
 missing, the installer asks before installing Docker Engine and Compose through
 the host package manager.
 The installer does not modify UFW, firewalld or cloud security-group policy.
@@ -62,7 +89,18 @@ STACK_ROOT/
   deployment-access.txt   generated URLs and credentials (0600)
 ```
 
-The SnowLuma image is pinned to the tested `v1.14.15` release by default.
+The SnowLuma image is pinned to the tested `v1.14.22` release by default. Upstream has since
+published a v2 line (minimum Node.js 24 and no documented OneBot migration in its release notes);
+this project intentionally does not auto-upgrade across that major until it has been tested here.
+If you already
+deployed an older protocol image, you do not need to edit compose files by hand: the console's
+**Settings → OneBot → 协议端（SnowLuma）** panel shows the running version and can update it
+(changes `SNOWLUMA_IMAGE` in `.env`, then `compose pull && up -d`; volumes are untouched so the
+QQ login survives; a failed update rolls back automatically). The same is available on the CLI:
+`node src/ops.js snowluma-version` and `node src/ops.js snowluma-update [--to IMAGE] [--dry-run]`.
+
+Protocol versions below `1.14.20` still work, but stickers sent as "emoji style" render as plain
+images in QQ (`sub_type` support landed in SnowLuma `1.14.20`, see issue #468).
 Download or container startup failures stop the installation with an error.
 One shared OneBot token is written to SnowLuma's global template, every existing
 per-account config and QQ Agent's configuration. Existing installations retain
@@ -90,14 +128,17 @@ that disable GPU compositing on headless hosts.
 ### Docker Hub is unreachable (mainland China)
 
 `registry-1.docker.io` is frequently blocked or DNS-poisoned from mainland
-hosts: the pull fails with `dial tcp …: i/o timeout` and the installer stops
-after printing a hint. Any of these three routes works:
+hosts: the pull fails with `dial tcp …: i/o timeout`. The installer retries
+through a built-in list of public mirrors automatically (`docker.1panel.live`,
+`docker.m.daocloud.io`) and records the one that worked in `snowluma/.env`, so a
+fresh install normally needs no extra flags; it stops with a hint only when
+those fail too. Any of these three routes works:
 
 ```bash
-# 1) Retry through a registry mirror you trust (e.g. your cloud vendor's)
+# 1) Add your own mirror (tried before the built-in list; comma-separated)
 QQ_AGENT_IMAGE_MIRROR=<mirror-host> bash deploy-all.sh
 bash deploy-all.sh --image-mirror <mirror-host>            # same thing
-bash deploy-all.sh --image <mirror-host>/motricseven7/snowluma:v1.14.15
+bash deploy-all.sh --image <mirror-host>/motricseven7/snowluma:v1.14.22
 
 # 2) Configure a global accelerator once (Docker then uses it for every pull)
 sudo tee /etc/docker/daemon.json <<'JSON'
@@ -106,14 +147,17 @@ JSON
 sudo systemctl restart docker
 
 # 3) Pull elsewhere and carry the image over
-docker pull motricseven7/snowluma:v1.14.15
-docker save motricseven7/snowluma:v1.14.15 | gzip > snowluma.tgz
+docker pull motricseven7/snowluma:v1.14.22
+docker save motricseven7/snowluma:v1.14.22 | gzip > snowluma.tgz
 gunzip -c snowluma.tgz | docker load      # on the target host
 ```
 
-Mirrors are third-party services: the installer never picks one for you, and
-`SNOWLUMA_IMAGE` / `--image` accept any full reference. The chosen reference is
-remembered in `snowluma/.env`, so later runs reuse it. Cloud-vendor internal
+Mirrors are third-party services: the installer automatically tries its
+built-in list when Docker Hub is unreachable, and any mirror you pass is tried
+first. `SNOWLUMA_IMAGE` / `--image` accept any full reference. The chosen
+reference is remembered in `snowluma/.env`, so later runs reuse it — and a
+later run strips a remembered mirror prefix before retrying through the
+current list, so you can switch mirrors at any time. Cloud-vendor internal
 accelerators such as `mirror.ccs.tencentyun.com` only work inside that vendor's
 network.
 
@@ -180,12 +224,13 @@ bash deploy.sh \
 
 Create the parent directory with appropriate ownership first. Run deployment as
 the service user, not root. The installer uses sudo only for linger if required.
-`--install-dir` and `--data-dir` must match the existing installation when
-updating: a wrong directory is not rejected, it points the service at a new,
-empty data directory. `--host` and `--port` may be omitted — the script then
-reuses the address recorded in `config.json` and prints a note; when given
-explicitly they must match the first installation, otherwise the console becomes
-unreachable from outside.
+When updating, `--install-dir` / `--data-dir` / `--service` / `--repository` /
+`--branch` are verified against the installation record (`.deployment.json`)
+**before anything is touched** — a mismatch is rejected with exit 2 and nothing
+was modified (see 参数校验与逃生开关 below). `--host` and `--port` may be
+omitted — the script then reuses the address recorded in `config.json` and
+prints a note; when given explicitly they only warn on drift, since the source
+of truth for the console address is `config.json`.
 Dependencies are installed with `--omit=dev --ignore-scripts`; Linux needs no
 Electron, GUI, X11, browser, compiler or native SQLite add-on.
 If no compatible Node.js is found, the script downloads Node.js 22 into
@@ -246,10 +291,12 @@ The deployment also installs `${SERVICE}-update.service` and
 `${SERVICE}-update.timer`. The timer wakes hourly, while the persisted
 `autoUpdate.intervalHours` setting controls whether a GitHub check is due.
 Automatic updates default to disabled. When enabled from the Control page, the
-updater shallow-fetches the configured GitHub branch into a persistent bare
+updater deploys **published Releases only** (ordinary commits on the branch are
+never deployed): it shallow-fetches the release tag into a persistent bare
 cache, tests the candidate checkout, then delegates deployment and rollback to
-`deploy.sh`. Any failure disables automatic updates and queues one administrator
-notification. See [GitHub automatic updates](AUTO_UPDATE.md).
+`deploy.sh`. Any failure disables automatic updates (unless
+`autoUpdate.disableOnFailure` is explicitly set to false) and queues one
+administrator notification. See [GitHub automatic updates](AUTO_UPDATE.md).
 
 The import option is available on the first installation only:
 
@@ -275,11 +322,11 @@ credentials are not returned by `/api/config`. On an untrusted network, TLS must
 be terminated in front of the service. Plain HTTP on the LAN is not encrypted.
 `/healthz` returns liveness plus the deployed version and the OneBot connection
 state. API endpoints accept
-`x-console-token`. The `?token=` query parameter is **also accepted, on every authenticated
-route** (`authorize()` reads it uniformly; the auto-login shortcut is only its intended use — this is a
-known deferred item, see `docs/KNOWN-ISSUES.md`). Treat any `?token=` URL as a full credential: use it
-only for the auto-login shortcut, never paste it elsewhere, and never over plain HTTP to a host you do
-not control.
+`x-console-token`. The `?token=` query parameter is accepted **only by `/api/events`** (the SSE
+endpoint, which cannot set request headers); every other route takes the token via cookie or the
+`x-console-token` header — script callers (e.g. `ops.js`) use the header. Treat any `?token=` URL
+as a full credential: use it only for the auto-login shortcut, never paste it elsewhere, and never
+over plain HTTP to a host you do not control.
 
 The top selector changes observe/active mode. Observe stores messages but makes
 no automatic model calls and blocks text, stickers, pokes and test sends.
@@ -482,21 +529,33 @@ WAL/SHM, member memory files, per-chat `memory/*/_handoff.json`,
 Legacy `messages/group_123.json` files migrate once transactionally and are left
 unchanged. Corrupt archives abort migration rather than being treated as empty.
 Keep messages on a disk with sufficient free space; completed session logs default
-to a retention count of 2000.
+to a retention count of 2000 and are additionally pruned after 90 days by the
+daily retention sweep (whichever limit hits first).
 
 ```bash
-bash manage.sh observe
-bash manage.sh backup /mnt/data/backups/qq-agent-20260911
+# 加密备份（默认 AES-256-GCM；密钥在 ~/.config/qq-agent/backup.key，
+# 也可用 QQ_AGENT_BACKUP_KEY 覆盖）。备份目录 0700、文件 0600。
+node src/ops.js backup --dry-run
+node src/ops.js backup --confirm --keep=4
+
+# 恢复演练：解密最近一份备份到临时目录 + SQLite integrity_check
+node src/ops.js backup --drill
+
+# 恢复：先 --dry-run 看条目，再 --confirm；服务起不来会自动回滚
+node src/ops.js restore --from ~/qq-agent/backups/qq-agent-data-XXXX.tar.gz.enc --confirm
 ```
 
 A consistent multi-file snapshot requires observe mode or a cancelled run, and
 waiting for runs to finish. SQLite backup uses the online backup API rather than a
 raw copy of the database that could omit WAL data. Backups contain credentials
-and private messages.
+and private messages, so they are encrypted by default; the key file must be
+kept separately from the backups (losing it makes the archive unrecoverable).
+`--no-encrypt` exists only as an explicit escape hatch.
 
-The restore procedure is: stop this service, archive its current data directory,
-restore the backup into an empty data directory owned by the service user, then
-start in observe mode. The old qq-bridge data must not be overwritten.
+`restore` stops the service, moves the current data directory to
+`data.pre-restore-<timestamp>`, extracts the archive, starts the service and
+checks it. If it does not come back, the previous directory is restored
+automatically. The old qq-bridge data must not be overwritten.
 
 ## Validation
 
@@ -505,7 +564,7 @@ npm ci --omit=dev --ignore-scripts
 npm test
 npm run test:unit
 node --check src/server.js
-bash -n deploy.sh manage.sh
+bash -n deploy.sh && bash -n deploy-all.sh && bash -n manage.sh
 ```
 
 Tests use local mock protocol/model servers and isolated temporary data. Real QQ
@@ -514,8 +573,10 @@ activation. Observe-mode deployment validates receipt without emitting replies.
 
 ## OneBot Shows "Not Connected"
 
-The control panel reports only whether the socket is up. The actual reason is
-recorded in `/api/status` under `onebot.error`. One read-only audit prints it:
+The console's Settings → OneBot page spells out the failure reason inline (port
+not listening / token mismatch / unresolvable address, with the raw error). The
+raw reason is also recorded in `/api/status` under `onebot.error`; one read-only
+audit prints it:
 
 ```bash
 node src/ops.js audit --dir=/mnt/data/qq-agent     # line: "OneBot: connected=false error=…"
@@ -553,3 +614,112 @@ Three additional failure modes require attention:
 
 A logged-out QQ account is not a connection failure: the socket stays up and only
 `get_login_info` is missing. Watch it with `node src/ops.js watch-login`.
+
+## 控制台里更新协议端报 docker 权限不足
+
+症状：控制台 →「更新协议端」失败，日志里是
+
+```text
+unable to get image: permission denied while trying to connect to the Docker
+daemon socket at unix:///var/run/docker.sock
+```
+
+而同一个账号在交互 shell 里 `docker pull` / `docker ps` **完全正常**。
+
+**这不是 `docker.sock` 权限配错了，而是跑控制台的那个进程没有 `docker` 组。**
+
+控制台是 systemd **用户服务**，它的补充组（supplementary groups）在 `systemd --user`
+管理器启动那一刻就固定了 —— 开了 linger 的机器上就是**开机那一刻**。所以：
+
+1. 你把自己加进 docker 组（`sudo usermod -aG docker $USER`）之后，
+2. 新开的交互 shell 拿到了 `docker` 组，命令行一切正常，但
+3. 那个一直在跑的 `systemd --user`（以及它下面的控制台/协议端服务）**不会跟着更新**。
+
+于是只有控制台里那条路径会 `permission denied`。查证：
+
+```bash
+# 交互 shell 有 docker 组（应当能看到 999 或你的 docker gid）
+id
+# 控制台进程有没有 —— 输出里没有 docker 的 gid 即中招
+systemctl --user show -p MainPID --value qq-agent-linux \
+  | xargs -I{} grep ^Groups /proc/{}/status
+getent group docker            # 拿到 docker 组的 gid 用于比对
+```
+
+修复（会**短暂重启**控制台与协议端）：
+
+```bash
+sudo systemctl stop user@$(id -u).service    # 重建用户管理器与它下面的服务
+sleep 3                                       # 等旧实例的 cgroup 被回收
+sudo systemctl start user@$(id -u).service
+# 或直接重启机器
+```
+
+重启后再跑一次上面的 `grep ^Groups` 确认 `docker` 的 gid 已经出现。
+
+⚠️ **不要用 `systemctl restart user@` 代替**：2026-10-09 实测（systemd 249）——stop 与 start
+挨太近时，新管理器会因旧实例 cgroup 未回收而以 `status=219/CGROUP` 启动失败，且失败后**不会
+自动回来**（服务停摆到人工 `start`）；分开两步、留 3 秒间隔，是实测可靠的姿势。
+
+⚠️ **也不要用 `loginctl terminate-user`**：它同样不会把管理器自动带回来（服务会停到你下次登录）。
+
+**重跑一次部署脚本即可自动修好**：`deploy.sh` / `deploy-all.sh` 在收尾时会检查"部署用户在不在
+docker 组、服务进程拿没拿到组"，缺什么补什么 —— 加组（`usermod -aG docker`）+ 用
+`stop → sleep 3 → start` 重建一次 user manager（服务随 linger 自动恢复；只在交互式部署时做，
+自动更新场景跳过重建、只加组）。上面的手工命令留给不便重跑部署的场景。整套检测用的是
+`getent` / `usermod` / `systemctl` —— systemd 家族各发行版（Ubuntu / Debian / CentOS /
+Fedora / Arch…）通用；非 systemd 的发行版不在支持范围。
+
+### 代价须知：加进 docker 组等于给这个账号 root 等价权限
+
+`deploy.sh` / `deploy-all.sh` 的收尾自愈会执行 `usermod -aG docker <部署用户>`。这不是
+"顺手加的一个组"：docker 组的成员可以起一个挂载了宿主根目录的容器
+（`docker run --rm -v /:/host alpine cat /host/etc/shadow`），**等价于宿主 root**。
+
+所以在**把账号加进 docker 组之前**，控制台被拿下最多是应用级 + 它自己的用户级服务
+（控制台跑的命令只有 `systemctl --user`）；加进去之后，同一个进程被拿下就等于宿主机 root。
+这是「控制台里更新协议端」这个功能的前提（控制台进程必须能驱动 docker），取舍有三条路：
+
+- **接受它**（当前默认）：省事，功能开箱可用。前提是你信任控制台的访问控制
+  （控制台令牌 + `server.host` 的暴露面，见下）。
+- **不接受**：不要在控制台里更新协议端 —— 把 `autoUpdate.snowluma.enabled` 与
+  `followBaseline` 都设为 `false`，改用命令行的 `deploy.sh` / `ops snowluma-update`
+  （`sudo` 按需输密码，不需要给常驻进程这个组的权限），并执行
+  `sudo usermod -rG docker <部署用户>` 把组摘掉、再重启 user manager（见上）。
+- **缩小暴露面**：把 `server.host` 改成 `127.0.0.1` 再通过 SSH 隧道访问控制台。
+  `0.0.0.0` + 这个组 + 云安全组放通端口，三样凑齐就是"互联网上有一个能改宿主 root 的面板"。
+
+### 自动回退（仅限未加固的部署）
+
+直接调 `docker` 撞上"套接字没权限"时，更新路径会尝试回退到 `sudo -n docker`（非交互，
+一次；没有免密 sudo 就立刻失败，不会挂住）。
+
+⚠️ **但本项目的标准 unit 默认带 `NoNewPrivileges=true` 加固**（`deploy.sh` / `deploy-all.sh`
+经 `scripts/install-service.mjs` 生成），内核会禁止这类进程用 `sudo` 提权 —— 加固部署下
+这条回退**不会生效**（控制台会直接报"本服务被 NoNewPrivileges 加固，sudo 回退不可用"），
+也就是说：**默认配置下没有免密的捷径** —— 修法是上面那条（重启 user manager），或者干脆
+重跑一次部署脚本（新版会自动做，见上）。
+
+只有显式关掉加固的部署才会真正走到 `sudo` 回退。本段旧文案曾写"有免密 sudo 就能用、
+不必重启 user manager"，那对默认配置是错的，2026-10-09 更正。
+
+不想让服务走提权路径的部署，设 `QQ_AGENT_NO_SUDO_DOCKER=1`（写进
+`qq-agent-linux.service` 的 `Environment=`）即可关掉这条回退，那就必须先做上面的人工修复。
+
+为什么不能做得更干净：非 root 进程**无法**给自己补上缺失的补充组 —— 实测
+`systemd-run --user -p SupplementaryGroups=docker id` 报
+`Changing group credentials failed: Operation not permitted`，而 Ubuntu 上 `sg` 也不是 setgid
+的。所以在进程内"自己修好组"这条路是不存在的；未加固的部署上 sudo 回退是唯一能当下就通
+的方案，加固部署上则没有免密捷径 —— 这是内核限制，不是配置问题。
+
+### 另外两处让问题更早暴露
+
+- **更新前预检**：`snowluma-update.js` 在动 `.env` 之前先探一次 `docker info`（含回退），
+  两条路都不通才给出上面的人工修复步骤，而不是抛一段原始 stderr。
+- **巡检新增 `docker-socket` 一项**：每 5 分钟一次的健康检查会 `fs.access` 这个套接字。
+  直连不可用且主进程**未**加固时，它会再探一次 `sudo -n docker`（就是上面那条回退），通了就记 ok
+  并在详情里说明"更新会走回退" —— 不这么做的话，一条"功能其实能用"的状态会变成每 5 分钟一次、
+  连击 3 次就私聊 owner、而且**永远不会恢复**的误报。
+  ⚠️ 主进程带 `NoNewPrivileges`（默认配置）时**不再拿巡检进程的 sudo 结果当证据**：那条回退在
+  控制台里必失败，巡检会直接报红并指向修法（2026-10-09 审查：此前这里会出一条"假绿"——
+  巡检说"会走回退"，用户点按钮照样失败）。

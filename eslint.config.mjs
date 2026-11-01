@@ -35,6 +35,8 @@ export default [
   { files: ['src/**/*.js'], ...nodeScope },
   { files: ['scripts/**/*.mjs'], ...nodeScope },
   { files: ['test/**/*.mjs'], ...nodeScope },
+  // 示例插件（随仓库发布，别让它没人管）
+  { files: ['examples/**/*.mjs'], ...nodeScope },
   {
     files: ['ui/**/*.js'],
     languageOptions: {

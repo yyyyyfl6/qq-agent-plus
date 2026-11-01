@@ -5,6 +5,7 @@
 // 只做"导航"：跳转一律通过点击真实的侧栏按钮完成，保证与手动点击走同一条加载路径。
 
 import { esc } from './core/dom.js';
+import { iconSvg } from './core/icons.js';
 import { state } from './core/state.js';
 
 (function commandPalette() {
@@ -32,23 +33,27 @@ import { state } from './core/state.js';
     const list = [];
     document.querySelectorAll('#tabs .tab').forEach((btn) => {
       if (btn.classList.contains('hidden') || btn.hidden || btn.style.display === 'none') return;
-      const label = btn.textContent.trim();
-      list.push({ label, hint: '页面', ico: btn.dataset.settingsJump ? 'persona' : btn.dataset.tab, keys: `${label} ${btn.dataset.tab}`, run: () => btn.click() });
+      // 上游导航是两行（<b>主名</b><i>说明</i>）：面板只显示主名，说明进搜索关键词
+      const label = (btn.querySelector('.tab-label b')?.textContent || btn.textContent).trim();
+      const sub = btn.querySelector('.tab-label i')?.textContent || '';
+      list.push({ label, hint: '页面', ico: btn.dataset.icon || 'chevron', keys: `${label} ${sub} ${btn.dataset.tab || ''}`, run: () => btn.click() });
     });
+    // 「人格」（双人格页）不是侧栏页签，单独列一条
+    list.push({ label: '人格（切换人格 / 专属指令）', hint: '页面', ico: 'mask', keys: '人格 皮肤 skins 切鱼 切猫 大肥鱼 哈基米 persona', run: () => { window.location.href = '/skins.html'; } });
     for (const [id, label, keys] of SETTINGS) {
       list.push({
         label: `设置 › ${label}`,
         hint: '设置',
-        ico: 'settings',
+        ico: 'gear',
         keys: `${label} ${keys} ${id} 设置 settings`,
         run: () => {
           state.settingsSection = id;
-          document.querySelector('#tabs .tab[data-tab="settings"]:not([data-settings-jump])')?.click();
+          document.querySelector('#tabs .tab[data-tab="settings"]')?.click();
           state.settingsSection = id;
         }
       });
     }
-    list.push({ label: '切换主题（暗 / 亮 / 跟随系统）', hint: '操作', ico: 'persona', keys: 'theme 主题 暗色 亮色', run: () => document.querySelector('#theme-btn')?.click() });
+    list.push({ label: '切换主题（暗 / 亮 / 跟随系统）', hint: '操作', ico: 'moon', keys: 'theme 主题 暗色 亮色', run: () => document.querySelector('#theme-btn')?.click() });
     return list;
   }
 
@@ -76,7 +81,7 @@ import { state } from './core/state.js';
     const list = overlay.querySelector('.cp-list');
     list.innerHTML = items.length
       ? items.map((e, i) => `<button type="button" class="cp-item ${i === active ? 'active' : ''}" data-idx="${i}">
-          <span class="cp-icon" data-ico="${esc(e.ico || '')}" aria-hidden="true"></span><span class="cp-label">${esc(e.label)}</span><span class="cp-hint">${esc(e.hint)}</span></button>`).join('')
+          <span class="cp-icon" aria-hidden="true">${iconSvg(e.ico || 'chevron', { size: 16 })}</span><span class="cp-label">${esc(e.label)}</span><span class="cp-hint">${esc(e.hint)}</span></button>`).join('')
       : '<div class="cp-empty">没有匹配的页面</div>';
   }
 

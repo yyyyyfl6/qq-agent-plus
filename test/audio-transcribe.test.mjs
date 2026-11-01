@@ -529,3 +529,24 @@ it('空音频给"内容为空"的准确报错（不是一句 ffmpeg 转换失败
   const { audioBufferToPcm } = await import('../src/tools/audio-transcribe.js');
   await assert.rejects(() => audioBufferToPcm(Buffer.alloc(0), { name: 'x.amr' }), /音频内容为空/);
 });
+
+
+
+it('音频下载失败：退还这次额度（没向服务商发请求就不该白扣）', async () => {
+  resetAsrQuota();
+  setRuntimeConfig({
+    ...DEFAULT_CONFIG,
+    asr: { ...DEFAULT_CONFIG.asr, enabled: true, provider: 'openai', baseUrl: 'https://api.siliconflow.cn/v1', model: 'm', apiKey: 'sk-test', maxPerHour: 1, maxPerHourPerChat: 1 }
+  });
+  const { transcribeMessageAudio } = await import('../src/tools/audio-transcribe.js');
+  const ctx = {
+    chatKey: 'group:9',
+    signal: AbortSignal.timeout(8000),
+    onebot: { getMsg: async () => ({ message: [{ type: 'video', data: { url: 'http://127.0.0.1:1/nope.mp4' } }] }) }
+  };
+  const result = await transcribeMessageAudio(ctx, { mid: 'm1' });
+  assert.equal(result.ok, false, '下载失败应如实报错');
+  const again = consumeAsrQuota(Date.now());
+  assert.equal(again.ok, true, '失败的那次应已退还（上限 1：没退还的话这里就被挡住了）');
+  resetAsrQuota();
+});

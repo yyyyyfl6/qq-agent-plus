@@ -1,0 +1,253 @@
+import { Embedder, readLivingMemoryEmbeddingConfig } from './embedding.js';
+import { LivingMemoryStore } from './store.js';
+import { asText, clampInt, now, redactionReason } from './util.js';
+
+function embeddingText(memory) {
+  return [memory.summary, memory.content, memory.tags.join(' '), memory.entities.join(' ')].filter(Boolean).join('\n');
+}
+
+function recencyScore(memory) {
+  const days = Math.max(0, (now() - memory.updatedAt) / 86400000);
+  return Math.max(0, 1 - days / 365);
+}
+
+function cosineSimilarity(left, right) {
+  if (!left || !right || left.length !== right.length || !left.length) return 0;
+  let dot = 0;
+  let leftNorm = 0;
+  let rightNorm = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    const a = Number(left[index]) || 0;
+    const b = Number(right[index]) || 0;
+    dot += a * b;
+    leftNorm += a * a;
+    rightNorm += b * b;
+  }
+  if (!leftNorm || !rightNorm) return 0;
+  return dot / Math.sqrt(leftNorm * rightNorm);
+}
+
+function boundedDeadlineMs(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  return Math.max(200, Math.min(15000, Math.round(parsed)));
+}
+
+export class LivingMemoryService {
+  constructor({ file, embeddingConfig = null, store = null, embedder = null, log = console, turnRetentionDays = 7 } = {}) {
+    this.embeddingConfig = embeddingConfig || readLivingMemoryEmbeddingConfig();
+    this.store = store || new LivingMemoryStore({ file, turnRetentionDays });
+    this.embedder = embedder || new Embedder(this.embeddingConfig);
+    this.log = log;
+  }
+
+  health() {
+    return {
+      ok: true,
+      storage: { kind: 'sqlite', ok: true },
+      embedding: {
+        configured: this.embedder.ready(),
+        model: this.embeddingConfig.model || '',
+        dimensions: this.embeddingConfig.dimensions || 0
+      },
+      stats: this.store.stats()
+    };
+  }
+
+  async upsertMemory(raw) {
+    // 服务层自己始终做敏感信息检查；allowSensitive 只用于内部迁移，不能从控制台传进来。
+    const redactionText = [
+      raw?.summary || '', raw?.content || '',
+      ...(Array.isArray(raw?.tags) ? raw.tags : []),
+      ...(Array.isArray(raw?.entities) ? raw.entities : [])
+    ].join('\n');
+    const rejected = redactionReason(redactionText);
+    if (rejected) throw new Error(`拒绝保存：${rejected}`);
+    const duplicate = raw?.id ? null : this.store.findDuplicate({
+      scopeKey: raw?.scopeKey,
+      type: raw?.type,
+      summary: raw?.summary,
+      content: raw?.content
+    });
+    const memory = this.store.upsertMemory(raw, { id: raw?.id || duplicate?.id || '' });
+    if (!this.embedder.ready()) {
+      // 没有配置 Embedding 时标成“仅关键词”；编辑已有向量记忆则保留旧向量。
+      if (memory.vectorStatus === 'ready' && memory.vectorDimensions > 0) return memory;
+      return this.store.setVectorState(memory.id, { status: 'none' });
+    }
+    if (memory.status !== 'active') {
+      return this.store.setVectorState(memory.id, { status: 'stale', model: this.embeddingConfig.model });
+    }
+    try {
+      const [vector] = await this.embedder.embed(embeddingText(memory));
+      return this.store.setVectorState(memory.id, {
+        status: 'ready',
+        model: this.embeddingConfig.model,
+        vector
+      });
+    } catch (error) {
+      // 编辑时 store 已保留旧向量；这里只记错误，不把旧向量清掉。
+      if (memory.vectorStatus === 'ready' && memory.vectorDimensions > 0) {
+        this.log.warn?.('[living-memory] 重新向量化失败，继续沿用旧向量：', error?.message || error);
+        return this.store.markVectorError(memory.id, `重新向量化失败：${error?.message || error}`);
+      }
+      this.log.warn?.('[living-memory] 向量化失败，已保留关键词可检索记忆：', error?.message || error);
+      return this.store.setVectorState(memory.id, {
+        status: 'error',
+        error: String(error?.message || error),
+        model: this.embeddingConfig.model
+      });
+    }
+  }
+
+  async recall({ scopeKeys, query, limit = 6, deadlineMs = 0, semantic = true } = {}) {
+    const maxItems = clampInt(limit, 1, 20, 6);
+    const lexical = this.store.lexicalCandidates({ scopeKeys, query, limit: 800 });
+    const ranked = new Map();
+    for (const item of lexical) ranked.set(item.memory.id, { memory: item.memory, lexical: item.score, semantic: 0 });
+
+    let vectorError = '';
+    let semanticAvailable = semantic && this.embedder.ready() && this.store.hasReadyVectors({
+      scopeKeys,
+      model: this.embeddingConfig.model
+    });
+    const deadline = boundedDeadlineMs(deadlineMs);
+    const startedAt = now();
+    const remainingMs = () => deadline ? Math.max(0, deadline - (now() - startedAt)) : 0;
+
+    if (semanticAvailable) {
+      try {
+        const embeddingTimeoutMs = deadline
+          ? Math.min(this.embeddingConfig.recallTimeoutMs, remainingMs())
+          : this.embeddingConfig.recallTimeoutMs;
+        if (embeddingTimeoutMs < 200) throw new Error('语义召回超出本轮时间预算，已使用关键词结果');
+        const [queryVector] = await this.embedder.embed(asText(query, 4000), { timeoutMs: embeddingTimeoutMs });
+        const candidates = this.store.vectorCandidates({
+          scopeKeys,
+          model: this.embeddingConfig.model,
+          dimensions: queryVector.length,
+          limit: this.embeddingConfig.vectorScanLimit
+        });
+        if (!candidates.length) {
+          semanticAvailable = false;
+        } else {
+          const best = candidates
+            .map((item) => ({ id: item.id, score: cosineSimilarity(queryVector, item.vector) }))
+            .filter((item) => item.score > 0)
+            .sort((a, b) => b.score - a.score)
+            .slice(0, 32);
+          const memories = this.store.getMemories(best.map((item) => item.id));
+          const byId = new Map(memories.map((memory) => [memory.id, memory]));
+          for (const match of best) {
+            const memory = byId.get(match.id);
+            if (!memory) continue;
+            const prior = ranked.get(memory.id) || { memory, lexical: 0, semantic: 0 };
+            prior.semantic = Math.max(prior.semantic, match.score);
+            ranked.set(memory.id, prior);
+          }
+        }
+      } catch (error) {
+        vectorError = String(error?.message || error);
+      }
+    }
+
+    const entries = [...ranked.values()].map((item) => {
+      const lexicalNormal = Math.min(1, item.lexical / 18);
+      const score = item.semantic * 0.62 + lexicalNormal * 0.25
+        + (Number(item.memory.importance) || 0) / 10 * 0.09 + recencyScore(item.memory) * 0.04;
+      return {
+        ...item.memory,
+        retrieval: {
+          score: Math.round(score * 1000) / 1000,
+          semantic: Math.round(item.semantic * 1000) / 1000,
+          lexical: item.lexical,
+          recency: Math.round(recencyScore(item.memory) * 1000) / 1000
+        }
+      };
+    }).sort((a, b) => b.retrieval.score - a.retrieval.score || b.updatedAt - a.updatedAt).slice(0, maxItems);
+
+    const mode = !semantic || !this.embedder.ready()
+      ? 'lexical'
+      : !semanticAvailable
+        ? 'lexical-pending-vectors'
+        : vectorError ? 'hybrid-degraded' : 'hybrid';
+    return { entries, vectorError, mode };
+  }
+
+  /**
+   * Rebuild local vectors without changing a memory card's semantic timestamp.
+   * It is used by the external-service migration and is deliberately opt-in:
+   * normal startup never turns an Embedding provider into an unbounded job.
+   */
+  async reindexVectors({ limit = 100000, batchSize = 8, timeoutMs = 0, force = false, fn = null } = {}) {
+    const report = { configured: this.embedder.ready(), candidates: 0, attempted: 0, ready: 0, failed: 0 };
+    if (!this.embedder.ready()) return { ...report, reason: 'Embedding 未配置' };
+    const items = this.store.vectorWork({ model: this.embeddingConfig.model, limit, force });
+    report.candidates = items.length;
+    const size = clampInt(batchSize, 1, 64, 8);
+    const effectiveTimeoutMs = clampInt(timeoutMs, 0, 120000, 0);
+    const notify = () => {
+      if (typeof fn === 'function') fn({ ...report });
+    };
+    const saveReady = (memory, vector) => {
+      this.store.setVectorState(memory.id, {
+        status: 'ready', model: this.embeddingConfig.model, vector, preserveUpdatedAt: true
+      });
+      report.ready += 1;
+    };
+    const saveError = (memory, error) => {
+      this.store.setVectorState(memory.id, {
+        status: 'error', error: String(error?.message || error), model: this.embeddingConfig.model, preserveUpdatedAt: true
+      });
+      report.failed += 1;
+    };
+
+    for (let offset = 0; offset < items.length; offset += size) {
+      const batch = items.slice(offset, offset + size);
+      report.attempted += batch.length;
+      const text = batch.map((memory) => embeddingText(memory));
+      try {
+        const vectors = await this.embedder.embed(text, { timeoutMs: effectiveTimeoutMs });
+        if (vectors.length !== batch.length) throw new Error('Embedding 返回数量不匹配');
+        batch.forEach((memory, index) => saveReady(memory, vectors[index]));
+      } catch (batchError) {
+        // A malformed single card must not make the rest of an import permanently unvectorizable.
+        this.log.warn?.('[living-memory] 批量向量回填失败，改为逐条尝试：', batchError?.message || batchError);
+        for (const memory of batch) {
+          try {
+            const [vector] = await this.embedder.embed(embeddingText(memory), { timeoutMs: effectiveTimeoutMs });
+            saveReady(memory, vector);
+          } catch (error) {
+            saveError(memory, error);
+          }
+        }
+      }
+      notify();
+    }
+    return report;
+  }
+
+  archiveMemory(id) {
+    return this.store.archiveMemory(id);
+  }
+
+  unarchiveMemory(id) {
+    return this.store.unarchiveMemory(id);
+  }
+
+  removeMemory(id) {
+    return this.store.removeMemory(id);
+  }
+
+  recordTurn(raw) {
+    return this.store.recordTurn(raw);
+  }
+
+  prune() {
+    return this.store.pruneExpired();
+  }
+
+  close() {
+    this.store.close();
+  }
+}

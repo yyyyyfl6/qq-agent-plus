@@ -15,12 +15,13 @@ const OPEN_FRIEND_PROPOSAL_STATES = new Set([
 ]);
 // 入站好友请求里"还没了结"的状态：与触发闸门、friend_add 收尾用的集合一致
 // （identity-store.js 里那两处 `status IN (...)`）。保留期清理不能删这些。
+// failed 是终态（决策入口只接受 pending，不会重试）——列在这里等于永远不清、表只涨不缩
+//（2026-10-12 审查）。
 const OPEN_INCOMING_REQUEST_STATES = new Set([
   'pending',
   'deciding',
   'approved',
-  'held_unknown',
-  'failed'
+  'held_unknown'
 ]);
 
 function ensureColumn(db, table, name, definition) {
@@ -913,6 +914,17 @@ export class IdentityStore {
           WHERE account_uin!='' AND uin=?
             AND status IN ('queued','reviewing')
         `).run(now, now, uin);
+      }
+      // 2026-10-06 复审 P2：管理员经身份资产手工标记的 is_friend 是持久 override（重建路径
+      // 尊重它），快照刷新却把它无差别清零 —— ≤15 分钟内"已是好友"闸门失效，可对同一人
+      // 重复发申请。归零/好友回填之后把**非空** override 补回来；is_friend 为 NULL 的
+      // override 不动（与重建路径 `override?.is_friend == null ? 行值 : override 值` 同口径）。
+      const reapply = this.db.prepare('UPDATE people SET is_friend=?, updated_at=? WHERE uin=?');
+      for (const override of this.db.prepare(
+        'SELECT uin, is_friend FROM identity_asset_overrides WHERE deleted=0 AND is_friend IS NOT NULL'
+      ).all()) {
+        const overrideUin = normalizeUin(override.uin);
+        if (overrideUin) reapply.run(Number(override.is_friend) ? 1 : 0, now, overrideUin);
       }
       this.db.prepare(`
         INSERT INTO identity_meta(key, value) VALUES ('friend_snapshot_at', ?)

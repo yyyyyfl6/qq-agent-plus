@@ -35,6 +35,8 @@ export function normalizeStickerEntry(raw) {
     hidden: entry.hidden === true,
     metadataEdited: entry.metadataEdited === true,
     useCount: Math.max(0, Number(entry.useCount) || 0),
+    // QQ 收藏被删除后不会立刻清：连续几次同步都没返回才真删（见 mergeStickerLibrary）。
+    missCount: Math.max(0, Math.floor(Number(entry.missCount) || 0)),
     lastUsedAt: Number(entry.lastUsedAt) || 0,
     lastContext: String(entry.lastContext ?? '').slice(0, 200),
     createdAt: String(entry.createdAt || nowIso()),
@@ -74,6 +76,9 @@ export function saveStickerStore(entries, file = STICKER_FILE) {
   fs.chmodSync(file, 0o600);
 }
 
+/** 同步窗口上限（sticker-manager 按这个数拉取）。 */
+export const STICKER_SYNC_LIMIT = 500;
+
 export function mergeStickerLibrary(existing, fetched) {
   const out = existing.map(normalizeStickerEntry).filter(Boolean);
   const byId = new Map(out.map((e) => [e.id, e]));
@@ -101,6 +106,7 @@ export function mergeStickerLibrary(existing, fetched) {
       usage: old?.usage || '',
       source: old?.source || 'qq',
       useCount: old?.useCount || 0,
+      missCount: 0,   // 这次同步能看到它，之前的漏检计数清零
       lastUsedAt: old?.lastUsedAt || 0,
       lastContext: old?.lastContext || '',
       createdAt: old?.createdAt || nowIso(),
@@ -117,13 +123,24 @@ export function mergeStickerLibrary(existing, fetched) {
   }
   // 保护：这次一条都没拉到（接口失败/空列表）时不要剪枝——否则 QQ 一抖，本地库连备注一起被清空
   if (!fetchedIds.size) return out;
-  // 剪枝只剪"没有任何本地数据"的条目：这次没出现的 QQ 收藏可能是被删了，也可能只是
-  // 协议端没把它带回来（分页/上限/响应不全都算）。备注、标签、使用计数是模型自己攒的，
-  // 不能因为一次同步就静默丢掉 —— 那种丢失没有任何备份可恢复。
-  const hasLocalData = (e) => Boolean(String(e.localNote || e.usage || '').trim())
-    || (Array.isArray(e.tags) && e.tags.length > 0)
-    || Number(e.useCount) > 0;
-  return out.filter((e) => e.source !== 'qq' || e.hidden || fetchedIds.has(e.id) || hasLocalData(e));
+  // 拉满同步窗口时无法判断后面还有没有：此时不做剪枝，避免把 500 条之后的收藏
+  // 连续 3 次"没看到"后误删。用户收藏确实少于 500 时才会真正清理。
+  if (Array.isArray(fetched) && fetched.length >= STICKER_SYNC_LIMIT) return out;
+  // 这次没出现的 QQ 收藏可能是被删了，也可能只是协议端没带回来（分页/上限/响应不全）。
+  // 一次就删会把备注/标签/使用计数一起静默丢掉，所以给 3 次同步的观察期：
+  // 连续 3 次都没返回才真删；中途重新出现就清零（issue #57）。
+  // hidden 也一样：它只表示"用户在控制台删了，但 QQ 服务器上可能还在"，不能永久保留。
+  const kept = [];
+  for (const entry of out) {
+    if (entry.source !== 'qq' || fetchedIds.has(entry.id)) {
+      kept.push(entry);
+      continue;
+    }
+    const missCount = Math.max(0, Number(entry.missCount) || 0) + 1;
+    if (missCount >= 3) continue;
+    kept.push({ ...entry, missCount, updatedAt: nowIso() });
+  }
+  return kept;
 }
 
 /** 剥掉清单里的展示性修饰，返回**由长到短**的形态阶梯：原文 → 去行首项目符号 → 每剥掉一段
@@ -154,6 +171,11 @@ function stripDisplayForms(text) {
     if (!changed) break;
   }
   return forms;
+}
+
+/** 引号形态归一：库里存半角、模型常传全角，不归一就会四级匹配全落空。 */
+function normalizeStickerLookup(value) {
+  return String(value ?? '').trim().toLowerCase().replace(/[“”‘’「」『』]/g, '"');
 }
 
 export function findSticker(entries, ref) {
@@ -188,26 +210,25 @@ export function findSticker(entries, ref) {
   // 形态阶梯由长到短地试：先按原文，再逐段剥掉展示性后缀（整行粘贴时靠这一步还原备注名）。
   const forms = stripDisplayForms(raw);
   for (const form of forms) {
-    const label = form.toLowerCase();
+    const label = normalizeStickerLookup(form);
     // ① 备注精确相等
     const exact = visible.filter((entry) =>
-      [entry.desc, entry.localNote].some((value) =>
-        String(value || '').trim().toLowerCase() === label));
+      [entry.localNote, entry.desc].some((value) => normalizeStickerLookup(value) === label));
     if (exact.length === 1) return exact[0];
     if (exact.length > 1) continue;   // 同级重名：换一种形态再试，仍不行就 null（宁缺勿错）
     if (label.length < 2) continue;
     // ② 备注包含查询（"只记得半句"）
     const noteHasQuery = visible.filter((entry) =>
-      [entry.desc, entry.localNote].some((value) => {
-        const text = String(value || '').trim().toLowerCase();
+      [entry.localNote, entry.desc].some((value) => {
+        const text = normalizeStickerLookup(value);
         return text.length > 0 && text.includes(label);
       }));
     if (noteHasQuery.length === 1) return noteHasQuery[0];
     if (noteHasQuery.length > 1) continue;
     // ③ 查询包含备注（模型附带了多余的字，但不要短备注吞掉长查询：本级只认"备注被查询包住"）
     const queryHasNote = visible.filter((entry) =>
-      [entry.desc, entry.localNote].some((value) => {
-        const text = String(value || '').trim().toLowerCase();
+      [entry.localNote, entry.desc].some((value) => {
+        const text = normalizeStickerLookup(value);
         return text.length >= 2 && label.includes(text);
       }));
     if (queryHasNote.length === 1) return queryHasNote[0];
@@ -215,7 +236,7 @@ export function findSticker(entries, ref) {
     // ④ 标签（最弱一级，仅在前面都没命中时才用）
     const tagHit = visible.filter((entry) =>
       (Array.isArray(entry.tags) ? entry.tags : []).some((value) => {
-        const text = String(value || '').trim().toLowerCase();
+        const text = normalizeStickerLookup(value);
         return text.length > 0 && (text.includes(label) || label.includes(text));
       }));
     if (tagHit.length === 1) return tagHit[0];
@@ -276,7 +297,7 @@ export function buildStickerContext(entries, max = 10, { vision = true } = {}) {
   // 现在一半留给"没用过/最久没用"的：发掉一张，下一张就自然顶上来。
   // 排序只看 useCount / lastUsedAt / createdAt / id，同一份库每轮结果完全一致 ——
   // 这段清单常驻系统提示、属于缓存前缀，不能每次运行都换一批。
-  const hasNote = (e) => Boolean(String(e.desc || e.localNote || '').trim());
+  const hasNote = (e) => Boolean(String(e.localNote || e.desc || '').trim());
   const byUsage = [...list].sort((a, b) =>
     (b.useCount || 0) - (a.useCount || 0)
     || (hasNote(b) ? 1 : 0) - (hasNote(a) ? 1 : 0)
@@ -302,7 +323,9 @@ export function buildStickerContext(entries, max = 10, { vision = true } = {}) {
   const lines = top.map((e) => {
     // 备注/标签由模型按群友暗示写入（sticker_note 工具可写），最终拼进**系统提示**的
     // 【可用表情包】段 —— 不过清洗就是一个可持久化的注入位（写了每轮都在）。
-    const label = clipLine(sanitizeUserText(e.desc || e.localNote || '')) || '（无备注，可先看图）';
+    // 控制台「自动备注」写的是 localNote；desc 只是采集时自动填的粗标（常是 GIF/e）。
+    // 给模型看的清单必须与 UI、工具层同口径：localNote 优先。
+    const label = clipLine(sanitizeUserText(e.localNote || e.desc || '')) || '（无备注，可先看图）';
     const extra = e.tags?.length ? ` [${clipLine(e.tags.map((t) => sanitizeUserText(t)).join('/'), TAG_CHARS)}]` : '';
     const used = e.useCount ? `（用过${e.useCount}次）` : '（没用过）';
     // 两类来源在 QQ 里的呈现完全不同：QQ 收藏表情发出去是"表情"，本地图库（收藏/上传的图）
@@ -332,7 +355,7 @@ export function buildStickerContext(entries, max = 10, { vision = true } = {}) {
 }
 
 /** 发送前的表情包策略提示（软策略）。 */
-export function buildStickerStrategyHint(level = 1, { vision = true } = {}) {
+export function buildStickerStrategyHint(level = 1, { vision = true, cardFirst = false } = {}) {
   // 活跃度引导放在系统提示的策略段里（而不是"本次输入"的【表情包用法】）——
   // 同一主题两处引导会左右脑互搏（Kondius 2026-09-07）：策略讲时机、档位讲频率，
   // 合并成一处由档位直接改写频率行。
@@ -343,6 +366,20 @@ export function buildStickerStrategyHint(level = 1, { vision = true } = {}) {
     '频率：回应、吐槽、接梗时优先考虑配一个贴切的表情，让对话更有活人感；别每次都用同一张。',
     '频率：你是表情包爱好者——能配表情的地方尽量配，接梗/调侃/附和时几乎都会带一张，聊天要有表情包的烟火气；注意换着用，不要连发同一张。'
   ][Math.min(3, Math.max(0, Number(level) || 0))];
+  // 角色卡优先（Issue #40）：表情包也是"怎么说"的一部分，平台只交代工具与边界，
+  // 时机/频率/真人感交给角色卡 —— 否则换卡后仍是同一种"每 3~5 轮一张"的节奏。
+  if (cardFirst) return [
+    '【表情包策略】',
+    '- 时机：按角色设定决定用不用；被逗笑、接梗、赞同、自嘲、无语、告别等场景都合适，别人发表情/图片时也可以回一张。',
+    '- 频率：按角色设定；别连续刷屏，同一张别连着用。',
+    '- 选择：先看备注/笔记/标签能不能对上语境——完全贴切的优先，语义接近、氛围对的也可以用，不用等 100% 契合；只有明显不搭才别发。',
+    vision
+      ? '- 清单里标「没用过」的也可以直接用，不确定是什么就先 get_sticker_image 看一眼；用掉一张，下一张没用过的会自己顶上来。'
+      : '- 清单里标「没用过」的挑有备注的用（清单里没备注的不会列出来）；看不到图，别对没把握的图硬发挥。',
+    '- 发送：用 send_sticker；一条消息只能是一张表情，不能在同一气泡里附带文字；想说的话先用 send_message 作为单独气泡发出，再单独发表情。',
+    '- 选图很简单：stickerId 直接填【可用表情包】里那行开头的备注名（不要背长 id），备注里独特的一小段也行，系统会自动匹配；命中不唯一时才需要完整 id（可用 list_stickers 看全库）。',
+    '- 不要：在严肃/正式/敏感话题硬塞表情；不要一条消息里塞多个表情；不要把文字和表情混在同一个气泡里。'
+  ].join('\n');
   return [
     '【表情包策略：像真人一样用，不刷屏】',
     '- 合适时机：被戳中笑点/槽点、接梗、赞同、自嘲、安慰、无语、赢了/输了、告别/晚安，都可以自然用；别人发了表情包/图片时，接完话基本都要回一张自己的。',

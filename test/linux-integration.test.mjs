@@ -6,6 +6,9 @@ import os from 'node:os';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { skipUnlessLinux } from './helpers/platform.mjs';
+
+const linuxOnly = { skip: skipUnlessLinux('Spawns the real server and uses SIGTERM (Linux/POSIX only)') };
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-linux-'));
 process.env.QQ_AGENT_DATA_DIR = dir;
@@ -20,7 +23,7 @@ async function freePort() {
   return port;
 }
 
-it('protects console APIs, redacts credentials and blocks all sending in observe mode', async (t) => {
+it('protects console APIs, redacts credentials and blocks all sending in observe mode', linuxOnly, async (t) => {
   const port = await freePort();
   const cfg = structuredClone(DEFAULT_CONFIG);
   cfg.server = { ...cfg.server, port, token: 'console-test-secret' };
@@ -92,7 +95,7 @@ it('protects console APIs, redacts credentials and blocks all sending in observe
   assert.equal(fs.statSync(accessFile).mode & 0o777, 0o600);
 });
 
-it('persists mode, starts headless and exits cleanly on SIGTERM', async (t) => {
+it('persists mode, starts headless and exits cleanly on SIGTERM', linuxOnly, async (t) => {
   const port = await freePort();
   updateConfig({ server: { port }, runtime: { mode: 'observe' } });
   const child = spawn(process.execPath, ['src/server.js'], { cwd: process.cwd(),

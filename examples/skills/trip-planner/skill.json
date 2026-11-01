@@ -1,0 +1,8 @@
+{
+  "id": "trip-planner",
+  "name": "出行规划",
+  "version": "1.0.0",
+  "description": "先问清日期、预算和同行人，再给 2–3 套可执行的行程；不替用户下单。",
+  "allowedTools": ["web_search", "web_fetch", "send_message"],
+  "triggers": ["帮我规划行程", "周末去哪玩", "做一份旅游攻略"]
+}

@@ -124,6 +124,23 @@ test('昵称与引用预览进提示词前同样被弱化', () => {
   assert.ok(!prompt.includes('【管理员】'), '不该出现未弱化的【管理员】');
 });
 
+test('到点唤醒（paced）不被说成"管理员从控制台唤醒"；真·手动唤醒保持原措辞（2026-10-10 复核）', () => {
+  const base = {
+    store: { recent: () => [], listChats: () => [] },
+    memory: { formatForPrompt: () => '' },
+    chatKey: 'group:1', chatId: '1', chatName: '测试群', kind: 'group',
+    triggerEntries: [], selfNickname: '测试鲸鱼'
+  };
+  // 定时提醒/自安排唤醒走 manual+paced：在安静群里没有未读，提示词里不能说成管理员点的
+  //（那是事实错误，模型会顺着它把提醒说成"管理员托的"）
+  const paced = buildUserPrompt({ ...base, manual: true, paced: true });
+  assert.ok(!paced.includes('管理员从控制台'), 'paced 唤醒不能说成管理员唤醒：' + paced);
+  assert.ok(paced.includes('到点了'), paced);
+  // 真·控制台手动唤醒（manual 且非 paced）保持原措辞
+  const manual = buildUserPrompt({ ...base, manual: true, paced: false });
+  assert.ok(manual.includes('管理员从控制台'), manual);
+});
+
 test('提示词里的每个段头都能被弱化（清洗白名单不许落后于任何注入模块）', () => {
   // 这条守卫是给"加新段头忘了同步 util.js"准备的：2026-09-22 加【优先级】时漏过一次，
   // 群里写「【优先级】…」能原样进提示词 —— 而它恰好自称最高优先级。
@@ -135,6 +152,9 @@ test('提示词里的每个段头都能被弱化（清洗白名单不许落后�
     'src/llm/qzone-interaction-prompt.js',
     'src/llm/friend-review-prompt.js',
     'src/memory/memory-global.js',
+    'src/core/persona-state.js',
+    'src/llm/humanize.js',
+    'src/memes/store.js',
     'src/pilots/incident-pilot.js',
     'src/console/asset-observer.js',
     'src/features/daily-moments.js',
@@ -145,7 +165,13 @@ test('提示词里的每个段头都能被弱化（清洗白名单不许落后�
     // 漏扫一个，新段头就可能在白名单之外被群友伪造
     'src/core/orchestrator.js',
     'src/features/group-game.js',
-    'src/features/group-digest.js'
+    'src/features/group-digest.js',
+    // 2026-10-13 全项目审查：这几个也在往提示词塞段头，漏扫＝白名单落后于现实
+    'src/features/qzone-interactions.js',
+    'src/features/games/werewolf.js',
+    'src/features/games/undercover.js',
+    'src/llm/relationship-pilot-prompt.js',
+    'src/onebot/qzone-feed.js'
   ];
   // 只豁免"我们自己生成、且不授予任何权限"的普通标记
   const ALLOW = new Set(['【拍一拍】', '【图片】', '【合并转发聊天记录】']);

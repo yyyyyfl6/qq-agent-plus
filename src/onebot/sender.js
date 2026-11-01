@@ -4,8 +4,9 @@
 // - Markdown → 纯文本、QQ 硬长度切分、CQ 转义
 // - 发出的每一条记进 ChatStore（self=true，供下一次运行当"自己的发言"）
 import { getConfig, DEFAULT_CONFIG } from '../core/config.js';
-import { sleep, randInt, createSendChain, formatClockTime } from '../core/util.js';
+import { sleep, sleepAbortable, randInt, createSendChain, formatClockTime, todayKey } from '../core/util.js';
 import { mdToPlain, splitForQQ } from '../llm/md-to-plain.js';
+import { shapeBubbles } from '../llm/bubble-shape.js';
 import { assertCanSend } from '../core/access.js';
 import { createLogger } from '../core/logger.js';
 
@@ -27,7 +28,13 @@ export function classifyTransportFailure(error) {
   const message = String(error?.message ?? error);
   const causeText = String(error?.cause?.code || error?.cause?.message || '');
   const evidence = causeText || message;
-  const definite = /ECONNREFUSED|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH/i.test(evidence);
+  // WS 帧级证据也是"确定未投递"：ws 的 send 回调报错（readyState 非 OPEN → 帧没写进 socket，
+  // 文案 "WebSocket is not open: readyState …"）与发送途中连接被关（帧没写完/压缩中被打断 ——
+  // 接收端只拿到残帧会被整帧丢弃；ws 8.x 的真实文案是 "The socket was closed while data was
+  // being compressed" / "…blob was being read"）都意味着对方不可能收到完整帧。加进来之前
+  // 这些错误既不匹配 definite 也不匹配 uncertain，结果"确定没送达"的消息既不重试、
+  // 还落 unknown 挂人工核对（2026-10-07 复审）。
+  const definite = /ECONNREFUSED|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|WebSocket is not open|WS 发送失败|socket was closed while data was being (compressed|read)/i.test(evidence);
   const uncertain = !definite
     && /timeout|timed out|ETIMEDOUT|ECONNRESET|EPIPE|socket hang up|fetch failed|network|HTTP 5\d\d|Unexpected status code: 5\d\d/i.test(evidence);
   return { evidence, definite, uncertain };
@@ -38,11 +45,15 @@ function muteError(untilTs) {
   if (!untilTs) return '本群全员禁言中，本轮先不发言';
   // 只写 HH:MM:SS 会让模型以为"今天就能发"：QQ 禁言最长 30 天，跨天时必须带上日期
   // （2026-09-26 审查：25 小时后的解禁时间被写成"预计 09:12:33 解除"）
-  const until = new Date(untilTs);
-  const now = new Date();
-  const sameDay = until.getFullYear() === now.getFullYear()
-    && until.getMonth() === now.getMonth() && until.getDate() === now.getDate();
-  const when = sameDay ? formatClockTime(untilTs) : `${until.getMonth() + 1}月${until.getDate()}日 ${formatClockTime(untilTs)}`;
+  // ⚠️ 日期与时刻必须同一口径（都是上海时区，2026-10-09 审查）：原来用 getMonth()/getDate()
+  // 取的是**宿主机本地时区**的日期，而 formatClockTime 固定按 Asia/Shanghai 格式化 ——
+  // 部署在 TZ=UTC 的机器上，北京 0-8 点之间两者差一天，解禁日期会报错一天。
+  const dayKey = todayKey(untilTs);
+  const sameDay = dayKey === todayKey();
+  const [, mm, dd] = dayKey.split('-');
+  const when = sameDay
+    ? formatClockTime(untilTs)
+    : `${Number(mm)}月${Number(dd)}日 ${formatClockTime(untilTs)}`;
   return `本群禁言中（预计 ${when} 解除），本轮先不发言`;
 }
 
@@ -85,7 +96,61 @@ function muteUntilMs(raw, nowSec) {
   return shut * 1000;                         // 超限值由 muteMark 一处兜住（超限即返回 0）
 }
 
+/**
+ * 人类化首条延迟（纯函数，便于单测，不依赖墙钟）。
+ * 未开启或 replyDelay 关闭时返回 null（调用方回退到普通 #gap）。
+ */
+export function leadDelayFor(humanize, parts) {
+  const h = humanize;
+  if (h?.enabled !== true || h?.replyDelay?.enabled === false) return null;
+  const n = (Array.isArray(parts) ? parts : []).reduce((sum, part) => sum + String(part || '').length, 0);
+  const min = Math.max(0, Math.min(30000, Number(h?.replyDelay?.minMs) || 0));
+  const max = Math.max(min, Math.min(30000, Number(h?.replyDelay?.maxMs) || min));
+  const perChar = Math.max(0, Math.min(200, Number(h?.replyDelay?.perCharMs) || 0));
+  const cap = Math.max(max, Math.min(60000, Number(h?.replyDelay?.capMs) || 8000));
+  const base = min + Math.random() * (max - min) + n * perChar;
+  return Math.min(cap, Math.max(0, Math.round(base)));
+}
+
 export class SendQueue {
+/**
+   * 送达之后的记账：把自己发出去的话写进库 + 通知 onSent。
+   * 这些都是**发送成功之后**的副作用，失败绝不能把一次已经送达的发送改判成失败：
+   * 文本/贴纸/语音/拍一拍/表情五条路径的 appendSelf + onSent 都在 Promise.allSettled
+   * 的链里，任一处抛错都会被汇总成 failed → 告诉模型「发送失败」→ 模型重发 →
+   * 群里出现两条一样的消息（2026-10-04 全面复审 P3 实测：stub appendSelf 抛 disk full，
+   * sendCalls=1、outbox=sent，却上报 toolOutcome=发送失败）。
+   * 写不进去的账留给人工核对，这里只记日志。
+   */
+  #afterSent(run) {
+    try {
+      // 刻意写成 run.call(null)：ops scan 按「标识符(」收集调用点，直接写 run( 会把参数名
+      // 当成一个未定义的全局函数报出来（2026-10-04 全面复审）。
+      return run.call(null);
+    } catch (error) {
+      log.warn('[sender] 消息已送达但记账失败（该条仍算已发出，不会上报失败）:', error?.message ?? error);
+      return null;
+    }
+  }
+
+  /**
+   * 送达后记账要用的「被引用消息的作者」。**这一步已经在 send() 成功之后**，所以库读也必须
+   * 自己兜住：findByMid 抛错（磁盘/库损坏这类不受 busy_timeout 管的错）会让整条 promise
+   * reject → sendTextBatch 把这条记成 failed → 模型以为没发出去、重发 → 群里两条一样的消息。
+   * 与 #afterSent 同源的漏兜（2026-10-05 全审：三处 findByMid 都在兜底之外）。
+   */
+  #replyTarget(chatKey, options) {
+    const at = String(options.atUserId || '');
+    if (at || options.replyToMessageId == null) return at;
+    try {
+      const replied = this.store.findByMid(chatKey, options.replyToMessageId);
+      if (replied && !replied.self) return String(replied.senderId || '');
+    } catch (error) {
+      log.warn('[sender] 消息已送达，但查被引用消息失败（这条按无引用记账）:', error?.message ?? error);
+    }
+    return at;
+  }
+
   constructor({ onebot, store, onSent = null, onIncident = null }) {
     this.onebot = onebot;
     this.store = store;
@@ -161,13 +226,45 @@ export class SendQueue {
     this.hourTimes.set(chatKey, hour);
   }
 
-  #gap(text, isLast) {
+  #gap(text, isLast, voice) {
     const cfg = getConfig().send;
     const min = Math.max(200, Number(cfg.minGapMs) || 1000);
     const max = Math.max(min, Number(cfg.maxGapMs) || 3000);
     if (isLast) return 0;
-    const byLength = Math.min(8000, (String(text || '').length) * (Number(cfg.byLengthMs) || 20));
+    // 角色卡自己的节奏优先：猫娘/损友不该等跟技术宅一样久。只在开了人类化时生效。
+    const pause = voice?.pauseMs;
+    if (getConfig().humanize?.enabled === true && Array.isArray(pause) && pause.length === 2) {
+      const vmin = Math.max(0, Math.min(30000, Number(pause[0]) || 0));
+      const vmax = Math.max(vmin, Math.min(30000, Number(pause[1]) || vmin));
+      // 200ms 是绝对下限（与下面普通路径同款）：voice-profiles 写 [0,0] 不能造成零间隔连发刷屏
+      return Math.max(200, randInt(vmin, vmax));
+    }
+    // byLengthMs 的 0 是合法值（"不按字数附加延迟"，控制台那个框 min="0"）——
+    // 用 `|| 20` 会把它吞掉，界面上填了 0、实际每条仍按 20ms/字延迟（2026-10-08 审查）。
+    const perChar = Number(cfg.byLengthMs);
+    const byLength = Math.min(8000, String(text || '').length * (Number.isFinite(perChar) ? Math.max(0, perChar) : 20));
     return Math.min(15000, Math.max(min, randInt(min, max) * 0.5 + byLength * 0.5));
+  }
+
+  /**
+   * 人类化首条延迟：按本批总字数模拟"看完再打字"，不改变后续气泡的间隔。
+   * 未开启时返回 null（调用方回退到原来的 #gap），保证升级前后发送节奏逐字一致。
+   */
+  #leadDelay(parts) {
+    return leadDelayFor(getConfig().humanize, parts);
+  }
+
+  /**
+   * 私聊「正在输入…」（群聊没有这个能力，协议端侧会 no-op）。开关 send.typingIndicator
+   * 默认开；纯装饰，任何失败（协议端不支持、超时）都吞掉，绝不影响本次发送。
+   */
+  async #signalTyping(kind, id, options) {
+    if (kind !== 'private') return;
+    if (getConfig().send?.typingIndicator === false) return;
+    if (typeof this.onebot?.setInputStatus !== 'function') return;
+    try {
+      await this.onebot.setInputStatus('private', id, true, options?.signal);
+    } catch { /* 输入状态只是装饰 */ }
   }
 
   async #deliver(chatKey, options, payload, send) {
@@ -192,7 +289,15 @@ export class SendQueue {
           await sleep(1500);
         }
       }
-      this.store.finishSend(id, { messageId: data?.message_id });
+      try {
+        this.store.finishSend(id, { messageId: data?.message_id });
+      } catch (accountingError) {
+        // 消息**已经送达**（上面拿到 data 就是证据）。记账失败绝不能改判成"发送失败"再抛出去 ——
+        // 那会让模型以为没发出去而重发，群里就多一条一模一样的内容（2026-10-04 全面复审 P3）。
+        // 该行留在 sending，控制台"未知写入"里能人工核对 —— 这本来就是 sending 状态的用途。
+        log.warn('[sender] 消息已送达但 outbox 记账失败（该行留在 sending，待人工核对）:',
+          accountingError?.message ?? accountingError);
+      }
       return data;
     } catch (error) {
       // 记账口径与重试判定一致：能证明没送达的算 failed（可被"重试失败批次"捞回来），
@@ -202,10 +307,18 @@ export class SendQueue {
       const outcome = error?.outcome === 'failed' || error?.outcome === 'unknown'
         ? error.outcome
         : (definite && !uncertain ? 'failed' : 'unknown');
-      this.store.finishSend(id, {
-        error: error?.message ?? error,
-        outcome
-      });
+      try {
+        this.store.finishSend(id, {
+          error: error?.message ?? error,
+          outcome
+        });
+      } catch (accountingError) {
+        // 与成功路径同口径（2026-10-04 复审修的是成功路径，失败路径是漏网之鱼，2026-10-06 复审 P3）：
+        // 记账失败只记日志、原错误照抛 —— 否则真实错误被 sqlite 错误顶掉、incident 整段跳过、
+        // 本该记 failed 自动重试的 definite 失败被升级成"未知写入"人工核对。
+        log.warn('[sender] 发送失败后 outbox 记账也失败（该行留在 sending，待人工核对）:',
+          accountingError?.message ?? accountingError);
+      }
       try {
         const incident = this.onIncident(error, {
           source: 'sender',
@@ -232,9 +345,20 @@ export class SendQueue {
     if (kind !== 'group' && kind !== 'private') throw new Error(`非法会话 key：${chatKey}`);
     const list = Array.isArray(messages) ? messages : [messages];
     if (!list.length) throw new Error('消息列表为空');
+    const humanizeCfg = getConfig().humanize;
+    // 气泡整形只作用于"人格回复"（send_message 路径传 persona:true）。
+    // 日报/群游戏结算/管理员简报/插件代发这类系统文本有自己的格式，按卡的每条字数硬拆只会拆坏。
+    // 整形在 Markdown 转换之前做：代码围栏、URL、行内代码还在原文里，拆分器能整段保护它们。
+    const shaped = humanizeCfg?.enabled === true && humanizeCfg?.shape?.enabled !== false
+      && options.persona === true
+      ? shapeBubbles(list, {
+        maxBubbles: options.voice?.maxBubbles ?? humanizeCfg?.shape?.maxBubbles,
+        maxChars: options.voice?.maxChars ?? humanizeCfg?.shape?.maxChars
+      })
+      : list;
     const hardSplitAt = Number(getConfig().send?.hardSplitAt) || 0;
     const parts = [];
-    for (const m of list) {
+    for (const m of shaped) {
       const plain = mdToPlain(String(m ?? ''), { preserveCode: options.preserveCode === true });
       if (!plain) continue;
       // 最后防线：任何上游畸形路径漏下来的 "[object Object]" 到这儿直接拦掉，
@@ -250,25 +374,26 @@ export class SendQueue {
     for (let i = 0; i < parts.length; i++) {
       const text = parts[i];
       const isLast = i === parts.length - 1;
-      const gap = this.#gap(text, isLast);
+      // 首条：开了人类化才用它（可为 0），否则回退到原来的 #gap —— 关闭时发送节奏与升级前一致。
+      const lead = i === 0 ? this.#leadDelay(parts) : null;
+      const gap = lead === null ? this.#gap(text, isLast, options.voice) : lead;
       promises.push(chain(async () => {
         assertCanSend(chatKey, options.signal, { gameScoped: options.gameScoped === true });
         if (options.runId && this.store.hasUncertainEffects(options.runId)) throw new Error('Previous send delivery is uncertain');
         this.#checkRate(chatKey);
-        if (gap > 0) await sleep(gap);
+        // 先亮"正在输入"再等间隔：对方看到的状态是"它正在打字"，而不是干等（私聊限定）。
+        await this.#signalTyping(kind, id, options);
+        if (gap > 0) await sleepAbortable(gap, options.signal);
         const data = await this.#deliver(chatKey, options, { type: 'text', text }, () => this.onebot.sendText(kind, id, text, {
           replyToMessageId: i === 0 ? options.replyToMessageId : null, // 引用挂在第一条上：回的就是那条
           atUserId: i === 0 ? options.atUserId : null,
           signal: options.signal
         }));
         const ts = Date.now();
-        let targetUserId = String(options.atUserId || '');
-        if (!targetUserId && options.replyToMessageId != null) {
-          const replied = this.store.findByMid(chatKey, options.replyToMessageId);
-          if (replied && !replied.self) targetUserId = String(replied.senderId || '');
-        }
+        let targetUserId = this.#replyTarget(chatKey, options);
         if (!targetUserId && kind === 'private') targetUserId = String(id);
-        this.store.appendSelf(chatKey, {
+        this.#afterSent(() => {
+          this.store.appendSelf(chatKey, {
           text,
           ts,
           mid: data?.message_id ?? null,
@@ -276,9 +401,9 @@ export class SendQueue {
           // 引擎私聊（群游戏的 game-secret）由调用方指定 eventKind：发送端是首次写库者，
           // 落库时就得是正确的类型，不能等 ingest 回显（按 mid 幂等、不会回填；2026-09-29 审查 P0）
           eventKind: options.eventKind || 'message'
-        });
+          });
         this.onSent?.({ chatKey, text, messageId: data?.message_id ?? null });
-        return { text, messageId: data?.message_id ?? null, at: formatClockTime(ts) };
+        });        return { text, messageId: data?.message_id ?? null, at: formatClockTime(ts) };
       }));
     }
 
@@ -310,6 +435,33 @@ export class SendQueue {
     return { sent, failed };
   }
 
+  /** 发一张「聊天记录」卡片（合并转发）。nodes 格式见 onebot.sendForwardMsg。 */
+  sendForwardCard(chatKey, nodes, options = {}) {
+    const [kind, id] = String(chatKey).split(':');
+    const chain = this.#chain(chatKey);
+    return chain(async () => {
+      if (options.runId && this.store.hasUncertainEffects(options.runId)) throw new Error('Previous send delivery is uncertain');
+      this.#checkRate(chatKey);
+      const data = await this.#deliver(chatKey, options, { type: 'forward', nodes: nodes.length }, () => this.onebot.sendForwardMsg(kind, id, nodes, {
+        signal: options.signal
+      }));
+      const ts = Date.now();
+      let targetUserId = this.#replyTarget(chatKey, options);
+      if (!targetUserId && kind === 'private') targetUserId = String(id);
+      this.#afterSent(() => {
+        this.store.appendSelf(chatKey, {
+          text: `[聊天记录卡片]${nodes.length}条`,
+          ts,
+          mid: data?.message_id ?? null,
+          targetUserId,
+          eventKind: 'message'
+        });
+        this.onSent?.({ chatKey, text: '[聊天记录卡片]', messageId: data?.message_id ?? null });
+      });
+      return { message_id: data?.message_id ?? null };
+    });
+  }
+
   /** 发送一个收藏表情（独立气泡）。 */
   sendSticker(chatKey, sticker, options = {}) {
     const [kind, id] = String(chatKey).split(':');
@@ -319,6 +471,7 @@ export class SendQueue {
       // 避免"不知道发没发出去"的消息与表情/拍一拍叠加出多笔 unknown 记账。
       if (options.runId && this.store.hasUncertainEffects(options.runId)) throw new Error('Previous send delivery is uncertain');
       this.#checkRate(chatKey);
+      await this.#signalTyping(kind, id, options); // 私聊发表情前同样先亮输入状态
       await sleep(randInt(600, 1500)); // 发表情前真人式的短暂停顿
       const data = await this.#deliver(chatKey, options, { type: 'sticker', id: sticker.id }, () => this.onebot.sendSticker(kind, id, sticker.url, {
         replyToMessageId: options.replyToMessageId ?? null,
@@ -326,20 +479,144 @@ export class SendQueue {
         signal: options.signal
       }));
       const ts = Date.now();
-      let targetUserId = String(options.atUserId || '');
-      if (!targetUserId && options.replyToMessageId != null) {
-        const replied = this.store.findByMid(chatKey, options.replyToMessageId);
-        if (replied && !replied.self) targetUserId = String(replied.senderId || '');
-      }
+      let targetUserId = this.#replyTarget(chatKey, options);
       if (!targetUserId && kind === 'private') targetUserId = String(id);
-      this.store.appendSelf(chatKey, {
+      this.#afterSent(() => {
+        this.store.appendSelf(chatKey, {
         text: `[表情包:${sticker.desc || sticker.localNote || sticker.id}]`,
         ts,
         mid: data?.message_id ?? null,
         targetUserId,
         eventKind: 'message'
-      });
+        });
       this.onSent?.({ chatKey, text: `[表情包]`, messageId: data?.message_id ?? null, sticker: sticker.id });
+      });      return { message_id: data?.message_id ?? null };
+    });
+  }
+
+  /**
+   * 发送一张普通图片（不带表情标记，群友可直接保存）。生成图按 imageGen.sendAs='image'
+   * 走这条；与 sendSticker 共用限频、禁言预检、outbox 记账与不确定结果防线（issue #67）。
+   */
+  sendImage(chatKey, image, options = {}) {
+    const [kind, id] = String(chatKey).split(':');
+    const chain = this.#chain(chatKey);
+    return chain(async () => {
+      if (options.runId && this.store.hasUncertainEffects(options.runId)) throw new Error('Previous send delivery is uncertain');
+      this.#checkRate(chatKey);
+      await this.#signalTyping(kind, id, options);
+      await sleep(randInt(600, 1500));
+      const data = await this.#deliver(chatKey, options, { type: 'image', id: image.id }, () => this.onebot.sendImage(kind, id, image.url, {
+        replyToMessageId: options.replyToMessageId ?? null,
+        atUserId: options.atUserId ?? null,
+        signal: options.signal
+      }));
+      const ts = Date.now();
+      let targetUserId = this.#replyTarget(chatKey, options);
+      if (!targetUserId && kind === 'private') targetUserId = String(id);
+      this.#afterSent(() => {
+        this.store.appendSelf(chatKey, {
+          text: `[图片:${image.desc || image.localNote || image.id}]`,
+          ts,
+          mid: data?.message_id ?? null,
+          targetUserId,
+          eventKind: 'message'
+        });
+        this.onSent?.({ chatKey, text: '[图片]', messageId: data?.message_id ?? null });
+      });
+      return { message_id: data?.message_id ?? null };
+    });
+  }
+
+  /**
+   * QQ 原生 AI 语音（send_qq_voice 工具）：群聊限定，协议端 SnowLuma ≥1.14.20。
+   * 走 #deliver —— 与文本/语音/贴纸同款：限频、禁言预检、outbox 记账。
+   * （2026-10-07 复审 P2：原先工具直接 onebot.call，模型抽风时没有任何限频。）
+   */
+  aiVoice(chatKey, { character, text, label = '' } = {}, options = {}) {
+    const [kind, id] = String(chatKey).split(':');
+    if (kind !== 'group') throw new Error('QQ 原生语音只能发在群聊里');
+    const chain = this.#chain(chatKey);
+    return chain(async () => {
+      if (options.runId && this.store.hasUncertainEffects(options.runId)) throw new Error('Previous send delivery is uncertain');
+      this.#checkRate(chatKey);
+      await sleep(randInt(600, 1500));
+      const data = await this.#deliver(chatKey, options, { type: 'ai-voice', character },
+        () => this.onebot.call('send_group_ai_record', {
+          group_id: Number(id), character, text
+        }, 60000, options.signal));
+      const ts = Date.now();
+      this.#afterSent(() => {
+        this.store.appendSelf(chatKey, {
+          text: `[QQ语音]${String(label || text).slice(0, 60)}`,
+          ts,
+          mid: data?.message_id ?? null,
+          targetUserId: '',
+          eventKind: 'message'
+        });
+        this.onSent?.({ chatKey, text: '[QQ语音]', messageId: data?.message_id ?? null });
+      });
+      return { message_id: data?.message_id ?? null };
+    });
+  }
+
+  /**
+   * 往群里发一个文件（send_group_file 工具）：群聊限定。文件在群里可见，与发消息同类，
+   * 同样走 #deliver（限频/禁言预检/outbox；上传 5xx 后的"结果未知"也能在控制台核对）。
+   */
+  groupFile(chatKey, { file, name }, options = {}) {
+    const [kind, id] = String(chatKey).split(':');
+    if (kind !== 'group') throw new Error('群文件只能发在群聊里');
+    const chain = this.#chain(chatKey);
+    return chain(async () => {
+      if (options.runId && this.store.hasUncertainEffects(options.runId)) throw new Error('Previous send delivery is uncertain');
+      this.#checkRate(chatKey);
+      const data = await this.#deliver(chatKey, options, { type: 'file', name },
+        () => this.onebot.call('upload_group_file', {
+          group_id: Number(id), file, name
+        }, 120000, options.signal));
+      const ts = Date.now();
+      this.#afterSent(() => {
+        this.store.appendSelf(chatKey, {
+          text: `[群文件]${String(name || '').slice(0, 60)}`,
+          ts,
+          mid: data?.message_id ?? null,
+          targetUserId: '',
+          eventKind: 'message'
+        });
+        this.onSent?.({ chatKey, text: '[群文件]', messageId: data?.message_id ?? null });
+      });
+      return { file_id: data?.file_id ?? null, message_id: data?.message_id ?? null };
+    });
+  }
+
+  /**
+   * 把一张图传进群相册（upload_to_group_album 工具）：群聊限定、开关默认关。
+   * 同样是"所有人都看得到"的写操作，走 #deliver —— 限频 / 禁言预检 / outbox
+   * （上传 120 秒超时后的"结果未知"能在控制台核对，而不是只留在调用栈里）。
+   */
+  albumPhoto(chatKey, { file, albumId, albumName }, options = {}) {
+    const [kind, id] = String(chatKey).split(':');
+    if (kind !== 'group') throw new Error('群相册只能在群聊里操作');
+    const chain = this.#chain(chatKey);
+    return chain(async () => {
+      if (options.runId && this.store.hasUncertainEffects(options.runId)) throw new Error('Previous send delivery is uncertain');
+      this.#checkRate(chatKey);
+      const data = await this.#deliver(chatKey, options, { type: 'album-photo', albumId },
+        () => this.onebot.call('upload_image_to_qun_album', {
+          group_id: Number(id), album_id: albumId, album_name: albumName || albumId, file
+        }, 120000, options.signal));
+      const ts = Date.now();
+      this.#afterSent(() => {
+        this.store.appendSelf(chatKey, {
+          text: `[群相册]上传了一张照片（${String(albumName || albumId).slice(0, 40)}）`,
+          ts,
+          mid: data?.message_id ?? null,
+          targetUserId: '',
+          eventKind: 'message'
+        });
+        this.onSent?.({ chatKey, text: '[群相册]', messageId: data?.message_id ?? null });
+      });
       return { message_id: data?.message_id ?? null };
     });
   }
@@ -358,21 +635,18 @@ export class SendQueue {
         signal: options.signal
       }));
       const ts = Date.now();
-      let targetUserId = String(options.atUserId || '');
-      if (!targetUserId && options.replyToMessageId != null) {
-        const replied = this.store.findByMid(chatKey, options.replyToMessageId);
-        if (replied && !replied.self) targetUserId = String(replied.senderId || '');
-      }
+      let targetUserId = this.#replyTarget(chatKey, options);
       if (!targetUserId && kind === 'private') targetUserId = String(id);
-      this.store.appendSelf(chatKey, {
+      this.#afterSent(() => {
+        this.store.appendSelf(chatKey, {
         text: `[语音${seconds ? `${seconds}秒` : ''}:${String(label || '').slice(0, 40)}]`,
         ts,
         mid: data?.message_id ?? null,
         targetUserId,
         eventKind: 'message'
-      });
+        });
       this.onSent?.({ chatKey, text: '[语音]', messageId: data?.message_id ?? null, voice: seconds });
-      return { message_id: data?.message_id ?? null };
+      });      return { message_id: data?.message_id ?? null };
     });
   }
 
@@ -389,15 +663,16 @@ export class SendQueue {
         () => this.onebot.sendPoke(kind, id, targetUserId, options.signal));
       const ts = Date.now();
       const target = kind === 'group' && targetUserId != null ? ` ${targetUserId}` : '对方';
-      this.store.appendSelf(chatKey, {
+      this.#afterSent(() => {
+        this.store.appendSelf(chatKey, {
         text: `[拍一拍] 你拍了拍${target}`,
         ts,
         mid: data?.message_id ?? null,
         targetUserId: String(targetUserId || (kind === 'private' ? id : '')),
         eventKind: 'poke'
-      });
+        });
       this.onSent?.({ chatKey, text: `[拍一拍]${target}`, messageId: null });
-      return data;
+      });      return data;
     });
   }
 
@@ -420,8 +695,34 @@ export class SendQueue {
         }));
       const ts = Date.now();
       const label = (options.text ? String(options.text) : '') + (face?.name ? `[表情：${face.name}]` : `[表情：${face?.id ?? ''}]`);
-      this.store.appendSelf(chatKey, { text: label, ts, mid: data?.message_id ?? null, eventKind: 'face' });
+      this.#afterSent(() => {
+        this.store.appendSelf(chatKey, { text: label, ts, mid: data?.message_id ?? null, eventKind: 'face' });
       this.onSent?.({ chatKey, text: label, messageId: data?.message_id ?? null });
+      });      return data;
+    });
+  }
+
+  /** 改自己在群里的群名片。改完留档，下次运行模型才知道当前名片是什么。 */
+  setCard(chatKey, card, { signal } = {}) {
+    const [kind, id] = String(chatKey).split(':');
+    const text = String(card ?? '').trim();
+    const chain = this.#chain(chatKey);
+    return chain(async () => {
+      if (kind !== 'group') throw new Error('群名片只能在群聊里改');
+      await this.#assertNotMuted(chatKey);
+      this.#checkRate(chatKey);
+      await sleep(randInt(300, 900));
+      // 等待期间运行被中止：别再发出写入（工具侧传了 signal 就必须真的用上）
+      signal?.throwIfAborted();
+      const data = await this.onebot.setGroupCard(id, this.onebot.selfId, text, signal);
+      // ⚠️ 与五条发送路径同口径：**改名片已经成功**，之后的记账失败不能把结果改判成失败
+      //（2026-10-05 复审 P3：这条写路径漏了 #afterSent —— appendSelf 抛 disk full 时，
+      //  工具会回"改群名片失败"，可名片其实已经改了，模型会以为没改成）。
+      this.#afterSent(() => {
+        const label = `[改群名片] 现在叫「${text}」`;
+        this.store.appendSelf(chatKey, { text: label, ts: Date.now(), mid: null, eventKind: 'card' });
+        this.onSent?.({ chatKey, text: label, messageId: null });
+      });
       return data;
     });
   }

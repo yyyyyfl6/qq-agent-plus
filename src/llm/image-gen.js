@@ -4,6 +4,7 @@
 // 响应两种形态（各网关不一，都要吃）：
 //   · b64_json —— 图片本体直接给（省一次下载，首选）
 //   · url      —— 给临时链接，由调用方走 safeFetchBinary 拉（本项目已有 SSRF 防护）
+// ModelScope API-Inference 是例外：创建任务后只给 task_id，必须轮询任务结果中的 output_images。
 //
 // Key 归属是这里的重点（见 resolveImageGenAuth）：配置指向别家却留空 Key 时，
 // **绝不能**回退用聊天模型那把 Key —— 那是"把 A 家的密钥发给 B 家"的经典事故。
@@ -11,12 +12,18 @@
 // 下载器（url 形态）直接 import safeFetchBinary 而不是当参数传：函数当参数会被 ops scan
 // 当成"未定义调用点"误报（与 tts-http.js 里记的同一类）。
 import { watchTimeWindow } from '../core/time-gate.js';
-import { imageGenKeyFor } from '../core/config.js';
+import { imageGenKeyResolve } from '../core/config.js';
 import { imageGenServiceOfBaseUrl, imageGenServiceNeedsKey } from './image-gen-presets.js';
 import { safeFetchBinary } from './safe-fetch.js';
+import { readBytesBounded, readTextBounded } from '../core/http-body.js';
 
 export const MAX_PROMPT_CHARS = 800;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;   // 与表情库落盘上限一致
+// 生图接口可能直接回 b64_json（16 MiB 图片编成 base64 约 21 MiB 字符），上限给到 16 MiB：
+// 既容纳正常大图，又能拦住畸形响应把常驻进程读爆。
+// （图片字节本身另有 MAX_IMAGE_BYTES 与 safeFetchBinary 的限量，这里只管文本读取。）
+const IMAGE_RESPONSE_MAX_BYTES = 16 * 1024 * 1024;
+const MODELSCOPE_POLL_MS = 5000;
 
 export function imageGenConfigured(cfg) {
   const g = cfg?.imageGen || {};
@@ -32,9 +39,14 @@ function hostOf(url) {
 
 /** 实际要打的地址：imageGen 没填就跟聊天模型同一家（很多网关同域就带 images 端点）。 */
 export function imageGenBaseUrl(imageGen, api) {
-  const own = String(imageGen?.baseUrl || '').trim();
-  if (own) return own.replace(/\/+$/, '');
-  return String(api?.baseUrl || '').trim().replace(/\/+$/, '');
+  const clean = (value) => String(value || '').trim()
+    .replace(/\/+$/, '')
+    // 用户常把完整端点粘进「服务地址」（issue #62）：适配器自己会拼 /images/generations，
+    // 不剥掉就会变成 /images/generations/images/generations，服务端只会回 404。
+    .replace(/\/images\/generations$/i, '');
+  const own = clean(imageGen?.baseUrl);
+  if (own) return own;
+  return clean(api?.baseUrl);
 }
 
 /**
@@ -58,7 +70,7 @@ export function imageGenKeyStale(imageGen, api) {
   if (!hasAny) return false;   // 从没存过 = "还没填"，不是"要重填"
   // imageGenKeyFor 里含"没记归属的老单槽按当前地址能用"的兜底 —— 与运行时同一口径，
   // 不给升级中的实例制造突然失效（2026-10-02 回归测试抓到过）
-  return !imageGenKeyFor(imageGen, host);
+  return !imageGenKeyResolve(imageGen, host).value;
 }
 
 /** 实际会用的图片服务主机（控制台「显示」按钮判断"表单里换的主机是不是当前这家"用）。 */
@@ -87,7 +99,8 @@ export function resolveImageGenAuth({ imageGen, api, apiKey } = {}) {
   }
   // 活动槽不可用（没填/归属不是这家）→ 查"这家存过的"（2026-10-02：切换服务预设的记忆；
   // 也覆盖手改配置直接换地址的情况 —— 只要那把 Key 确实是给这个主机存的，就不算跨家外发）
-  const remembered = imageGenKeyFor(imageGen, gHost);
+  // 运行时取值走 imageGenKeyResolve（与保存路径同一口径；不再另开一个字符串包装导出）
+  const remembered = imageGenKeyResolve(imageGen, gHost).value;
   if (remembered) return { ok: true, key: remembered, reused: false, error: '' };
   const aHost = hostOf(api?.baseUrl);
   if (gHost && aHost && gHost === aHost) {
@@ -124,7 +137,8 @@ export async function generateImage({
   apiKey = '',
   prompt,
   signal = null,
-  fetchFn = fetch
+  fetchFn = fetch,
+  modelscopePollMs = MODELSCOPE_POLL_MS
 } = {}) {
   const g = cfg?.imageGen || cfg || {};
   const base = imageGenBaseUrl(g, apiCfg);
@@ -157,11 +171,19 @@ export async function generateImage({
   }
   const releaseTimeGuard = watchTimeWindow((error) => controller.abort(error));
   const preset = imageGenServiceOfBaseUrl(base);
+  // Moss 官方 output_watermark 是 { enabled: boolean }；0.9.11 早期说明误导过布尔写法，
+  // 这里兼容一次，免得按旧说明保存的配置在升级后还是发不出（issue #62 更正）。
+  const requestExtra = extra.output_watermark !== undefined && typeof extra.output_watermark === 'boolean' && preset?.id === 'moss'
+    ? { ...extra, output_watermark: { enabled: extra.output_watermark } }
+    : extra;
   try {
     // 免 Key 的 pollinations 形状单独走一条：提示词在 URL 路径里、GET 取图字节
     // （它那个长得像 OpenAI 的 POST /openai/images/generations **不看 body**，别用）
     if (preset?.shape === 'pollinations') {
       return await pollinationsImage({ base, body, model, size, controller, fetchFn });
+    }
+    if (preset?.shape === 'modelscope') {
+      return await modelscopeImage({ base, body, model, size, extra, auth, controller, fetchFn, pollMs: modelscopePollMs });
     }
     const res = await fetchFn(`${base}/images/generations`, {
       method: 'POST',
@@ -175,11 +197,11 @@ export async function generateImage({
         n: 1,
         ...formatParam,
         ...(size ? { size } : {}),
-        ...extra
+        ...requestExtra
       }),
       signal: controller.signal
     });
-    const text = await res.text();
+    const text = await readTextBounded(res, IMAGE_RESPONSE_MAX_BYTES);
     let parsed = null;
     try { parsed = JSON.parse(text); } catch { /* 下面按原文报错 */ }
     if (!res.ok) {
@@ -211,6 +233,78 @@ export async function generateImage({
   }
 }
 
+/** ModelScope API-Inference：创建异步任务，完成后从 output_images 下载结果。 */
+async function modelscopeImage({ base, body, model, size, extra, auth, controller, fetchFn, pollMs }) {
+  const headers = {
+    'content-type': 'application/json',
+    'X-ModelScope-Async-Mode': 'true',
+    ...(auth.key ? { authorization: `Bearer ${auth.key}` } : {})
+  };
+  const res = await fetchFn(`${base}/images/generations`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ model, prompt: body, n: 1, ...(size ? { size } : {}), ...extra }),
+    signal: controller.signal
+  });
+  const text = await readTextBounded(res, IMAGE_RESPONSE_MAX_BYTES);
+  let created = null;
+  try { created = JSON.parse(text); } catch { /* 按原文带出 */ }
+  if (!res.ok) {
+    const detail = String(created?.error?.message || created?.message || text || '').slice(0, 300);
+    throw new Error(`图片生成失败 HTTP ${res.status}${detail ? `：${detail}` : ''}`);
+  }
+  const taskId = String(created?.task_id || '').trim();
+  if (!taskId) throw new Error(`魔搭图片生成没有返回 task_id：${String(text).slice(0, 200)}`);
+
+  // 官方要求任务查询携带该类型；成功响应才包含 output_images，不能把创建任务的 SUCCEED 当成图片结果。
+  while (true) {
+    if (controller.signal.aborted) throw controller.signal.reason ?? new Error('图片生成超时');
+    await sleepWithSignal(Math.max(0, Number(pollMs) || 0), controller.signal);
+    const taskRes = await fetchFn(`${base}/tasks/${encodeURIComponent(taskId)}`, {
+      method: 'GET',
+      headers: {
+        ...(auth.key ? { authorization: `Bearer ${auth.key}` } : {}),
+        'X-ModelScope-Task-Type': 'image_generation'
+      },
+      signal: controller.signal
+    });
+    const taskText = await readTextBounded(taskRes, IMAGE_RESPONSE_MAX_BYTES);
+    let task = null;
+    try { task = JSON.parse(taskText); } catch { /* 按原文带出 */ }
+    if (!taskRes.ok) {
+      const detail = String(task?.error?.message || task?.message || taskText || '').slice(0, 300);
+      throw new Error(`魔搭图片任务查询失败 HTTP ${taskRes.status}${detail ? `：${detail}` : ''}`);
+    }
+    const status = String(task?.task_status || '').toUpperCase();
+    if (status === 'FAILED') {
+      const detail = String(task?.message || task?.error?.message || taskText || '').slice(0, 300);
+      throw new Error(`魔搭图片生成任务失败${detail ? `：${detail}` : ''}`);
+    }
+    if (status !== 'SUCCEED') continue;
+    const url = String(task?.output_images?.[0] || '').trim();
+    if (!url) throw new Error(`魔搭图片生成任务已完成但没有返回 output_images：${String(taskText).slice(0, 300)}`);
+    const { buffer } = await safeFetchBinary(url, MAX_IMAGE_BYTES, controller.signal);
+    if (!buffer?.length) throw new Error('从魔搭生成结果 URL 下载到的图片为空');
+    return { buffer, revisedPrompt: '' };
+  }
+}
+
+function sleepWithSignal(ms, signal) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(done, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      reject(signal?.reason ?? new Error('图片生成超时'));
+    };
+    function done() {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 /**
  * pollinations 形状：GET {base}/prompt/<提示词>?width=&height=&model=&nologo=true，直接拿图片字节。
  * 返回与 OpenAI 形状同一个 `{ buffer, revisedPrompt }`，调用方不需要知道是哪一家。
@@ -228,7 +322,9 @@ async function pollinationsImage({ base, body, model, size, controller, fetchFn 
   const res = await fetchFn(url.toString(), { method: 'GET', signal: controller.signal });
   const type = String(res.headers?.get?.('content-type') || '');
   if (!res.ok || !type.startsWith('image/')) {
-    const detail = String((await res.text?.()) || '').slice(0, 300);
+    // 错误详情有界读（4096 字节足够，还要再截 300 字符）；读不出来不影响报错本身。
+    let detail = '';
+    try { detail = String(await readTextBounded(res, 4096)).slice(0, 300); } catch { /* 忽略 */ }
     // 402 / 429 是这条免 Key 路线的常态而不是异常：官方文档写明匿名档是「15 秒 1 次」按 IP 限流，
     // 额度用完之后直接回一个**空的** 402（响应体就俩字节 {}），不解释的话用户完全看不懂。
     // 2026-10-01 实测：同一时刻本机出口 200、云服务器出口 402 —— 是按 IP 算的。
@@ -239,8 +335,14 @@ async function pollinationsImage({ base, body, model, size, controller, fetchFn 
     }
     throw new Error(`图片生成失败 HTTP ${res.status}${detail ? `：${detail}` : ''}`);
   }
-  const buffer = Buffer.from(await res.arrayBuffer());
+  // 有界读取：上游返回超大/畸形响应时中途取消，而不是先整包读入再判长度（那样上限形同虚设）
+  let buffer;
+  try {
+    buffer = await readBytesBounded(res, MAX_IMAGE_BYTES);
+  } catch (error) {
+    if (error?.code === 'BODY_TOO_LARGE') throw new Error('生成的图片过大（>8 MiB）');
+    throw error;
+  }
   if (!buffer.length) throw new Error('图片生成返回了空数据');
-  if (buffer.length > MAX_IMAGE_BYTES) throw new Error('生成的图片过大（>8 MiB）');
   return { buffer, revisedPrompt: '' };
 }

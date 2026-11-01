@@ -6,9 +6,33 @@ import { normalizeThinkingIntent, resolveThinkingPatch, modelServiceById, modelS
 import { resolveModelPrice, priceAt } from '../pricing/model-prices.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { assertTimeAllowed, watchTimeWindow } from '../core/time-gate.js';
+import { readJsonBounded, readTextBounded } from '../core/http-body.js';
 import { createLogger } from '../core/logger.js';
+import { imageType } from '../core/image-type.js';
+import { redactText } from '../core/redact.js';
 
 const log = createLogger('llm');
+
+// 聊天响应可能是长文，给宽松但有限的上限：8 MiB 已远超正常回答，
+// 又能拦住畸形上游一口气吐几百 MB 把常驻进程读爆。
+const CHAT_RESPONSE_MAX_BYTES = 8 * 1024 * 1024;
+// /models 只是一串模型 id，2 MiB 绰绰有余。
+const MODELS_JSON_MAX_BYTES = 2 * 1024 * 1024;
+
+/**
+ * 进程内 LLM 计数（低基数，不按会话/用户打标签）。
+ * requests = 外层对话请求；attempts = 真正打出去的 HTTP 次数（含重试/兜底）；
+ * retries = 主动重试次数；failures = 最终失败（重试与兜底都耗尽）；fallbackUses = 切兜底次数。
+ * 控制台 /api/metrics 直接读这份计数，不额外落库。
+ */
+export const llmRuntimeStats = {
+  requests: 0,
+  attempts: 0,
+  retries: 0,
+  failures: 0,
+  primaryErrors: 0,
+  fallbackUses: 0
+};
 
 function joinUrl(base, path) {
   return `${String(base).replace(/\/+$/, '')}${path}`;
@@ -46,6 +70,7 @@ function getOpencodeSessionId() {
  * 兼容历史数据：providers[].apiKey 也可能存有明文（老配置），也认。
  */
 export function resolveApiKey(cfg) {
+  if (cfg?.activeSkinId) return String(cfg.api?.apiKey || '').trim() === '******' ? '' : String(cfg.api?.apiKey || '').trim();
   const pid = String(cfg?.api?.provider ?? '').trim();
   if (pid) {
     const fromCatalog = String(cfg?.providerKeys?.[pid] ?? '').trim();
@@ -87,6 +112,8 @@ export function isRetryableError(error) {
   // 明确的客户端错误：重试也不会变好，只会白烧额度
   if (/HTTP\s*(401|400|403|404|405|409|413|422)/i.test(msg)) return false;
   if (/unauthorized|forbidden|invalid api.?key|incorrect api.?key/i.test(msg)) return false;
+  // 中转站把格式不兼容包装成 500；相同附件重发仍会失败。
+  if (/mime type[^\n]*not supported|unsupported[^\n]*(?:mime|media)|convert_request_failed/i.test(msg)) return false;
 
   // 明确的暂时性故障
   if (/HTTP\s*5\d\d/i.test(msg)) return true;                        // 5xx
@@ -166,7 +193,7 @@ function currentServiceId() {
   }
 }
 
-function thinkingFor(purpose, overrides = null) {
+function thinkingFor(purpose, overrides = null, intentOverride = undefined) {
   let raw = null;
   let customParams = null;
   let serviceId = '';
@@ -186,6 +213,8 @@ function thinkingFor(purpose, overrides = null) {
       serviceId = currentServiceId();
     }
   } catch { /* 取不到就走默认 */ }
+  // 独立任务（如交接摘要）可显式覆盖聊天/供应商的思考设置。
+  if (intentOverride !== undefined) raw = intentOverride;
   const intent = normalizeThinkingIntent(raw, purpose);
   if (intent === 'on') return { mode: 'on', patch: null, approx: false, effectiveOff: false, serviceId };
   // 自定义/表外渠道优先用用户的档位映射（api.thinkingParams）。
@@ -236,8 +265,10 @@ async function runCompletionWithRetries(args, retries) {
       args.signal?.throwIfAborted();
       const response = await chatCompletion(args);
       if (!moderationRetried && isModerationRefusal(response)) {
+        if (attempt >= retries) return response;   // 最后一轮还被拦：把拦截结果如实返回（重试预算已耗尽）
         moderationRetried = true;
         args = { ...args, messages: trimForModerationRetry(args.messages) };
+        llmRuntimeStats.retries += 1;
         log.warn('[llm] 服务商审核拦截整次请求，改用精简上下文重试一次');
         await delay(600, undefined, { signal: args.signal });
         continue;
@@ -247,6 +278,7 @@ async function runCompletionWithRetries(args, retries) {
       lastError = error;
       if (args.signal?.aborted || attempt >= retries || !isRetryableError(error)) throw error;
       const wait = 1000 * Math.pow(2, attempt);   // 1s, 2s
+      llmRuntimeStats.retries += 1;
       log.warn(`[llm] 请求失败（第 ${attempt + 1} 次尝试），${wait}ms 后重试：${error?.message ?? error}`);
       await delay(wait, undefined, { signal: args.signal });
     }
@@ -270,6 +302,14 @@ function pickFallback(args) {
   try { fb = getConfig().api?.fallback; } catch { return null; }
   if (!fb || fb.enabled === false || !String(fb.model || '').trim()) return null;
   const api = effectiveApi();
+  const fbBase = String(fb.baseUrl || '').trim();
+  // 备用地址换了主机、却没单独给 Key 时**绝不沿用主渠道那把** —— 那等于把 A 家的密钥发给 B 家
+  // （这类事故本项目在 asr / 生图 / tts 上都修过，兜底模型是最后一个漏口）。
+  // 文档里 api.fallback.apiKey 本就是"另一个服务商的 key"；留空就当"没配兜底"，退回主渠道的错。
+  if (fbBase && hostOf(fbBase) !== hostOf(api.baseUrl) && !String(fb.apiKey || '').trim()) {
+    log.warn(`[llm] 兜底地址 ${hostOf(fbBase)} 与主渠道不同却没配 api.fallback.apiKey，本次不切兜底`);
+    return null;
+  }
   return {
     ...api,
     baseUrl: fb.baseUrl || api.baseUrl,
@@ -285,12 +325,14 @@ function pickFallback(args) {
  * 自动改用 config.api.fallback 里配置的备用模型再试一次（只切一次，不递归）。
  */
 export async function chatCompletionWithRetry(args, retries = 2) {
+  llmRuntimeStats.requests += 1;
   let response = null;
   let primaryError = null;
   try {
     response = await runCompletionWithRetries(args, retries);
   } catch (error) {
     primaryError = error;
+    llmRuntimeStats.primaryErrors += 1;
   }
 
   const shouldFallback = primaryError
@@ -298,7 +340,13 @@ export async function chatCompletionWithRetry(args, retries = 2) {
     : isModerationRefusal(response);
   const fb = shouldFallback ? pickFallback(args) : null;
   if (!fb || args.signal?.aborted) {
-    if (primaryError) throw primaryError;
+    if (primaryError) {
+      llmRuntimeStats.failures += 1;
+      throw primaryError;
+    }
+    // 兜底不可用时把**本次结果**如实返回；null 只能来自内部异常路径（throw null 已被上面堵死），
+    // 但调用方（orchestrator 等）会直接读 response.model / .message —— 这里显式兜一层，别让它崩在调用方。
+    if (!response) throw new Error('模型请求没有返回结果');
     return response;
   }
 
@@ -306,7 +354,19 @@ export async function chatCompletionWithRetry(args, retries = 2) {
     ? `失败（${String(primaryError?.message ?? primaryError).slice(0, 90)}）`
     : '两轮都被审核拦截';
   log.warn(`[llm] 主模型${why}，改用兜底模型 ${fb.model}`);
-  return await runCompletionWithRetries({ ...args, overrides: fb }, 1);
+  llmRuntimeStats.fallbackUses += 1;
+  try {
+    const fbResponse = await runCompletionWithRetries({ ...args, overrides: fb }, 1);
+    // 2026-10-06 复审 P3：标记本次是否真的换了渠道（兜底端点与主渠道 host 不同）。
+    // 同渠道换模型不算换渠道 —— vendor 不变；跨渠道时调用方把成本记到实际渠道名下。
+    const primaryBase = String(effectiveApi().baseUrl || '');
+    const channelChanged = Boolean(fbResponse.originBaseUrl)
+      && hostOf(fbResponse.originBaseUrl) !== hostOf(primaryBase);
+    return { ...fbResponse, viaFallback: true, channelChanged };
+  } catch (error) {
+    llmRuntimeStats.failures += 1;
+    throw error;
+  }
 }
 
 /**
@@ -314,13 +374,36 @@ export async function chatCompletionWithRetry(args, retries = 2) {
  * 返回 { message, usage, raw }；usage 形如 { prompt_tokens, completion_tokens, total_tokens }。
  * overrides: { baseUrl, apiKey, model, timeoutMs } 可选，用于记忆整理专用模型等场景。
  */
-/** 请求体里的内容清洗：字符串直接清，多模态数组逐段清 text（图片段原样保留）。 */
-function cleanContentForRequest(content) {
+/** 最终请求边界：保留文字与兼容图片，不支持的附件用文字说明代替。 */
+function cleanContentForRequest(content, model = '') {
   if (typeof content === 'string') return stripLoneSurrogates(content);
   if (Array.isArray(content)) {
-    return content.map((part) => (part && typeof part.text === 'string'
-      ? { ...part, text: stripLoneSurrogates(part.text) }
-      : part));
+    const omitted = () => ({ type: 'text', text: '[已过滤不支持的附件，原消息文字保留]' });
+    return content.map((part) => {
+      if (part?.type === 'image_url') {
+        const url = String(part.image_url?.url || '');
+        let mime = '';
+        const header = /^data:([^;,]+)[^,]*,/i.exec(url.slice(0, 160));
+        if (/^data:/i.test(url)) {
+          if (!header) return omitted();
+          mime = imageType(Buffer.from(url.slice(header[0].length, header[0].length + 48), 'base64')) || header[1].toLowerCase();
+        } else {
+          try {
+            const extension = /\.(gif|svg|bmp|tiff?|heic|heif)$/i.exec(new URL(url).pathname)?.[1]?.toLowerCase();
+            if (extension) mime = `image/${extension}`;
+          } catch { return omitted(); }
+        }
+        const compatible = ['image/png', 'image/jpeg', 'image/jpg', 'image/webp'];
+        if (!/gemini/i.test(String(model))) compatible.push('image/gif');
+        if (mime && !compatible.includes(mime)) return omitted();
+        // 声明 MIME 与魔数不一致时，以实际图片格式为准。
+        return header && mime !== header[1].toLowerCase()
+          ? { ...part, image_url: { ...part.image_url, url: `data:${mime};base64,${url.slice(header[0].length)}` } } : part;
+      }
+      if (part?.type === 'refusal') return part;
+      if (part?.type !== 'text') return omitted();
+      return { ...part, text: stripLoneSurrogates(part.text) };
+    });
   }
   return content;
 }
@@ -334,13 +417,16 @@ export async function chatCompletion({
   overrides = null,
   cacheKey = '',
   maxTokens = null,
-  purpose = ''
+  purpose = '',
+  thinking: intentOverride = undefined
 }) {
   assertTimeAllowed();
+  llmRuntimeStats.attempts += 1;
   const api = overrides || effectiveApi();
+  if (api.requireApiKey && (!api.apiKey || api.apiKey === '******')) throw new Error('人格提供商缺少 API Key，请在提供商设置中保存');
   // 聊天这类"随口回一句"的任务关掉思考：省一半输出 token、少 1~3 秒；
   // 判断/写作类（表情包要不要收、说说、空间互动、身份评估）不传 purpose，继续思考。
-  const thinking = thinkingFor(purpose, overrides);
+  const thinking = thinkingFor(purpose, overrides, intentOverride);
   const thinkingOff = thinking.effectiveOff;
   const body = {
     model: api.model,
@@ -410,6 +496,8 @@ export async function chatCompletion({
     }
     body.stream = false;
   }
+  // extraBody 也能覆盖 model/messages，必须按最终模型再次检查，覆盖历史与工具结果中的附件。
+  if (Array.isArray(body.messages)) body.messages = body.messages.map((message) => ({ ...message, content: cleanContentForRequest(message.content, body.model) }));
 
   const controller = new AbortController();
   const timeoutMs = Math.max(5000, Number(api.timeoutMs) || 180000);
@@ -432,7 +520,7 @@ export async function chatCompletion({
     });
     let res = await send(body);
     if (!res.ok) {
-      let text = await res.text();
+      let text = await readTextBounded(res, CHAT_RESPONSE_MAX_BYTES);
       // 模型级差异：个别模型/网关不认识思考参数会整次 400 —— 一个可选参数不该让消息发不出去。
       // 去掉"我们自己加的"思考参数重试一次（extraBody 是用户显式填的，不动）。
       const patchKeys = thinking.patch ? Object.keys(thinking.patch) : [];
@@ -447,19 +535,21 @@ export async function chatCompletion({
         for (const k of patchKeys) delete retryBody[k];
         if (!thinkingParamRejectedWarned.has(api.model)) {
           thinkingParamRejectedWarned.add(api.model);
-          log.warn('[llm] 模型拒绝思考参数，已去掉后重试（每个模型提示一次）：', api.model, '|', text.slice(0, 160));
+          log.warn('[llm] 模型拒绝思考参数，已去掉后重试（每个模型提示一次）：', api.model, '|', redactText(text, 160));
         }
         res = await send(retryBody);
-        if (!res.ok) text = await res.text();
+        if (!res.ok) text = await readTextBounded(res, CHAT_RESPONSE_MAX_BYTES);
       }
-      if (!res.ok) throw new Error(`模型 API HTTP ${res.status}：${text.slice(0, 500)}`);
+      if (!res.ok) throw new Error(`模型 API HTTP ${res.status}：${redactText(text, 500)}`);
     }
-    const data = await res.json();
+    const data = await readJsonBounded(res, CHAT_RESPONSE_MAX_BYTES);
     const choice = data?.choices?.[0];
     if (!choice) throw new Error('模型 API 响应缺少 choices');
     return {
       message: choice.message ?? {}, finishReason: choice.finish_reason ?? null,
-      usage: data.usage ?? null, model: data.model ?? api.model, raw: data
+      usage: data.usage ?? null, model: data.model ?? api.model, raw: data,
+      // 实际发往的端点（overrides/兜底接管后 ≠ 主渠道）—— 调用方据此把成本记到实际渠道名下
+      originBaseUrl: String(api.baseUrl || '')
     };
   } catch (error) {
     if (controller.signal.reason?.code === 'TIME_CONTROL_INACTIVE') throw controller.signal.reason;
@@ -482,7 +572,7 @@ export async function listModels() {
     signal: AbortSignal.timeout(15000)
   });
   if (!res.ok) throw new Error(`获取模型列表失败：HTTP ${res.status}`);
-  const data = await res.json();
+  const data = await readJsonBounded(res, MODELS_JSON_MAX_BYTES);
   const list = Array.isArray(data?.data) ? data.data : (Array.isArray(data) ? data : []);
   return list.map((m) => ({ id: String(m.id ?? m.model ?? m) })).filter((m) => m.id);
 }
@@ -506,9 +596,9 @@ export function addUsage(target, usage) {
 /** 兼容各供应商返回缓存命中 Token 的字段差异。 */
 export function cachedTokensOfUsage(usage = {}) {
   return Number(
-    usage.prompt_tokens_details?.cached_tokens
-    ?? usage.prompt_cache_hit_tokens
-    ?? usage.cached_tokens
+    usage?.prompt_tokens_details?.cached_tokens
+    ?? usage?.prompt_cache_hit_tokens
+    ?? usage?.cached_tokens
     ?? 0
   ) || 0;
 }

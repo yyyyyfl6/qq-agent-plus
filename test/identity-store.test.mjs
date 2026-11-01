@@ -4,10 +4,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import { rmDirBestEffort } from './helpers/cleanup.mjs';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-identity-store-'));
 process.env.QQ_AGENT_DATA_DIR = root;
-process.on('exit', () => fs.rmSync(root, { recursive: true, force: true }));
+process.on('exit', () => rmDirBestEffort(root));
 
 const { ChatStore } = await import('../src/core/store.js');
 const {
@@ -29,7 +30,7 @@ test('identity pilot is promoted: legacy enabled:false no longer gates it', asyn
   const store = new ChatStore(0, { dataDir: dir });
   t.after(() => {
     store.close();
-    fs.rmSync(dir, { recursive: true, force: true });
+    rmDirBestEffort(dir);
   });
   let calls = 0;
   const manager = new IdentityPilotManager({
@@ -51,7 +52,7 @@ test('unifies the same QQ across chats and indexes legacy memory without modifyi
   const store = new ChatStore(0, { dataDir: dir });
   t.after(() => {
     store.close();
-    fs.rmSync(dir, { recursive: true, force: true });
+    rmDirBestEffort(dir);
   });
   const now = Date.now();
   store.appendIncoming('group:100', {
@@ -119,7 +120,8 @@ test('unifies the same QQ across chats and indexes legacy memory without modifyi
   assert.equal(status.friends, 1);
   assert.equal(status.legacyMemories, 2);
   assert.equal(friendCalls, 1);
-  assert.equal(fs.statSync(identityDatabasePath(dir)).mode & 0o777, 0o600);
+  // Windows 没有 POSIX 权限位，这条只能在 POSIX 上验证（fixture 已用 0600 创建）。
+  if (process.platform !== 'win32') assert.equal(fs.statSync(identityDatabasePath(dir)).mode & 0o777, 0o600);
 
   const people = manager.listPeople();
   assert.equal(people.length, 1);
@@ -159,7 +161,7 @@ test('unifies the same QQ across chats and indexes legacy memory without modifyi
 
 test('legacy memory scanner ignores name-only identities and leaves source bytes untouched', (t) => {
   const dir = fs.mkdtempSync(path.join(root, 'legacy-'));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  t.after(() => rmDirBestEffort(dir));
   const memoryDir = path.join(dir, 'memory');
   fs.mkdirSync(memoryDir, { recursive: true });
   const file = path.join(memoryDir, 'group_300.json');
@@ -241,7 +243,7 @@ test('friend proposals require eligibility, deduplicate, cool down, and close on
   });
   t.after(() => {
     manager.stop();
-    fs.rmSync(dir, { recursive: true, force: true });
+    rmDirBestEffort(dir);
   });
   await manager.start();
 
@@ -333,7 +335,7 @@ test('friend proposal validation enforces message threshold and administrator co
   const store = new ChatStore(0, { dataDir: dir });
   t.after(() => {
     store.close();
-    fs.rmSync(dir, { recursive: true, force: true });
+    rmDirBestEffort(dir);
   });
   const cfg = {
     identityPilot: {
@@ -427,7 +429,7 @@ test('friend proposal is retired: approval is rejected even with legacy enabled 
   t.after(() => {
     manager.stop();
     store.close();
-    fs.rmSync(dir, { recursive: true, force: true });
+    rmDirBestEffort(dir);
   });
   await manager.start();
   // 主动好友候选已退役（Issue #10 + QQ 账号风控）：功能门硬编码关闭，
@@ -554,7 +556,7 @@ test('unknown friend request result is held and a crashed dispatch is recovered 
     reopened.getFriendProposal(second.proposal.id).dispatchError,
     /结果确认前重启/
   );
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  t.after(() => rmDirBestEffort(dir));
 });
 
 test('incoming friend requests notify once, require approval, and add the private whitelist', async (t) => {
@@ -562,7 +564,7 @@ test('incoming friend requests notify once, require approval, and add the privat
   const store = new ChatStore(0, { dataDir: dir });
   t.after(() => {
     store.close();
-    fs.rmSync(dir, { recursive: true, force: true });
+    rmDirBestEffort(dir);
   });
   const cfg = {
     identityPilot: {
@@ -694,7 +696,7 @@ test('incoming friend request keeps an unknown result and never retries automati
   const store = new ChatStore(0, { dataDir: dir });
   t.after(() => {
     store.close();
-    fs.rmSync(dir, { recursive: true, force: true });
+    rmDirBestEffort(dir);
   });
   const cfg = {
     identityPilot: {
@@ -774,7 +776,7 @@ test('台账保留期清理：90 天前已了结的删掉，未决的留着', (t
   const store = new IdentityStore({ dataDir: dir });
   t.after(() => {
     store.close();
-    fs.rmSync(dir, { recursive: true, force: true });
+    rmDirBestEffort(dir);
   });
 
   const old = Date.now() - 120 * 24 * 60 * 60 * 1000;
@@ -829,7 +831,7 @@ test('台账清理的边界：保留期可传参，恰好卡在保留期内的�
   const store = new IdentityStore({ dataDir: dir });
   t.after(() => {
     store.close();
-    fs.rmSync(dir, { recursive: true, force: true });
+    rmDirBestEffort(dir);
   });
 
   const day = 24 * 60 * 60 * 1000;

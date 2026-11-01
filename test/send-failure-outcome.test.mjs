@@ -37,6 +37,15 @@ it('classifyTransportFailure：连不上=确定没送达，超时/重置/5xx=结
   }
   assert.equal(classifyTransportFailure(new Error('HTTP 502 Bad Gateway')).uncertain, true, '协议端 5xx 可能已转发');
   assert.equal(classifyTransportFailure(new Error('Request timeout after 15000ms')).uncertain, true);
+
+  // WS 帧级证据 = 确定未投递：send 回调报错（帧没写进 socket）与发送途中连接被关
+  //（帧没写完/压缩中被打断 —— 接收端只拿到残帧会被整帧丢弃）。2026-10-07 复审：这两类
+  // 以前既不 definite 也不 uncertain —— "确定没送达"的消息既不重试、还落 unknown 挂人工核对。
+  // 文案用 ws 8.x 源码里的真实字符串（node_modules/ws/lib/websocket.js / sender.js）。
+  const wsSendFail = new Error('OneBot send_group_msg WS 发送失败: WebSocket is not open: readyState 2 (CLOSING)');
+  assert.equal(classifyTransportFailure(wsSendFail).definite, true, 'WS 帧未写出 = 确定未投递');
+  const wsMidFrame = new Error('The socket was closed while data was being compressed');
+  assert.equal(classifyTransportFailure(wsMidFrame).definite, true, '发送中连接被关 = 残帧必被丢弃');
 });
 
 // outbox 的落库状态（记账口径就是它）：failed = 确认没送达、可重试；unknown = 可能已投递、持有待核对。

@@ -1,0 +1,8 @@
+{
+  "id": "chat-summary",
+  "name": "群聊总结",
+  "version": "1.0.0",
+  "description": "把最近一段群聊整理成少数几条结论，保留分歧与待办，不编造没说过的话。",
+  "allowedTools": ["get_recent_messages", "send_message"],
+  "triggers": ["总结一下", "群里聊了什么", "帮我回顾"]
+}

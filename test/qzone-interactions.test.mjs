@@ -545,7 +545,9 @@ test('stop and time-window aborts are not counted as interface failures', () => 
   assert.equal(isNonFailureRunError(undefined), false);
 });
 
-test('aborting during the retry wait skips the retry and is not recorded as a feed failure', async () => {
+// 这条用例用一个"永不 resolve 的 sleep"+ abort 打破它来测中止语义：一旦中止语义回归，
+// 它不会失败而是**挂死**（消耗到 CI job 级超时）。给个 per-test 超时让它老实变红（2026-10-07 复核）。
+test('aborting during the retry wait skips the retry and is not recorded as a feed failure', { timeout: 20000 }, async () => {
   let feedCalls = 0;
   const f = fixture({
     feedCall: async () => {
@@ -638,4 +640,84 @@ test('repeated friend-feed failure still runs replies and the unread backlog', a
   assert.equal(result.run.selectedReplies, 1);
   assert.equal(f.manager.status().unreadFeeds, 0);
   assert.equal(f.manager.status().unreadReplies, 0);
+});
+
+test('写入前中止：未执行的条目保持未读，留给下个活跃窗口（2026-10-03 全量审查）', async () => {
+  const feed = [
+    { uin: 111, nickname: 'A', time: nowSec - 30, appid: 311, key: 'k1', html: htmlPost('one') },
+    { uin: 222, nickname: 'B', time: nowSec, appid: 311, key: 'k2', html: htmlPost('two') }
+  ];
+  let mgr = null;
+  const f = fixture({
+    feed,
+    complete: async ({ messages }) => {
+      const ids = idsFromMessages(messages, 'feed');
+      // 前提：模型确实给出了两条计划 —— 少了这句，"writes.length === 0"在"计划本身为空"时
+      // 也成立（断言会被空计划满足，2026-10-05 全审）。
+      assert.equal(ids.length, 2, '前提：两条动态都进了提示词（否则 writes=0 是空的）');
+      // 模型已经给出计划、即将开始写入时用户点了"停止"
+      mgr?.abort();
+      return response({
+        feedActions: ids.map((id) => ({ id, action: 'like_comment', content: '赞', reason: '好' })),
+        replyActions: []
+      });
+    }
+  });
+  mgr = f.manager;
+  await f.manager.runNow('feed');
+  assert.equal(f.writes.length, 0, '中止后不该再发出写入');
+  assert.equal(f.manager.status().unreadFeeds, 2, '未执行的条目必须仍是未读（提前标 reviewed 会让它们永远不再进批次）');
+});
+
+test('like_comment：评论已成功后点赞阶段被中止 → reviewed（退回 unread 会重复评论）', async () => {
+  // P1（2026-10-04 复审）：组合动作里评论可能**已经发出去了**，此时中止若退回 unread，
+  // 下轮会按未读重新决策 —— 模型看不到自己已经评论过（commentContent 还被抹了），
+  // 大概率再评一次。此前只有源码锚点（㉘），这里走真实写循环：comment_qzone 成功那一刻
+  // abort，中止检查落在点赞阶段的 pause 之后（正是复现点）。
+  const feed = [{ uin: 111, nickname: 'A', time: nowSec - 30, appid: 311, key: 'k1', html: htmlPost('one') }];
+  let mgr = null;
+  const f = fixture({
+    feed,
+    complete: async ({ messages }) => {
+      const ids = idsFromMessages(messages, 'feed');
+      assert.equal(ids.length, 1, '前提：这条动态进了提示词（否则下面的 writes 断言是空的）');
+      return response({
+        feedActions: ids.map((id) => ({ id, action: 'like_comment', content: '赞', reason: '好' })),
+        replyActions: []
+      });
+    }
+  });
+  mgr = f.manager;
+  const inner = f.onebot.call;
+  f.onebot.call = async (action, params) => {
+    const result = await inner(action, params);
+    if (action === 'comment_qzone') mgr.abort();   // 评论已成功、点赞还没发：用户此刻点了停止
+    return result;
+  };
+  await f.manager.runNow('feed');
+  const st = JSON.parse(fs.readFileSync(f.stateFile, 'utf8'));
+  const item = (st.feeds || []).find((x) => String(x.key || '').endsWith(':k1'));
+  assert.deepEqual(f.writes.map((w) => w.action), ['comment_qzone'], '只该发出评论，点赞不该发出去');
+  assert.equal(item.commentStatus, 'done', '前提：评论确实成功了');
+  assert.equal(item.status, 'reviewed', '评论已发出 → 必须 reviewed（退回 unread 下轮会重复评论）');
+});
+
+// ── 2026-10-06 复审 P2：持久化状态绑定账号（与 daily-moments 的 MOMENT_ACCOUNT_CHANGED 同款防线）──
+test('换号登录后，旧账号积压的互动队列拒绝执行（accountId 闸门）', async () => {
+  const f = fixture({
+    state: { version: 1, accountId: '999', feeds: [], comments: [], watchedPosts: [], runs: [] }
+  });
+  const result = await f.manager.runNow('feed');
+  assert.equal(result, undefined, '账号不匹配时本轮必须直接跳过（不产出 run）');
+  const st = JSON.parse(fs.readFileSync(f.stateFile, 'utf8'));
+  assert.equal(st.accountId, '999', '状态文件的账号归属不许被覆盖');
+  assert.deepEqual(f.writes, [], '一次 QQ 动作都不许发（旧队列不能以新账号身份执行）');
+});
+
+test('首次运行把当前 selfId 回填为状态归属（守卫不许变成一律拒跑）', async () => {
+  const f = fixture({});
+  const result = await f.manager.runNow('feed');
+  assert.ok(result, '前提：正常跑完一轮');
+  const st = JSON.parse(fs.readFileSync(f.stateFile, 'utf8'));
+  assert.equal(st.accountId, '888', '首次运行要回填当前 selfId，之后才具备换号判定基准');
 });

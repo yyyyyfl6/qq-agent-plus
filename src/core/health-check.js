@@ -4,8 +4,17 @@
 // fetchImpl / statfs 可注入：测试不打真实网络。
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { openDatabase } from './sqlite.js';
+import { isContainerRuntime } from './runtime.js';
 import { budgetStatus } from './budget.js';
+import { todayKey } from './util.js';
+import { readJsonBounded } from './http-body.js';
+import { parsePluginManifest } from '../plugins/manifest.js';
+import { permissionFlagSupported, isolationSummary } from '../plugins/isolation.js';
+import {
+  SNOWLUMA_BASELINE_IMAGE, SNOWLUMA_MIN_RECOMMENDED, readComposeEnv, parseImage, compareVersions
+} from './snowluma-update.js';
 
 const OUTBOUND_STALE_MS = 6 * 60 * 60 * 1000;   // 入站静默窗口：6 小时没人说话＝静默期（原名出站水位，
                                                 // 2026-10-02 判据改版后只用于比较入站时间）
@@ -18,6 +27,42 @@ const NOTIFY_AFTER_STREAK = 3;                   // 连续失败到第 3 次才�
 // 控制台半死不活（接受连接但不响应）时，一轮巡检会被它拖住整个超时窗口 ——
 // 而 qq-agent-health.timer 是 5 分钟一次，等于巡检自己叠在一起排不上。
 const FETCH_TIMEOUT_MS = 10 * 1000;
+
+/**
+ * 更新路径的 `sudo -n docker` 回退通不通（与 src/core/snowluma-update.js 的 runDocker 同一条路）。
+ * 用 `-n`：绝不弹密码提示；超时也压住，不让一次巡检被 sudo 拖住。
+ */
+function probeSudoDocker() {
+  try {
+    const res = spawnSync('sudo', ['-n', 'docker', 'info', '--format', '{{.ServerVersion}}'],
+      { timeout: 8000, stdio: 'ignore' });
+    return res?.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 控制台**主进程**是否被 NoNewPrivileges 加固：加固时 `sudo -n docker` 在那边**必失败**
+ * （内核禁止 setuid 提权），巡检就不能拿"巡检进程自己能 sudo"当"功能可用"的证据 ——
+ * 那会造出一条永不过期的假绿：巡检报"更新会走回退"，用户点按钮照样失败
+ *（2026-10-09 审查；标准 unit 由 install-service.mjs 生成，默认带 NNP）。
+ * 路径：systemctl show MainPID → /proc/<pid>/status 的 NoNewPrivs。
+ * 拿不到（非 Linux / 服务没在跑）时按"未加固"处理 —— 保持旧行为。
+ */
+function mainServiceHasNoNewPrivs(service) {
+  try {
+    const name = String(service || '').trim();
+    if (!name) return false;
+    const out = spawnSync('systemctl', ['--user', 'show', '-p', 'MainPID', '--value', name],
+      { timeout: 5000, encoding: 'utf8' });
+    const pid = Number(String(out?.stdout || '').trim());
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    return /NoNewPrivs:\s*1/.test(fs.readFileSync(`/proc/${pid}/status`, 'utf8'));
+  } catch {
+    return false;
+  }
+}
 
 function loadState(dataDir) {
   try {
@@ -33,6 +78,7 @@ function saveState(dataDir, state) {
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
   fs.renameSync(tmp, file);
+  fs.chmodSync(file, 0o600); // btrfs 兜底（Issue #11：mode 参数在该文件系统上会丢失；2026-10-12 审查）
 }
 
 /** Agent 是否处于暂停态（runtime.paused 持久化在 config.json；读不到按未暂停）。 */
@@ -45,13 +91,38 @@ function readRuntimePaused(dataDir) {
   }
 }
 
-/** 当日预算是否"已用尽且策略为 degrade"（此时编排器按设计保留未读，不该报停滞）。 */
-function readBudgetDegraded(dataDir) {
+/** 读插件段（只看开关与授权清单；此处不加载插件、不碰任何插件代码）。 */
+function readPluginConfig(dataDir) {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(dataDir, 'config.json'), 'utf8'));
+    const plugins = cfg?.plugins && typeof cfg.plugins === 'object' ? cfg.plugins : {};
+    return {
+      enabled: plugins.enabled === true,
+      requireIsolation: plugins.requireIsolation !== false,
+      requireNetworkIsolation: plugins.requireNetworkIsolation === true,
+      networkIsolation: plugins.networkIsolation !== false,
+      revoked: Array.isArray(plugins.revoked) ? plugins.revoked : [],
+      enabledIds: plugins.enabledIds || []
+    };
+  } catch {
+    return { enabled: false, requireIsolation: true, networkIsolation: true, requireNetworkIsolation: false, revoked: [], enabledIds: [] };
+  }
+}
+
+/**
+ * 当日预算用尽、且策略本身就会**保留未读**（此时"到期未处理"是设计使然，不该报停滞）。
+ * degrade：只回 @，其余保留未读；block：整批不跑，消息留到明天 —— 两种都会让消息堆着，
+ * 只豁免 degrade 的话 block 用户每天都会收到一条"收发链路可能停滞"的误报（2026-10-08 审查）。
+ */
+function readBudgetKeepPending(dataDir) {
   try {
     const cfg = JSON.parse(fs.readFileSync(path.join(dataDir, 'config.json'), 'utf8'));
     const usage = JSON.parse(fs.readFileSync(path.join(dataDir, 'usage-today.json'), 'utf8'));
-    const status = budgetStatus(cfg, usage);
-    return status.exceeded && status.onExceed === 'degrade';
+    // 只认"今天"的用量文件（与 sessions.todayUsage 同一口径，2026-10-13 审查）：昨天超限后、
+    // 今天第一笔会话还没把文件重写之前，不能拿昨天那份豁免今天的停滞告警 —— 否则真正的
+    // 管道停滞会被"预算已用尽"的豁免一整天地静默掉。
+    const status = budgetStatus(cfg, usage && usage.dayKey === todayKey() ? usage : {});
+    return status.exceeded && ['degrade', 'block'].includes(status.onExceed);
   } catch {
     return false;
   }
@@ -62,7 +133,7 @@ function readBudgetDegraded(dataDir) {
  * @param {object} opts
  *   dataDir / mode(observe|active) / consolePort / onebotHttpPort / onebotToken
  *   notify: async (text) => void|null   通知通道（ops.js 里接 core/notify-owner）
- *   fetchImpl / statfs                  注入点（测试）
+ *   fetchImpl / statfs / sudoDockerProbe 注入点（测试）
  * @returns {{ healthy: boolean, checks: Array, notified: string[], code: number }}
  */
 export async function runHealthCheck(opts = {}) {
@@ -71,17 +142,28 @@ export async function runHealthCheck(opts = {}) {
     mode = 'active',
     consolePort = 3210,
     onebotHttpPort = 3390,
+    onebotHttpUrl = '',
     onebotToken = '',
+    snowlumaDir = '',
+    service = '',
+    containerRuntime = null,   // 可注入（测试）：null＝按运行环境判断
+    noNewPrivsStatus = null,   // 可注入（测试）：null＝自动探测主服务进程
+    sudoDockerProbe = null,    // 可注入（测试）：null＝走真实 probeSudoDocker()
     outboundStaleMs = OUTBOUND_STALE_MS,
     notify = null,
     fetchImpl = globalThis.fetch,
     fetchTimeoutMs = FETCH_TIMEOUT_MS,
     statfs = null,
     now = Date.now(),
+    // 控制台「一键体检」在 **Web 进程内**调用：跳过全库 integrity_check（同步、O(库大小)）
+    // 和 health.json 落盘，避免一次点击把事件循环/定时巡检的连击状态拖坏。
+    integrityCheck = true,
+    persist = true,
   } = opts;
 
   const checks = [];
   const add = (name, ok, detail = '') => checks.push({ name, ok, detail });
+  const container = containerRuntime === null ? isContainerRuntime() : Boolean(containerRuntime);
   // AbortSignal.timeout 覆盖整次请求（含读 body）：挂死的服务在 fetchTimeoutMs 内必被中止，
   // 巡检不会为它多等一个 undici 默认超时。
   const probeSignal = () => AbortSignal.timeout(fetchTimeoutMs);
@@ -98,14 +180,95 @@ export async function runHealthCheck(opts = {}) {
   try {
     const headers = { 'content-type': 'application/json' };
     if (onebotToken) headers.authorization = `Bearer ${onebotToken}`;
-    const res = await fetchImpl(`http://127.0.0.1:${onebotHttpPort}/get_status`, { method: 'POST', headers, body: '{}', signal: probeSignal() });
-    const data = await res.json().catch(() => ({}));
+    // 容器里协议端是 compose 网络里的另一个服务（snowluma:3000），不是 127.0.0.1。
+    // 优先用完整的 httpUrl；没给才回落到宿主机式的端口探测。
+    const onebotBase = String(onebotHttpUrl || '').replace(/\/+$/, '') || `http://127.0.0.1:${onebotHttpPort}`;
+    const res = await fetchImpl(`${onebotBase}/get_status`, { method: 'POST', headers, body: '{}', signal: probeSignal() });
+    // 有界读：巡检目标是本机协议端，但"巡检把常驻进程读爆"这类亏不能再吃第二次（2026-10-10 审查）
+    const data = await readJsonBounded(res, 256 * 1024).catch(() => ({}));
     add('onebot-status', res.ok && data?.status === 'ok', res.ok ? `retcode=${data?.retcode ?? '?'}` : `HTTP ${res.status}`);
   } catch (error) {
     add('onebot-status', false, error?.message ?? String(error));
   }
 
-  // ③ 入站处理水位：判据是"**到期的入站消息有没有被处理**"，而不是"入站新 → 出站必须新"，
+  // ②b 协议端（SnowLuma）版本：只读 compose 项目的 .env（不 exec docker，巡检要便宜且无副作用）。
+  // 低于推荐版本**不算不健康**（机器人照常工作，只是贴纸会显示成图片），所以 ok=true + 在
+  // detail 里把"该升级"说清楚 —— 控制台「设置 → OneBot」页可以一键更新。
+  try {
+    if (!snowlumaDir) add('protocol-version', true, '未配置协议端目录（跳过）');
+    else {
+      const env = readComposeEnv(snowlumaDir);
+      const version = parseImage(env.image).version;
+      if (!env.exists) add('protocol-version', true, '没找到协议端 compose 项目（跳过）');
+      else if (!version) add('protocol-version', true, `镜像 tag 认不出：${env.image || '(空)'}`);
+      else if (compareVersions(version, SNOWLUMA_MIN_RECOMMENDED) < 0) {
+        add('protocol-version', true,
+          `${version} 低于推荐 ${SNOWLUMA_MIN_RECOMMENDED}（贴纸会显示成图片）；控制台可一键更新到 ${parseImage(SNOWLUMA_BASELINE_IMAGE).version}`);
+      } else {
+        add('protocol-version', true, `${version}（镜像 ${env.image}）`);
+      }
+    }
+  } catch (error) {
+    add('protocol-version', true, `跳过：${error?.message ?? error}`);
+  }
+
+  // ②b Docker 套接字可读写性（Issue #30）。
+  //     协议端是靠 docker 管的，控制台里的「更新协议端」要能连上守护进程。
+  //     这里用 fs.access 而不是跑 `docker info`：要的就是“这个进程的组对不对”
+  //     这一个事实，不依赖守护进程本身健不健康，也不引入外部命令。
+  //     ⚠️ 这一项只代表**拉起巡检的那个进程**有没有权限。巡检由 systemd timer 拉起，
+  //     组同样来自 systemd --user 管理器 —— 所以它恰好能提前抓到
+  //     “管理员后加进 docker 组、但用户管理器没重建”那种状态（交互 shell 里 docker 好用、
+  //     只有控制台里报 permission denied），而那正是只会在点下“更新协议端”那一刻才爆发的坑。
+  try {
+    const dockerHost = String(process.env.DOCKER_HOST || '');
+    const sock = dockerHost.startsWith('unix://') ? dockerHost.slice('unix://'.length) : '/var/run/docker.sock';
+    fs.accessSync(sock, fs.constants.R_OK | fs.constants.W_OK);
+    add('docker-socket', true, `可读写 ${sock}`);
+  } catch (error) {
+    // 主进程被 NNP 加固时回退必失败（2026-10-09 审查）：先判，别让"巡检能 sudo"造成假绿。
+    const hardened = noNewPrivsStatus ?? mainServiceHasNoNewPrivs(service);
+    if (error?.code === 'ENOENT') {
+      // 没装 docker、或用了远程 DOCKER_HOST ——与 protocol-version 的“跳过”同一口径：
+      // 这不是异常，不该把巡检报红。容器里更是常态（协议端由 compose 管）。
+      add('docker-socket', true, container
+        ? '容器模式：未挂载宿主 docker 套接字（协议端更新由 compose 管理，跳过）'
+        : '没有 docker 套接字（未装 docker 或用了远程 DOCKER_HOST，跳过）');
+    } else if (hardened) {
+      add('docker-socket', false,
+        `${error?.code || '不可读'}：控制台主进程被 NoNewPrivileges 加固，sudo 回退不可用，`
+        + '更新协议端会失败；修法见 docs/LINUX.md「控制台里更新协议端报 docker 权限不足」');
+    } else if ((sudoDockerProbe ?? probeSudoDocker)()) {
+      // ⚠️ 关键：不能只因为"直连不可用"就报失败。更新路径有一条 `sudo -n docker` 回退
+      //（Issue #30，与 deploy-all.sh 同一条路），那条路通则功能就是**能用**的。
+      // 只报直连失败会造出一条**永不过期的误报**：巡检每 5 分钟失败一次、连击 3 次通知 owner，
+      // 而因为那个条件不会自己恢复，也永远不会有"已恢复"通知。
+      add('docker-socket', true,
+        `直连不可用（${error?.code || '不可读'}），但 sudo -n docker 可用 —— 更新协议端会走回退；`
+        + '永久修法见 docs/LINUX.md「控制台里更新协议端报 docker 权限不足」');
+    } else {
+      add('docker-socket', false,
+        `${error?.code || '不可读'}：直连与 sudo -n docker 回退都不可用，控制台里更新协议端会失败；`
+        + '见 docs/LINUX.md「控制台里更新协议端报 docker 权限不足」');
+    }
+  }
+
+  // ③ 媒体工具：ffmpeg/ffprobe 是可选能力（语音转写、视频抽帧、GIF 帧条、超大图降采样）。
+  // 缺失不影响文字聊天，但相关功能会失败 —— 记绿并写明安装命令，避免误报连击。
+  {
+    const has = (cmd) => spawnSync(cmd, ['-version'], { timeout: 3000, stdio: 'ignore' }).status === 0;
+    const ffmpeg = has('ffmpeg');
+    const ffprobe = has('ffprobe');
+    if (ffmpeg && ffprobe) {
+      add('media-tools', true, 'ffmpeg/ffprobe 可用');
+    } else {
+      const missing = [!ffmpeg && 'ffmpeg', !ffprobe && 'ffprobe'].filter(Boolean).join('/');
+      add('media-tools', true, `未安装 ${missing}（可选：语音转写、视频抽帧、GIF 帧条不可用；`
+        + 'Debian/Ubuntu 装 ffmpeg，Fedora/RHEL 装 ffmpeg 包）');
+    }
+  }
+
+  // ④ 入站处理水位：判据是"**到期的入站消息有没有被处理**"，而不是"入站新 → 出站必须新"，
   //    也不是"bot 一直没说话"。
   // - observe 模式本来就不发消息 → 跳过（否则每 5 分钟固定误报）。
   // - 窗口内没有入站消息（深夜/冷清时段）→ 静默期，出站为空是正常行为 → 记 ok。
@@ -140,8 +303,8 @@ export async function runHealthCheck(opts = {}) {
     add('outbound-freshness', true, '跳过（observe 模式不发消息）');
   } else if (readRuntimePaused(dataDir)) {
     add('outbound-freshness', true, '跳过（Agent 已暂停，消息按设计留在未读）');
-  } else if (readBudgetDegraded(dataDir)) {
-    add('outbound-freshness', true, '跳过（当日预算已用尽且策略为 degrade：保留未读是设计行为）');
+  } else if (readBudgetKeepPending(dataDir)) {
+    add('outbound-freshness', true, '跳过（当日预算已用尽且策略为 degrade/block：保留未读是设计行为）');
   } else {
     try {
       const db = openDatabase(path.join(dataDir, 'messages.sqlite'), { readOnly: true });
@@ -190,7 +353,7 @@ export async function runHealthCheck(opts = {}) {
     }
   }
 
-  // ④ 磁盘余量
+  // ⑤ 磁盘余量
   try {
     const st = typeof statfs === 'function' ? statfs(dataDir) : fs.statfsSync(dataDir);
     const avail = Number(st.bavail) * Number(st.bsize);
@@ -199,38 +362,104 @@ export async function runHealthCheck(opts = {}) {
     add('disk-space', false, `磁盘余量读不了: ${error?.message ?? error}`);
   }
 
-  // ⑤ 自动更新状态
-  try {
-    const upd = JSON.parse(fs.readFileSync(path.join(dataDir, 'auto-update.json'), 'utf8'));
-    add('auto-update', upd?.status !== 'failed', upd?.status === 'failed' ? `status=failed（${String(upd?.error || '').slice(0, 120)}）` : `status=${upd?.status ?? 'unknown'}`);
-  } catch {
-    add('auto-update', true, '跳过（无 auto-update.json）');
+  // ⑥ 自动更新状态
+  if (container) {
+    // 容器里的更新是"换镜像"，没有 auto-update.json 这回事；旧卷里残留的 failed 状态
+    // 也不能拿到这里报红（那会让迁移过来的用户永久看到一条无法自愈的告警）。
+    add('auto-update', true, '容器模式：应用由镜像管理（跳过自动更新状态）');
+  } else {
+    try {
+      const upd = JSON.parse(fs.readFileSync(path.join(dataDir, 'auto-update.json'), 'utf8'));
+      add('auto-update', upd?.status !== 'failed', upd?.status === 'failed' ? `status=failed（${String(upd?.error || '').slice(0, 120)}）` : `status=${upd?.status ?? 'unknown'}`);
+    } catch {
+      add('auto-update', true, '跳过（无 auto-update.json）');
+    }
   }
 
-  // ⑥ 部署中断标记（36c649a 加固项）：存在＝上次部署被 SIGKILL/OOM 打断且未收尾
+  // ⑦ 部署中断标记（36c649a 加固项）：存在＝上次部署被 SIGKILL/OOM 打断且未收尾
   const marker = path.join(dataDir, '.deploy-in-progress');
-  add('deploy-interrupted', !fs.existsSync(marker), fs.existsSync(marker) ? '存在中断标记，按 docs/LINUX.md「部署被中断后怎么恢复」处理' : '');
+  if (container) {
+    add('deploy-interrupted', true, '容器模式：不适用（部署由镜像/编排负责）');
+  } else {
+    add('deploy-interrupted', !fs.existsSync(marker), fs.existsSync(marker) ? '存在中断标记，按 docs/LINUX.md「部署被中断后怎么恢复」处理' : '');
+  }
 
-  // ⑦ messages 库完整性（适配层只读打开）
-  try {
-    const db = openDatabase(path.join(dataDir, 'messages.sqlite'), { readOnly: true });
+  // ⑧ messages 库完整性（适配层只读打开）。控制台交互体检跳过：DatabaseSync 会同步扫全库。
+  if (integrityCheck) {
     try {
-      const row = db.prepare('PRAGMA integrity_check').get();
-      add('sqlite-integrity', row?.integrity_check === 'ok', row?.integrity_check ?? '');
-    } finally { db.close(); }
+      const db = openDatabase(path.join(dataDir, 'messages.sqlite'), { readOnly: true });
+      try {
+        const row = db.prepare('PRAGMA integrity_check').get();
+        add('sqlite-integrity', row?.integrity_check === 'ok', row?.integrity_check ?? '');
+      } finally { db.close(); }
+    } catch (error) {
+      add('sqlite-integrity', false, error?.message ?? String(error));
+    }
+  }
+
+  // ⑨ 插件（v1）：装了几个、授权几个、manifest 有没有问题、这台机器能不能隔离。
+  // 巡检是**独立进程**（ops health-check），拿不到运行中注册表的状态 —— 它只查磁盘与配置；
+  // "某个插件此刻是不是在跑"由控制台「插件」页回答（那是唯一有活注册表的地方）。
+  try {
+    const pluginCfg = readPluginConfig(dataDir);
+    if (pluginCfg.enabled !== true) add('plugins', true, '插件总开关关着（跳过）');
+    else {
+      const root = path.join(dataDir, 'plugins');
+      let entries = [];
+      // 跳过宿主自己的中间目录（.staging-/.backup-/.removed-）：它们里面有 plugin.json，
+      // 但目录名与 id 不一致 —— 不跳过就是"每次升级后巡检永久报红"（2026-10-15 复审 P1）
+      try {
+        entries = fs.readdirSync(root, { withFileTypes: true })
+          .filter((e) => e.isDirectory() && !e.name.startsWith('.'));
+      }
+      catch { entries = []; }
+      const broken = [];
+      for (const entry of entries) {
+        const dir = path.join(root, entry.name);
+        let raw = null;
+        try { raw = JSON.parse(fs.readFileSync(path.join(dir, 'plugin.json'), 'utf8')); }
+        catch { broken.push(`${entry.name}（读不到 plugin.json）`); continue; }
+        // 与宿主用**同一份**校验（plugins/manifest.js）：两处口径分裂的话，
+        // "巡检说没事、宿主却拒载"是最难受的一种状态。
+        const parsed = parsePluginManifest(raw, { dir });
+        if (!parsed.ok) broken.push(`${entry.name}（${parsed.error}）`);
+        else if (parsed.manifest.id !== entry.name) broken.push(`${entry.name}（manifest 的 id 与目录名不一致）`);
+      }
+      const cannotRun = !permissionFlagSupported() && pluginCfg.requireIsolation !== false;
+      // 网络隔离：本机做不到时——要求了就报红（fail-closed 说好的不许装），没要求就如实说明（不报红，
+      // 否则 Windows/macOS 上每次巡检都红，等于把红变成噪音）
+      const netOk = isolationSummary().net;
+      const netBlocked = pluginCfg.networkIsolation !== false && pluginCfg.requireNetworkIsolation === true && !netOk;
+      const revoked = pluginCfg.revoked.length
+        ? `撤回名单 ${pluginCfg.revoked.length} 条（${pluginCfg.revoked.slice(0, 3).join(', ')}${pluginCfg.revoked.length > 3 ? ' …' : ''}）`
+        : '';
+      const detail = [
+        `已装 ${entries.length} 个，授权 ${Array.isArray(pluginCfg.enabledIds) ? pluginCfg.enabledIds.length : 0} 个`,
+        broken.length ? `有问题：${broken.join('; ')}` : '',
+        revoked,
+        cannotRun ? '本机 Node 不支持权限隔离，插件不会被加载（换 Node，或明确关掉 plugins.requireIsolation）' : '',
+        !netOk && pluginCfg.networkIsolation !== false && !pluginCfg.requireNetworkIsolation
+          ? '插件进程的网络未隔离（本机没有可用的网络命名空间）：插件能自己连出去，控制台里也会显示'
+          : '',
+        netBlocked ? '要求网络隔离但本机做不到，插件不会被加载（换 Linux，或关掉 plugins.requireNetworkIsolation）' : ''
+      ].filter(Boolean).join('；');
+      add('plugins', broken.length === 0 && !cannotRun && !netBlocked, detail);
+    }
   } catch (error) {
-    add('sqlite-integrity', false, error?.message ?? String(error));
+    add('plugins', false, error?.message ?? String(error));
   }
 
   const healthy = checks.every((c) => c.ok);
 
   // ── 抑制与通知：按类别计连击；连续 NOTIFY_AFTER_STREAK 次失败才通知，恢复补发一次 ──
+  // persist=false 时（控制台交互体检）不读/不写 health.json，避免覆盖定时巡检的连击状态。
+  const notified = [];
+  if (persist) {
   const state = loadState(dataDir);
   state.streaks = state.streaks || {};
   state.lastRunAt = now;
   state.healthy = healthy;
   state.lastResults = checks;
-  const notified = [];
   if (typeof notify === 'function') {
     for (const c of checks) {
       const prev = state.streaks[c.name] || { count: 0 };
@@ -274,6 +503,7 @@ export async function runHealthCheck(opts = {}) {
     }
   }
   try { saveState(dataDir, state); } catch { /* health.json 写失败不影响巡检结论 */ }
+  }
 
   return { healthy, checks, notified, code: healthy ? 0 : 1 };
 }

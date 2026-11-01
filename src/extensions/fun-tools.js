@@ -3,7 +3,7 @@
 // 模型只负责用自己的口吻说出来 —— 不让模型自己编数字，免得同一个人一会儿 90 一会儿 12。
 import crypto from 'node:crypto';
 import { getConfig, updateConfig } from '../core/config.js';
-import { err, isPlainObject, ok, shanghaiDate } from './shared.js';
+import { err, isPlainObject, ok, shanghaiDate, triggerSenderIdsOf } from './shared.js';
 
 export const FUN_TOOLS_DEFAULTS = Object.freeze({
   enabled: false,
@@ -133,7 +133,7 @@ export function funToolDefs() {
       const c = funToolsConfig();
       const kind = String(args.kind || '');
       if (!c[kind]) return err(`「${kind}」这个玩法在控制台里关掉了`);
-      const uid = String(args.userId ?? '').replace(/\D/g, '') || String(ctx.triggerSenderIds?.at(-1) || '');
+      const uid = String(args.userId ?? '').replace(/\D/g, '') || String(triggerSenderIdsOf(ctx).at(-1) || '');
       if (kind === 'jrrp') {
         if (!uid) return err('需要 userId');
         return ok({ userId: uid, ...jrrp(uid) });

@@ -24,14 +24,15 @@ function clientWithRecorder() {
   return { bot, seen };
 }
 
-test('文本与表情用 15 秒超时，语音与图片（表情包）用 60 秒', async () => {
+test('文本与表情用 15 秒超时，语音与图片（表情包/普通图片）用 60 秒', async () => {
   const { bot, seen } = clientWithRecorder();
   await bot.sendText('group', 123, '你好');
   await bot.sendFace('group', 123, '178');
   await bot.sendRecord('private', 456, 'base64://AAAA');
   await bot.sendSticker('group', 123, 'https://example.com/s.png');
+  await bot.sendImage('group', 123, 'https://example.com/p.png', { atUserId: '42' });
 
-  assert.equal(seen.length, 4);
+  assert.equal(seen.length, 5);
   assert.equal(seen[0].timeoutMs, 15000, '文本仍是 15 秒');
   assert.equal(seen[1].timeoutMs, 15000, '系统表情不上传文件，仍是 15 秒');
   for (const item of seen.slice(2)) {
@@ -40,4 +41,14 @@ test('文本与表情用 15 秒超时，语音与图片（表情包）用 60 秒
   // 段类型没被改坏：record 仍是 record，图片仍是 image
   assert.equal(seen[2].segments[0].type, 'record');
   assert.equal(seen[3].segments[0].type, 'image');
+  // 贴纸要带表情呈现字段（用户 2026-10-07 反馈"发表情包变图片"），其它媒体段不带
+  assert.equal(seen[3].segments[0].data.sub_type, 1, '贴纸图片段要带 sub_type=1');
+  assert.equal(seen[3].segments[0].data.summary, '[动画表情]', '贴纸图片段要带 [动画表情]');
+  assert.equal(seen[2].segments[0].data.sub_type, undefined, '语音段不能被带上表情字段');
+  // 普通图片（issue #67）：带 at 段，但图片段不能带表情字段，否则群友还是存不下来
+  assert.equal(seen[4].segments[0].type, 'at');
+  assert.equal(seen[4].segments[1].type, 'image');
+  assert.equal(seen[4].segments[1].data.file, 'https://example.com/p.png');
+  assert.equal(seen[4].segments[1].data.sub_type, undefined, '普通图片不能带 sub_type');
+  assert.equal(seen[4].segments[1].data.summary, undefined, '普通图片不能带 [动画表情]');
 });

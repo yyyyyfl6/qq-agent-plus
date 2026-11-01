@@ -3,8 +3,6 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { DATA_DIR } from '../core/config.js';
 
-const MEMORY_BACKUP_ROOT = path.join(DATA_DIR, 'memory', 'backups');
-const BACKUP_ROOT = path.join(MEMORY_BACKUP_ROOT, 'consolidation');
 const chatDirName = (chatKey) => String(chatKey || '').replace(/[^a-z0-9_]/gi, '_');
 
 function writeJsonAtomic(file, value) {
@@ -29,6 +27,7 @@ function writeJsonAtomic(file, value) {
 const KEEP_PER_PERSON = 20;
 
 export function backupPersonBeforeConsolidation(person, {
+  memoryDir = path.join(DATA_DIR, 'memory'),
   sourceChatKey = '',
   at = Date.now(),
   reason = 'consolidation'
@@ -51,7 +50,7 @@ export function backupPersonBeforeConsolidation(person, {
 
   const when = Number(at) || Date.now();
   const snapshot = structuredClone(person);
-  const dir = path.join(BACKUP_ROOT, key);
+  const dir = path.join(memoryDir, 'backups', 'consolidation', key);
   const file = path.join(dir, `${when}-${crypto.randomUUID()}.json`);
   writeJsonAtomic(file, {
     version: 1,
@@ -63,7 +62,7 @@ export function backupPersonBeforeConsolidation(person, {
 
   const chatDir = chatDirName(sourceChatKey);
   if (/^(group|private)_\d+$/.test(chatDir)) {
-    writeJsonAtomic(path.join(MEMORY_BACKUP_ROOT, chatDir, `${key}.json`), snapshot);
+    writeJsonAtomic(path.join(memoryDir, 'backups', chatDir, `${key}.json`), snapshot);
   }
   // 只增不删会一直占盘：每人只保留最近 KEEP_PER_PERSON 份（文件名前缀是时间戳）
   try {

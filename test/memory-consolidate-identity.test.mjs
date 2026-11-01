@@ -130,3 +130,84 @@ test('整理链路：遗留条目并到本人名下、重名不猜、坏时间�
   assert.ok(result3.results.some((r) => r.userId === '456'), '这条人物应该被正常整理');
   third.store.close();
 });
+
+test('整理不覆盖控制台手写的 manual 印象（issue #55）', async (t) => {
+  const oldFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = oldFetch; });
+  writeMemberFile('789', '小美', [
+    { content: '手写：别叫她全名', createdAt: 2000, lastObservedAt: 2000, origin: 'manual' },
+    { content: '模型：爱吃辣', createdAt: 2000, lastObservedAt: 2000, origin: 'consolidated' }
+  ], ['group:4'], 2000);
+  const runner = makeRunner(['4']);
+  seedChat(runner.store, 'group:4', [['789', '小美', 4]]);
+  // 模型只回了自动条目，完全没有提手工那条 —— 写回时也必须把手工条目强制保留。
+  globalThis.fetch = async () => Response.json({
+    choices: [{
+      message: {
+        // 模拟模型把手工条目连同"（记于 …）"尾注一起抄回来 —— 不能再生成一条重复副本。
+        content: JSON.stringify({ impressions: ['手写：别叫她全名（记于 2026-10-25 10:00）', '模型：爱吃辣，也爱喝奶茶'] })
+      }
+    }],
+    usage: { total_tokens: 10 }
+  });
+
+  const result = await runner.runner.consolidateMemoryForChat('group:4');
+  assert.deepEqual(result.failed, []);
+  const impressions = runner.memory.getMember('group:4', '789').impressions;
+  const manual = impressions.find((e) => e.content === '手写：别叫她全名');
+  assert.ok(manual, '手工印象不能被模型删掉');
+  assert.equal(manual.origin, 'manual', '手工来源要保持 manual');
+  assert.equal(impressions.filter((e) => e.content.includes('别叫她全名')).length, 1, '不能留下模型抄回的重复副本');
+  assert.ok(impressions.some((e) => e.content.includes('爱喝奶茶')), '模型整理结果仍要生效');
+  runner.store.close();
+});
+
+test('整理期间控制台改手工印象：旧内容不复活、新内容保留 manual（issue #55 复审）', async (t) => {
+  const oldFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = oldFetch; });
+  writeMemberFile('790', '小美', [
+    { content: '手写：别叫她全名', createdAt: 2000, lastObservedAt: 2000, origin: 'manual' }
+  ], ['group:5'], 2000);
+  const runner = makeRunner(['5']);
+  seedChat(runner.store, 'group:5', [['790', '小美', 4]]);
+  globalThis.fetch = async () => {
+    // 模拟模型跑着的这段时间里，管理员在控制台把手工印象改了。
+    runner.memory.editMemberImpression('group:5', {
+      userId: '790', name: '小美', impressions: ['手写：改过的内容']
+    });
+    return Response.json({
+      choices: [{ message: { content: JSON.stringify({ impressions: ['模型：新条目'] }) } }],
+      usage: { total_tokens: 10 }
+    });
+  };
+
+  await runner.runner.consolidateMemoryForChat('group:5');
+  const impressions = runner.memory.getMember('group:5', '790').impressions;
+  assert.equal(impressions.some((e) => e.content === '手写：别叫她全名'), false, '旧快照里的手工条目不能被复活');
+  const edited = impressions.find((e) => e.content === '手写：改过的内容');
+  assert.ok(edited, '整理期间的新手工内容要保留');
+  assert.equal(edited.origin, 'manual');
+  assert.ok(impressions.some((e) => e.content === '模型：新条目'), '模型整理结果仍要生效');
+  runner.store.close();
+});
+
+test('手工印象达到存储上限 50 条时跳过整理，不截断用户内容（issue #55 复审）', async (t) => {
+  const oldFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = oldFetch; });
+  const fifty = Array.from({ length: 50 }, (_, i) => ({
+    content: `手写第 ${i + 1} 条`, createdAt: 2000 + i, lastObservedAt: 2000 + i, origin: 'manual'
+  }));
+  writeMemberFile('791', '小美', fifty, ['group:6'], 2000);
+  const runner = makeRunner(['6']);
+  seedChat(runner.store, 'group:6', [['791', '小美', 4]]);
+  globalThis.fetch = async () => Response.json({
+    choices: [{ message: { content: JSON.stringify({ impressions: ['模型新条目'] }) } }],
+    usage: { total_tokens: 10 }
+  });
+
+  await runner.runner.consolidateMemoryForChat('group:6');
+  const impressions = runner.memory.getMember('group:6', '791').impressions;
+  assert.equal(impressions.length, 50, '不能因为 replace 的存储上限静默丢掉尾部手工条目');
+  assert.equal(impressions.filter((e) => e.origin === 'manual').length, 50);
+  runner.store.close();
+});

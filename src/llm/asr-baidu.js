@@ -4,6 +4,7 @@
 //   2. 新式：直接 `Authorization: Bearer bce-v3/ALTAK-...`（把 API Key 原样当 Bearer 用）
 // 限制：单次 ≤60 秒、≤约 3MB（由上层分片）；pcm/wav/amr/m4a 都收，16k/8k 16 位单声道。
 import { asrApiKey, asrSecretKey, getConfig } from '../core/config.js';
+import { readTextBounded } from '../core/http-body.js';
 
 export const BAIDU_SPEECH_URL = 'https://vop.baidu.com/server_api';
 export const BAIDU_TOKEN_URL = 'https://aip.baidubce.com/oauth/2.0/token';
@@ -27,7 +28,8 @@ ${String(secretKey || '')}`;
   if (signal?.aborted) throw signal.reason ?? new Error('已中止');
   const timeout = AbortSignal.timeout(timeoutMs);
   const res = await fetchFn(url, { method: 'POST', signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
-  const body = await res.text();
+  // 有界读（256KB 足够换 token 的响应）：上游畸形/超大时中途中断（2026-10-09 审查）
+  const body = await readTextBounded(res, 256 * 1024);
   let data = null;
   try { data = JSON.parse(body); } catch { /* 下面按无 token 处理 */ }
   const token = String(data?.access_token || '').trim();
@@ -77,7 +79,8 @@ export async function baiduTranscribe(pcmBuffer, {
     const res = await fetchFn(BAIDU_SPEECH_URL, {
       method: 'POST', headers, body: JSON.stringify(payload), signal: controller.signal
     });
-    const body = await res.text();
+    // 有界读（1MB）：转写结果本应很小，超限视为上游异常并中断（2026-10-09 审查）
+    const body = await readTextBounded(res, 1024 * 1024);
     let data = null;
     try { data = JSON.parse(body); } catch { /* 下面统一报错 */ }
     // 顺序要紧：HTTP 失败时 body 可能是网关的 JSON（没有 err_no），先看 status 才能带上真实原因；

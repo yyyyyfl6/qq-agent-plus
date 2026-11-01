@@ -48,24 +48,29 @@ async function boot(t) {
   return { port, get };
 }
 
-function get(port, urlPath, headers = {}) {
+function request(port, method, urlPath, { headers = {}, body = '' } = {}) {
   return new Promise((resolve) => {
     const req = http.request(
-      { host: '127.0.0.1', port, path: urlPath, method: 'GET', headers },
+      { host: '127.0.0.1', port, path: urlPath, method, headers },
       (res) => {
         let text = '';
         res.setEncoding('utf8');
         res.on('data', (c) => { text += c; });
         res.on('end', () => {
-          let body = null;
-          try { body = JSON.parse(text); } catch { /* 非 JSON */ }
-          resolve({ status: res.statusCode, text, body });
+          let parsed = null;
+          try { parsed = JSON.parse(text); } catch { /* 非 JSON */ }
+          resolve({ status: res.statusCode, text, body: parsed, headers: res.headers });
         });
       }
     );
     req.on('error', (e) => resolve({ status: 0, text: String(e.message), body: null }));
-    req.end();
+    if (body) req.setHeader('content-length', Buffer.byteLength(body));
+    req.end(body);
   });
+}
+
+function get(port, urlPath, headers = {}) {
+  return request(port, 'GET', urlPath, { headers });
 }
 
 test('GET /api/onebot-key 按 field 回读 WS / HTTP 令牌明文', async (t) => {
@@ -109,6 +114,53 @@ test('GET /api/onebot-key：未知字段 400；非本机来源读不到令牌', 
   assert.match(src.slice(at, at + 900), /keyEndpoint: true/, '必须走明文密钥端点的守卫');
 });
 
+
+test('POST /api/config：非法 JSON 返回 400 而不是 500', async (t) => {
+  const { port } = await boot(t);
+  const res = await request(port, 'POST', '/api/config', {
+    headers: { host: `127.0.0.1:${port}`, 'content-type': 'application/json' },
+    body: '{not-json'
+  });
+  assert.equal(res.status, 400, res.text);
+  assert.match(String(res.body?.error || ''), /JSON/);
+});
+
+test('POST /api/config：英文校验错误也返回 400（不靠错误文案猜）', async (t) => {
+  const { port } = await boot(t);
+  const res = await request(port, 'POST', '/api/config', {
+    headers: { host: `127.0.0.1:${port}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ server: { port: 0 } })
+  });
+  assert.equal(res.status, 400, res.text);
+  assert.match(String(res.body?.error || ''), /Invalid server port/);
+});
+
+test('静态资源 304 也带防点击劫持头（老缓存不会漏防护）', async (t) => {
+  const { port } = await boot(t);
+  const first = await request(port, 'GET', '/', { headers: { host: `127.0.0.1:${port}` } });
+  assert.equal(first.status, 200, first.text);
+  const etag = first.headers?.etag;
+  assert.ok(etag, 'HTML 响应应带 ETag');
+  const second = await request(port, 'GET', '/', {
+    headers: { host: `127.0.0.1:${port}`, 'if-none-match': etag }
+  });
+  assert.equal(second.status, 304, second.text);
+  assert.equal(second.headers?.['x-frame-options'], 'DENY');
+  assert.match(String(second.headers?.['content-security-policy'] || ''), /frame-ancestors 'none'/);
+  assert.equal(second.headers?.['referrer-policy'], 'no-referrer');
+});
+
+test('POST /api/health/check 走同一份巡检并返回检查项', async (t) => {
+  const { port } = await boot(t);
+  const res = await request(port, 'POST', '/api/health/check', {
+    headers: { host: `127.0.0.1:${port}`, 'content-type': 'application/json' },
+    body: '{}'
+  });
+  assert.equal(res.status, 200, res.text);
+  assert.equal(typeof res.body?.healthy, 'boolean');
+  assert.ok(Array.isArray(res.body?.checks));
+  assert.ok(res.body.checks.length > 0, '巡检至少要返回控制台/协议端等检查项');
+});
 
 test('GET /api/status 带版本号（控制台版本徽标的数据来源）', async (t) => {
   const { port, get: fetchPath } = await boot(t);

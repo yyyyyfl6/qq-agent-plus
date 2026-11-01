@@ -19,9 +19,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '22'
+          node-version-file: .nvmrc
           cache: npm
 
       - name: 安装依赖
@@ -29,25 +29,33 @@ jobs:
 
       # runner 镜像里没有 ffmpeg，而 GIF 帧条与语音转码的用例依赖它：缺了会被显式跳过，
       # 于是"CI 绿"覆盖不到这两条链路（2026-09-26 实测：新用例在缺 ffmpeg 时断言失败）。
-      # 装发行版包（不引第三方 action），顺便多验证一个 ffmpeg 版本（生产是 4.4.2）。
+      # 装发行版包（不引第三方 action）。版本并不与生产完全一致：裸机 Ubuntu 22.04 是 4.4.2，
+      # Docker 镜像 Debian 12 是 5.1.9，CI 是 ubuntu-latest 的发行版包。
       - name: 安装 ffmpeg（GIF 帧条 / 音频转码用例依赖）
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg
-          ffmpeg -version | head -n 1
+          # runner 的 apt 源偶尔会卡住（2026-10-26 实测 test job 在 update 上挂了 20 分钟）。
+          # 先直接装；失败再 update；仍失败就显式警告并继续 —— 缺 ffmpeg 的用例会按
+          # 既有 skip 逻辑标记 skipped，不能因为镜像源问题让整个 CI 红掉。
+          APT_OPTS=(-o Acquire::ForceIPv4=true -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+          if ! timeout 180 sudo apt-get install -y -qq "${APT_OPTS[@]}" ffmpeg; then
+            if ! timeout 240 sudo apt-get update -qq "${APT_OPTS[@]}" || ! timeout 180 sudo apt-get install -y -qq "${APT_OPTS[@]}" ffmpeg; then
+              echo "::warning::ffmpeg 安装失败（apt 源不可达），相关用例将跳过"
+            fi
+          fi
+          ffmpeg -version | head -n 1 || echo "ffmpeg unavailable; dependent tests will be skipped"
 
       - name: 语法检查（src / scripts / test / ui，递归）
         run: |
           set -e
           # 先确认四个目录都在：find 对"某个目录不存在"只报错不改变退出码传递，
           # 少检一个目录会静默通过（2026-09-26 审查）。
-          for d in src scripts test ui; do
+          for d in src scripts test ui examples; do
             [ -d "$d" ] || { echo "缺少目录：$d"; exit 1; }
           done
           # 递归：src/ 按领域分了子目录，用 src/*.js 这种 glob 会静默漏掉子目录。
           # 用 mapfile 并断言非空：`for f in $(find ...)` 会吃掉 find 的退出码，find 失败时
           # 循环体一次都不跑，却照样打印"通过（0 个文件）"并成功退出。
-          mapfile -t files < <(find src scripts test ui -type f \( -name '*.js' -o -name '*.mjs' \) | sort)
+          mapfile -t files < <(find src scripts test ui examples -type f \( -name '*.js' -o -name '*.mjs' \) | sort)
           [[ ${#files[@]} -gt 0 ]] || { echo "没有找到任何待检查文件"; exit 1; }
           for f in "${files[@]}"; do node --check "$f"; done
           echo "语法检查通过（${#files[@]} 个文件）"
@@ -62,21 +70,126 @@ jobs:
           for f in "${shells[@]}"; do bash -n "$f"; done
           echo "Shell 语法检查通过（${#shells[@]} 个）"
 
+      # root 安装路径的只读冒烟：确认 install.sh 不会以 root 直接跑 deploy-all.sh，
+      # 而是进入 root-install.sh 的降权预检。这一步不创建用户、不改系统。
+      - name: 一键安装 root 包装层预检（--check-only）
+        run: sudo bash install.sh --check-only
+
       - name: 未定义调用扫描（严格模式）
         run: node src/ops.js scan --strict
+
+      - name: 官方技能索引体检
+        run: npm run skill:check
 
       - name: 单元测试
         run: npm run test:unit
 
+      # 更新器的部署前门禁（scripts/auto-update.mjs）把同一份**门禁全清单**跑在 unit 的
+      # 加固环境里（install-service.mjs 生成的 unit 带 NoNewPrivileges=true + UMask=0077）。
+      # CI 默认环境没有这两样，于是一类"只在门禁环境里败"的用例（真实 /proc 探测、文件权限）
+      # 能一路绿到把更新路径弄瘫 —— 2026-10-10 线上实测即是如此（#1043/#1048 两条 sudo 回退
+      # 用例在带 NNP 的 unit 里必败，导致所有标准部署都装不上新版本）。这一步按 unit 的姿势
+      # 把门禁清单（unit + local + 四个回归 harness + scan，与更新器同一份）复跑一遍。
+      # 2026-10-10 同族第二个漏网：门禁单元的进程也可能没有 docker 组（用户管理器未继承），
+      # 此时 ops-health 里断言"全绿"的用例会因直连真实套接字失败而全红（issue #30 实测恰好
+      # 3 条必挂、门禁拒绝升级）—— 所以这里同时把 DOCKER_HOST 指向 000 权限的假套接字，
+      # 把"套接字不可访问"也作为门禁环境的一个维度复跑。
+      - name: 更新器门禁全清单（按 unit 的加固环境复跑：NoNewPrivileges + umask 0077 + 无 docker 访问 + 无 devDeps）
+        run: |
+          command -v setpriv >/dev/null || { echo "缺少 setpriv"; exit 1; }
+          umask 0077
+          NO_DOCKER_SOCK="${RUNNER_TEMP:-/tmp}/no-docker-access.sock"
+          : > "$NO_DOCKER_SOCK"
+          chmod 000 "$NO_DOCKER_SOCK"
+          export DOCKER_HOST="unix://$NO_DOCKER_SOCK"
+          # 第四条维度（2026-10-12 审查）：真门禁是 `npm ci --omit=dev` 的依赖面（没有
+          # happy-dom/espree 等 devDeps），CI 此前只跑"全量依赖"环境 —— 某个用例把 devDep
+          # 写成裸 import 时 CI 全绿、到了真门禁才 ERR_MODULE_NOT_FOUND。剔掉 devDeps 复跑
+          # 全清单；恢复放在**独立的 always 步骤**里 —— 这一步中途失败时也要把依赖装回来，
+          # 否则后面的步骤会以 ERR_MODULE_NOT_FOUND 的形式再红一次（信息重复、误导向）。
+          npm prune --omit=dev --no-audit --no-fund
+          setpriv --no-new-privs npm run test:unit
+          setpriv --no-new-privs npm run test:local
+          setpriv --no-new-privs npm run test:regression
+          setpriv --no-new-privs node src/ops.js scan --strict
+      - name: 恢复开发依赖（上一步失败也要恢复：后面的 eslint / 回归步骤还要用）
+        if: always()
+        run: npm ci --no-audit --no-fund
+
       - name: 本地回归测试
         run: npm run test:local
 
+      # 走 test:regression（scripts/test-suite.mjs）而不是裸 node：三条测试步骤统一由
+      # runner 重定向 TMPDIR/TMP/TEMP 到本次运行专属根目录，跑完整体删除，避免用例往
+      # /tmp 里堆 qq-* 垃圾（2026-10-09，测试卫生）。
       - name: 提示词 / 渲染 / 滚动 / 用量端到端回归
-        run: |
-          node test/test-prompt.mjs
-          node test/render-test.mjs
-          node test/scroll-test.mjs
-          node test/usage-e2e.mjs
+        run: npm run test:regression
+
+  # Windows 门禁（2026-10）：只允许显式 skip，不允许 fail。
+  # 跨平台可修项已修；POSIX/Linux-only 用例经 test/helpers/platform.mjs 带原因跳过。
+  # 用 spec 报告与空基线比对，任何未预期失败都会红，避免“Windows 永远一片红”掩盖回归。
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci --no-audit --no-fund
+
+      - name: Windows 单元测试（POSIX-only 跳过，未预期失败即红）
+        run: npm run test:unit:win
+
+  # 真浏览器冒烟（2026-10）：happy-dom/vm 抓不到布局、CSS、真实事件链。
+  # 起真实控制台 + 真 Chromium，覆盖登录、13 页签、设置/好友保存、插件审批、窄屏横向溢出。
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci --no-audit --no-fund
+
+      - name: 安装 Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: 浏览器冒烟（真 Chromium）
+        run: npm run test:browser
+
+  # 官方插件打包/安装冒烟：每个 examples/plugins/* 在干净数据目录里真打真装再卸载。
+  official-plugins:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci --no-audit --no-fund
+
+      - name: 官方插件打包 + 安装 + 卸载
+        run: node scripts/official-plugins-check.mjs
 
   # ESLint 门禁（改进方案 C4）：与本地 `npm run lint` 同口径 —— 0 error 才能进 main。
   # 与 test 分开成 job：lint 失败时一眼看到是风格/静态问题，不用翻几百行测试输出。
@@ -87,9 +200,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '22'
+          node-version-file: .nvmrc
           cache: npm
 
       - name: 安装依赖

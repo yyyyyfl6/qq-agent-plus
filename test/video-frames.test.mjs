@@ -107,3 +107,51 @@ test('抽帧被中止时原样抛出（不误报"需要 ffmpeg/ffprobe"）', { s
     /已中止|abort/i
   );
 });
+
+// 「消息类型」页的视频画面开关（issue #34，2026-10-15）：关掉后视频既不下载也不抽帧
+// （省一次网络往返 + 一次视觉调用），但图片/表情照常，并且要如实说明"这条视频没看"——
+// 否则模型会以为这条消息里只有那几张图。用 base64:// 送图、用计数服务端钉住"没碰视频"，
+// 所以这条用例不依赖 ffmpeg。
+test('关掉视频画面：视频不下载不抽帧，图片照常，并说明为什么看不到', async () => {
+  const { updateConfig } = await import('../src/core/config.js');
+  const tinyPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==';
+  let videoHits = 0;
+  const server = http.createServer((req, res) => {
+    videoHits += 1;
+    res.writeHead(200, { 'content-type': 'video/mp4' });
+    res.end(Buffer.alloc(64));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const videoUrl = `http://127.0.0.1:${server.address().port}/clip.mp4`;
+  const tool = buildToolDefs().find((t) => t.name === 'get_message_images');
+  assert.ok(tool, '工具要存在');
+  updateConfig({ messageTypes: { videoFrames: false } });
+  try {
+    // ① 只有视频：不下载、不抽帧，如实说清是设置关的（别再让它换个 id 重试）
+    const videoOnly = { mid: 'm1', text: '[视频]', media: [{ kind: 'video', url: videoUrl }] };
+    const ctx1 = {
+      chatKey: 'group:1', signal: AbortSignal.timeout(20000),
+      store: { findByMid: () => videoOnly, updateByMid: () => {} },
+      stickers: { find: async () => null }
+    };
+    const r1 = await tool.execute(ctx1, { messageId: 'm1' });
+    assert.equal(r1.isError, undefined, '这是设置行为，不该报错');
+    assert.match(String(r1.content), /视频画面查看在设置里关着/);
+
+    // ② 图片 + 视频：图照常给（走 base64:// 不碰网络），视频跳过并计数
+    const mixed = {
+      mid: 'm2', text: '[图片][视频]',
+      media: [{ kind: 'image', url: `base64://${tinyPng}` }, { kind: 'video', url: videoUrl }]
+    };
+    const ctx2 = { ...ctx1, store: { findByMid: () => mixed, updateByMid: () => {} } };
+    const r2 = await tool.execute(ctx2, { messageId: 'm2' });
+    const blob = JSON.stringify(r2);
+    assert.match(blob, /data:image\/png;base64,/, '图片仍要能看');
+    assert.match(blob, /1 条视频未看/, '要说明有视频没看，别让模型以为这条消息只有图');
+
+    assert.equal(videoHits, 0, '关掉后一次都不该去下视频');
+  } finally {
+    updateConfig({ messageTypes: { videoFrames: true } });
+    await new Promise((resolve) => server.close(resolve));
+  }
+});

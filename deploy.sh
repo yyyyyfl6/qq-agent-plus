@@ -14,7 +14,7 @@ DEPLOY_BRANCH=""
 IMPORT_BRIDGE=""
 CREDENTIAL_FILE=""
 NODE_BIN="${NODE_BIN:-}"
-NODE_VERSION="${QQ_AGENT_NODE_VERSION:-22.23.2}"
+NODE_VERSION="${QQ_AGENT_NODE_VERSION:-22.23.3}"
 BACKUP_ENABLED=true
 ALLOW_PATH_CHANGE=false
 
@@ -71,6 +71,9 @@ while (($#)); do
 done
 
 [[ "$(uname -s)" == Linux ]] || { printf 'Linux only\n' >&2; exit 1; }
+if ((EUID == 0)); then
+  printf 'Warning: running deploy.sh as root is not recommended; the service will run as root. Prefer the service user or install.sh.\n' >&2
+fi
 [[ "$SERVICE" =~ ^[a-zA-Z0-9_-]+$ ]] || exit 2
 [[ "$PORT" =~ ^[0-9]+$ ]] && ((PORT >= 1 && PORT <= 65535)) || {
   printf 'Port must be an integer from 1 to 65535\n' >&2
@@ -98,6 +101,14 @@ canon_path() {
 }
 ROOT_CANON="$(canon_path "$ROOT")" || { printf 'Cannot normalize the source path: %s\n' "$ROOT" >&2; exit 2; }
 INSTALL_CANON="$(canon_path "$INSTALL_DIR")" || { printf 'Cannot normalize the installation path: %s\n' "$INSTALL_DIR" >&2; exit 2; }
+# 共享目录判定放在归一化之后：`/srv/`、`/srv/../srv` 或指向 /srv 的符号链接
+# 归一化后都会命中；只比较未归一化的原始字符串会被这些等价写法绕过。
+case "$INSTALL_CANON" in
+  /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
+    printf 'Refusing to deploy into a shared system directory: %s\n' "$INSTALL_DIR" >&2
+    exit 2
+    ;;
+esac
 if [[ "$ROOT_CANON" != "$INSTALL_CANON" && "$INSTALL_CANON" == "$ROOT_CANON/"* ]]; then
   printf 'Installation path must not be nested inside the source repository\n' >&2
   exit 2
@@ -106,8 +117,22 @@ if [[ "$ROOT_CANON" != "$INSTALL_CANON" && "$ROOT_CANON" == "$INSTALL_CANON/"* ]
   printf 'The source repository must not be nested inside the installation path\n' >&2
   exit 2
 fi
+# 数据目录 = 安装目录时，下面按相对路径排除数据的逻辑会退化成只排除 /data/，而源码树里没有
+# data/ —— 第二次部署的 `rsync -a --delete` 会把 config.json / SQLite / 会话全删掉。
+# 这是"传了两个参数看起来都合理"的组合，必须在任何改动之前拒绝（与 rsync --delete 同一口径）。
+DATA_CANON="$(canon_path "$DATA_DIR")" || { printf 'Cannot normalize the data path: %s\n' "$DATA_DIR" >&2; exit 2; }
+if [[ "$DATA_CANON" == "$INSTALL_CANON" ]]; then
+  printf 'The data directory must be different from the installation directory: rsync --delete would wipe it\n' >&2
+  exit 2
+fi
+# 网页终端 / su / sudo -u 等非登录会话不设置 XDG_RUNTIME_DIR：systemctl --user 会报
+# "Failed to connect to bus"，哪怕用户管理器在跑（2026-10-12 报道在生产机复现：只差这一个
+# 环境变量）。目录存在就补上；用户自己的值不动。控制台触发的部署由 ops.js 注入，不受影响。
+if [[ -z "${XDG_RUNTIME_DIR:-}" && -d "/run/user/$(id -u)" ]]; then
+  export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+fi
 command -v systemctl >/dev/null || { printf 'systemctl is required: deploy on a Linux host with systemd\n' >&2; exit 1; }
-systemctl --user show-environment >/dev/null || { printf 'The systemd user manager is unavailable for %s: run this script from a normal login session (for example over SSH), not from a non-login context\n' "$(id -un)" >&2; exit 1; }
+systemctl --user show-environment >/dev/null || { printf 'Cannot reach the systemd user manager for %s: non-login shells (web terminals, su) need XDG_RUNTIME_DIR — run this script from a normal login session (for example over SSH), or export XDG_RUNTIME_DIR=/run/user/$(id -u) and retry; if that directory does not exist, run "sudo loginctl enable-linger %s" first\n' "$(id -un)" "$(id -un)" >&2; exit 1; }
 command -v rsync >/dev/null || { printf 'rsync is required: install it first (Debian/Ubuntu: apt install -y rsync)\n' >&2; exit 1; }
 mkdir -p "$INSTALL_DIR" "$DATA_DIR"
 
@@ -193,7 +218,7 @@ LOCK_OWNED=true
 node_ready() {
   [[ -n "$1" && -x "$1" ]] || return 1
   # 低限 22.19：运行期依赖 undici 8 声明 engines >=22.19（2026-10-01 升级，
-  # Dependabot 的 undici 6→8）；deploy.sh 自己下载的 .runtime 是 22.23.2，不受影响。
+  # Dependabot 的 undici 6→8）；deploy.sh 自己下载的 .runtime 是 22.23.3，不受影响。
   "$1" --input-type=module -e '
     const [major,minor]=process.versions.node.split(".").map(Number);
     if (major<22 || (major===22 && minor<19)) process.exit(1);
@@ -205,16 +230,52 @@ node_ready() {
 if [[ -z "$NODE_BIN" ]]; then
   NODE_BIN="$(command -v node || true)"
 fi
+# 2026-10-06 复审 P2：无系统 Node 时先复用 $INSTALL_DIR/.runtime 里已装好的运行时。
+# 原先只探测 `command -v node`，服务器重跑部署（deploy-all 的镜像拉取失败提示就是
+# "重跑 deploy-all.sh"，而它调 deploy.sh 不带 --node）会每次都从 nodejs.org 全量重下，
+# nodejs.org 不可达时整个部署失败 —— 哪怕磁盘上就有校验过的可用 node。
+RUNTIME_DIR="$INSTALL_DIR/.runtime"
+NODE_ARCH=''
+case "$(uname -m)" in
+  x86_64) NODE_ARCH=x64 ;;
+  aarch64|arm64) NODE_ARCH=arm64 ;;
+  *) NODE_ARCH='' ;;
+esac
+if [[ -n "$NODE_ARCH" ]] && ! node_ready "$NODE_BIN"; then
+  CANDIDATE_NODE="$RUNTIME_DIR/node-v${NODE_VERSION}-linux-${NODE_ARCH}/bin/node"
+  if node_ready "$CANDIDATE_NODE"; then
+    NODE_BIN="$CANDIDATE_NODE"
+    printf 'Reusing existing Node.js runtime at %s\n' "$CANDIDATE_NODE"
+  fi
+fi
+# 精确补丁版没命中时，先认上次部署记下的运行时，再退到 .runtime 里任意一个合格版本：
+# 升级 NODE_VERSION（22.23.2 → 22.23.3）不该让离线机器因为"版本号不同"重新下载。
+if ! node_ready "$NODE_BIN" && [[ -r "$INSTALL_DIR/.deployment-node" ]]; then
+  RECORDED_NODE="$(tr -d '\r\n' < "$INSTALL_DIR/.deployment-node" 2>/dev/null || true)"
+  if node_ready "$RECORDED_NODE"; then
+    NODE_BIN="$RECORDED_NODE"
+    printf 'Reusing recorded Node.js runtime at %s\n' "$NODE_BIN"
+  fi
+fi
+if ! node_ready "$NODE_BIN" && [[ -n "$NODE_ARCH" && -d "$RUNTIME_DIR" ]]; then
+  while IFS= read -r CANDIDATE_NODE; do
+    [[ -n "$CANDIDATE_NODE" ]] || continue
+    if node_ready "$CANDIDATE_NODE"; then
+      NODE_BIN="$CANDIDATE_NODE"
+      printf 'Reusing existing Node.js runtime at %s\n' "$NODE_BIN"
+      break
+    fi
+  done < <(find "$RUNTIME_DIR" -maxdepth 4 -type f \
+    -path "*/node-v*-linux-${NODE_ARCH}/bin/node" -print 2>/dev/null | sort -rV)
+fi
 if ! node_ready "$NODE_BIN"; then
   command -v curl >/dev/null
   command -v sha256sum >/dev/null
   command -v tar >/dev/null
-  case "$(uname -m)" in
-    x86_64) NODE_ARCH=x64 ;;
-    aarch64|arm64) NODE_ARCH=arm64 ;;
-    *) printf 'Unsupported CPU architecture: %s\n' "$(uname -m)" >&2; exit 1 ;;
-  esac
-  RUNTIME_DIR="$INSTALL_DIR/.runtime"
+  command -v xz >/dev/null || { printf 'xz is required to unpack the Node.js archive (install xz-utils)\n' >&2; exit 1; }
+  if [[ -z "$NODE_ARCH" ]]; then
+    printf 'Unsupported CPU architecture: %s\n' "$(uname -m)" >&2; exit 1
+  fi
   ARCHIVE="node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz"
   TMP_DIR="$(mktemp -d)"
   printf 'Installing Node.js v%s for %s...\n' "$NODE_VERSION" "$NODE_ARCH"
@@ -302,18 +363,89 @@ RSYNC_PRESERVE=(
   # 更新器跑测试时会在 checkout 根建这两个目录（runner 会在 rsync 前删掉，这里再兜一层：
   # rsync 是 `-a --delete` 从 checkout 根同步的，根目录多什么就会被部署什么）
   --exclude='/.auto-update-test-*/'
+  # Docker 全栈是另一种部署方式，不是 systemd 安装树的一部分。不铺进安装目录，
+  # 既是避免用户误跑 root docker-compose，也是保护安装目录里用户自己的同名文件
+  #（排除规则同时挡住 rsync --delete）。
+  --exclude=/docker-compose.yml
+  --exclude='/docker-compose.*.yml'
+  --exclude=/Dockerfile
+  --exclude=/.dockerignore
+  --exclude=/docker/
+  --exclude='/scripts/docker-*.mjs'
+  --exclude='/scripts/docker-*.sh'
 )
-if [[ "$DATA_DIR" == "$INSTALL_DIR/"* ]]; then
-  DATA_REL="${DATA_DIR#"$INSTALL_DIR"/}"
-  RSYNC_PRESERVE+=(--exclude="/$DATA_REL/")
+# 用**规范化**后的路径算相对路径：原始写法带 `/./`、`/x/../`、尾斜杠或符号链接时，
+# 字符串前缀比较会失败 → 排除规则匹配不到真实目录 → `rsync --delete` 把数据删掉
+#（2026-10-19 复审 P1）。DATA_CANON/INSTALL_CANON 在上面的路径守卫里已算好。
+#
+# 原始条目单独保护：数据目录可能是安装目录里指向别处的**符号链接**（数据盘独立），
+# 此时 DATA_CANON 落在安装目录之外，下面的 canonical 分支保护不到这个链接本身。
+# 规则**不能带尾斜杠**：rsync 的 `dir/` 只匹配目录，符号链接在删扫时按普通文件分类，
+# 带斜杠的规则匹配不到它（2026-10-19 复核实测语义）。同时排除条目与内容。
+# rsync 的 exclude 是模式语言：数据目录名里出现 * ? [ 时会被当成通配符，
+# 例如 data[1] 的规则会匹配 data1/，真正的 data[1]/ 反而没被排除、被 --delete 删掉。
+# 路径本身仍然合法，所以这里转义而不是拒绝。
+rsync_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\*/\\*}"
+  s="${s//\?/\\?}"
+  s="${s//\[/\\[}"
+  printf '%s' "$s"
+}
+
+DATA_REL=""
+if [[ "$DATA_CANON" == "$INSTALL_CANON/"* ]]; then
+  DATA_REL="${DATA_CANON#"$INSTALL_CANON"/}"
+  DATA_REL_ESC="$(rsync_escape "$DATA_REL")"
+  RSYNC_PRESERVE+=(--exclude="/$DATA_REL_ESC/")
 else
   RSYNC_PRESERVE+=(--exclude=/data/)
+fi
+# 原始条目单独保护：数据目录可能是安装目录里指向别处的符号链接（数据盘独立），
+# 此时 DATA_CANON 落在安装目录之外，上面的 canonical 分支保护不到这个链接本身。
+# 规则不能带尾斜杠（rsync 的 `dir/` 只匹配目录，符号链接按普通文件分类）。
+DATA_TRIMMED="$DATA_DIR"
+while [[ "$DATA_TRIMMED" == */ ]]; do DATA_TRIMMED="${DATA_TRIMMED%/}"; done
+# 用 realpath -ms 做**不跟随符号链接**的规范化：它会把 /./、/x/../、重复斜杠和
+# 尾斜杠收干净，但保留最后一段（以及路径中间）的链接名字。旧写法只归一化父目录，
+# 遇到「父目录本身是符号链接」时后半段原始路径直接落到安装目录之外，保护整段失效。
+if command -v realpath >/dev/null 2>&1; then
+  DATA_TRIMMED="$(realpath -ms -- "$DATA_TRIMMED")"
+else
+  DATA_PARENT="$(canon_path "$(dirname -- "$DATA_TRIMMED")")"
+  DATA_TRIMMED="${DATA_PARENT%/}/$(basename -- "$DATA_TRIMMED")"
+fi
+INSTALL_TRIMMED="$(canon_path "$INSTALL_DIR")"
+if [[ "$DATA_TRIMMED" == "$INSTALL_TRIMMED/"* ]]; then
+  RAW_REL="${DATA_TRIMMED#"$INSTALL_TRIMMED"/}"
+  # 祖先里的符号链接也要保护：数据目录 /srv/app/storage/data、storage 是链接时，
+  # 只排除最后一段 data 仍然会让 rsync --delete 把 storage 这个链接删掉。
+  RAW_PREFIX=""
+  IFS='/' read -r -a RAW_PARTS <<< "$RAW_REL"
+  for RAW_PART in "${RAW_PARTS[@]}"; do
+    [[ -n "$RAW_PART" ]] || continue
+    RAW_PREFIX="${RAW_PREFIX:+$RAW_PREFIX/}$RAW_PART"
+    if [[ -L "$INSTALL_DIR/$RAW_PREFIX" ]]; then
+      RAW_PREFIX_ESC="$(rsync_escape "$RAW_PREFIX")"
+      RSYNC_PRESERVE+=(--exclude="/$RAW_PREFIX_ESC" --exclude="/$RAW_PREFIX_ESC/**")
+      break
+    fi
+  done
+  if [[ -n "$RAW_REL" && ( -z "$DATA_REL" || "$RAW_REL/" != "$DATA_REL/" ) ]]; then
+    RAW_REL_ESC="$(rsync_escape "$RAW_REL")"
+    RSYNC_PRESERVE+=(--exclude="/$RAW_REL_ESC" --exclude="/$RAW_REL_ESC/**")
+  fi
 fi
 RSYNC_SOURCE=("${RSYNC_PRESERVE[@]}" --exclude=/node_modules/)
 
 WAS_ACTIVE=false
+WAS_ENABLED=false
 if systemctl --user is-active --quiet "$SERVICE.service"; then
   WAS_ACTIVE=true
+fi
+if systemctl --user is-enabled --quiet "$SERVICE.service" 2>/dev/null; then
+  WAS_ENABLED=true
 fi
 
 ROLLBACK_DIR=""
@@ -411,46 +543,49 @@ rollback_deployment() {
   ((status != 0)) || status=1
   trap - ERR INT TERM
   set +e
-  clear_deploy_marker          # 回滚完成即视为"这次部署已收尾"，别留下会让启动告警的标记
+  ROLLBACK_FAILED=false
+  # 注意：清标记必须放在**恢复动作之后**（原来放在这里）：
+  # 恢复过程中再失败（磁盘满正是常见原因）或被 SIGKILL 时，标记已经没了，
+  # 机器停在"半新半旧"却不再报 deploy-interrupted（2026-10-13 全项目审查）。
   printf '\nDeployment failed; restoring the previous installation...\n' >&2
   systemctl --user stop "$SERVICE.service" >/dev/null 2>&1
   systemctl --user disable --now "$UPDATE_SERVICE.timer" >/dev/null 2>&1
   if [[ -n "$ROLLBACK_DIR" && -d "$ROLLBACK_DIR/app" ]]; then
-    rsync -a --delete "${RSYNC_PRESERVE[@]}" "$ROLLBACK_DIR/app/" "$INSTALL_DIR/"
+    rsync -a --delete "${RSYNC_PRESERVE[@]}" "$ROLLBACK_DIR/app/" "$INSTALL_DIR/" || ROLLBACK_FAILED=true
   fi
   if [[ "$HAD_CONFIG" == true ]]; then
-    cp -p "$LOCK_DIR/state/config.json" "$DATA_DIR/config.json"
+    cp -p "$LOCK_DIR/state/config.json" "$DATA_DIR/config.json" || ROLLBACK_FAILED=true
   else
     rm -f -- "$DATA_DIR/config.json"
   fi
   if [[ "$HAD_ACCESS_FILE" == true ]]; then
-    cp -p "$LOCK_DIR/state/console-access.txt" "$DATA_DIR/console-access.txt"
+    cp -p "$LOCK_DIR/state/console-access.txt" "$DATA_DIR/console-access.txt" || ROLLBACK_FAILED=true
   else
     rm -f -- "$DATA_DIR/console-access.txt"
   fi
   if [[ "$HAD_UNIT" == true ]]; then
     mkdir -p "$(dirname "$UNIT_FILE")"
-    cp -p "$LOCK_DIR/state/service.unit" "$UNIT_FILE"
+    cp -p "$LOCK_DIR/state/service.unit" "$UNIT_FILE" || ROLLBACK_FAILED=true
   else
     rm -f -- "$UNIT_FILE"
   fi
   if [[ "$HAD_UPDATE_UNIT" == true ]]; then
-    cp -p "$LOCK_DIR/state/update.service" "$UPDATE_UNIT_FILE"
+    cp -p "$LOCK_DIR/state/update.service" "$UPDATE_UNIT_FILE" || ROLLBACK_FAILED=true
   else
     rm -f -- "$UPDATE_UNIT_FILE"
   fi
   if [[ "$HAD_UPDATE_TIMER" == true ]]; then
-    cp -p "$LOCK_DIR/state/update.timer" "$UPDATE_TIMER_FILE"
+    cp -p "$LOCK_DIR/state/update.timer" "$UPDATE_TIMER_FILE" || ROLLBACK_FAILED=true
   else
     rm -f -- "$UPDATE_TIMER_FILE"
   fi
   if [[ "$HAD_DEPLOYMENT_JSON" == true ]]; then
-    cp -p "$LOCK_DIR/state/deployment.json" "$INSTALL_DIR/.deployment.json"
+    cp -p "$LOCK_DIR/state/deployment.json" "$INSTALL_DIR/.deployment.json" || ROLLBACK_FAILED=true
   else
     rm -f -- "$INSTALL_DIR/.deployment.json"
   fi
   if [[ "$HAD_DEPLOYMENT_NODE" == true ]]; then
-    cp -p "$LOCK_DIR/state/deployment-node" "$INSTALL_DIR/.deployment-node"
+    cp -p "$LOCK_DIR/state/deployment-node" "$INSTALL_DIR/.deployment-node" || ROLLBACK_FAILED=true
   else
     rm -f -- "$INSTALL_DIR/.deployment-node"
   fi
@@ -462,9 +597,18 @@ rollback_deployment() {
   fi
   if [[ "$WAS_ACTIVE" == true ]]; then
     systemctl --user start "$SERVICE.service"
+  elif [[ "$WAS_ENABLED" == true ]]; then
+    # 原来是 enabled 但被手动 stop：回滚只恢复开机自启，不擅自启动。
+    systemctl --user enable "$SERVICE.service" >/dev/null 2>&1
   else
     systemctl --user disable --now "$SERVICE.service" >/dev/null 2>&1
   fi
+  if [[ "$ROLLBACK_FAILED" == true ]]; then
+    printf 'Rollback incomplete: keeping %s for manual recovery. Do not start the old service blindly.\n' "$IN_PROGRESS_MARKER" >&2
+    exit "$status"
+  fi
+  # 恢复与重启都做完，才算这次部署收尾
+  clear_deploy_marker
   exit "$status"
 }
 trap rollback_deployment ERR INT TERM
@@ -504,12 +648,14 @@ systemctl --user enable --now "$SERVICE.service"
 systemctl --user enable --now "$UPDATE_SERVICE.timer"
 if [[ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || true)" != yes ]]; then
   # Issue #15：unit 带 NoNewPrivileges（docs/BAOTA.md 推荐的加固）时，重启后由
-  # systemd 拉起的进程跑不了 sudo，这一步曾让整个更新回滚。linger 只影响"下次
-  # 开机自启"，不该一票否决本次部署——预检 + 尽力而为，失败只警告。
+  # systemd 拉起的进程跑不了 sudo，这一步曾让整个更新回滚。linger 同时决定两件事：
+  # 会话结束后用户管理器是否存活（没开的话，本登录会话一断，logind 就连同服务一起停掉）
+  # 和开机是否自动拉起——后果比"不自启"大，但这一步仍不该一票否决本次部署：预检 + 尽力
+  # 而为，失败只警告（2026-10-12 修正文案：原说法只提了"下次开机不会自启"）。
   if grep -q 'NoNewPrivs:[[:space:]]*1' /proc/self/status 2>/dev/null; then
-    printf '警告：服务被 NoNewPrivileges 加固，无法代为开启 linger；本次部署不受影响，但服务下次开机不会自启。\n请在服务账号的交互终端执行一次：sudo loginctl enable-linger %s\n' "$USER" >&2
+    printf '警告：服务被 NoNewPrivileges 加固，无法代为开启 linger；本次部署不受影响，但当前登录会话一断开，systemd 就会连同用户管理器一起停掉服务（机器人掉线），服务下次开机也不会自启。\n请在服务账号的交互终端执行一次：sudo loginctl enable-linger %s（执行后立即生效，之后退出终端服务不受影响）\n' "$USER" >&2
   elif ! sudo loginctl enable-linger "$USER" 2>/dev/null; then
-    printf '警告：启用 linger 失败（sudo 不可用或被拒绝）；本次部署不受影响，但服务下次开机不会自启。\n请在服务账号的交互终端执行一次：sudo loginctl enable-linger %s\n' "$USER" >&2
+    printf '警告：启用 linger 失败（sudo 不可用或被拒绝）；本次部署不受影响，但当前登录会话一断开，systemd 就会连同用户管理器一起停掉服务（机器人掉线），服务下次开机也不会自启。\n请在服务账号的交互终端执行一次：sudo loginctl enable-linger %s（执行后立即生效，之后退出终端服务不受影响）\n' "$USER" >&2
   fi
 fi
 # 健康检查要拼 URL，IPv6 字面量必须加方括号（http://::1:3210 不是合法 URL，fetch 会直接 reject，
@@ -526,12 +672,16 @@ HEALTHY=false
 # 90 秒窗口：慢机器冷启动（大库迁移、慢磁盘）可能超过旧版 50×0.2s≈10-20 秒，
 # 被误判失败会触发回滚，形成"每次更新都回滚"的怪圈；deploy-all 对同服务给的是
 # 30-90 秒，这里对齐同一量级。
+HEALTH_DEADLINE=$((SECONDS + 90))
 for _ in {1..90}; do
-  if "$NODE_BIN" -e 'fetch(process.argv[1]).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))' \
+  # 单次 fetch 必须有硬超时：服务接受连接但不响应时，undici 默认可能拖几百秒，
+  # 90 次循环就不再是 90 秒窗口，更新 unit 会先被杀掉、回滚也跑不到。
+  if "$NODE_BIN" -e 'fetch(process.argv[1], { signal: AbortSignal.timeout(2000) }).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))' \
       "http://$HEALTH_HOST:$PORT/healthz"; then
     HEALTHY=true
     break
   fi
+  (( SECONDS < HEALTH_DEADLINE )) || break
   sleep 1
 done
 [[ "$HEALTHY" == true ]] || { printf 'Service health check failed\n' >&2; rollback_deployment; exit 1; }
@@ -549,9 +699,94 @@ elif command -v git >/dev/null && git -C "$ROOT" rev-parse --verify HEAD >/dev/n
 else
   REVISION="source-$(date -u +%Y%m%dT%H%M%SZ)"
 fi
-printf '%s\n' "$REVISION" > "$DATA_DIR/deployed-revision"
-chmod 600 "$DATA_DIR/deployed-revision"
-systemctl --user --no-pager status "$SERVICE.service"
-MODE="$("$NODE_BIN" -e 'const c=require(process.argv[1]);process.stdout.write(c.runtime.mode)' "$DATA_DIR/config.json")"
+# 以下都是"部署已成功（健康检查通过）之后的收尾"：任何一步失败都不该把退出码变成非 0 ——
+# 更新器按退出码判定成败，尾部失败会被记成"部署失败"并触发 disableOnFailure 自停 + 告警，
+# 而实际服务已经跑在新版本上（2026-10-07 复审 P3）。全部尽力而为。
+if printf '%s\n' "$REVISION" > "$DATA_DIR/deployed-revision" 2>/dev/null; then
+  chmod 600 "$DATA_DIR/deployed-revision" 2>/dev/null || true
+else
+  printf 'Warning: could not record deployed revision in %s\n' "$DATA_DIR/deployed-revision" >&2
+fi
+# 自动更新驱动（QQ_AGENT_SOURCE_REVISION 有值）且按控制台设置换了仓库/分支时，把安装记录
+# 对齐到实际来源 —— 否则下次校验仍按旧记录判"不一致"（见 verify-deployment-target.mjs）。
+if [[ -n "${QQ_AGENT_SOURCE_REVISION:-}" && -f "$INSTALL_DIR/.deployment.json" && ( -n "${QQ_AGENT_REPOSITORY:-}" || -n "${QQ_AGENT_BRANCH:-}" ) ]]; then
+  "$NODE_BIN" -e '
+    const fs = require("fs");
+    const [file, repository, branch] = process.argv.slice(1);
+    const meta = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (repository) meta.repository = repository;
+    if (branch) meta.branch = branch;
+    fs.writeFileSync(file, JSON.stringify(meta, null, 2));
+  ' "$INSTALL_DIR/.deployment.json" "${QQ_AGENT_REPOSITORY:-}" "${QQ_AGENT_BRANCH:-}" || printf 'Warning: could not sync .deployment.json source record\n' >&2
+  chmod 600 "$INSTALL_DIR/.deployment.json" 2>/dev/null || true
+fi
+systemctl --user --no-pager status "$SERVICE.service" || true
+MODE="$("$NODE_BIN" -e 'const c=require(process.argv[1]);process.stdout.write(c.runtime.mode)' "$DATA_DIR/config.json" 2>/dev/null)" || MODE="unknown"
+# ── docker 组自愈：控制台的「更新协议端」按钮靠服务进程直连 /var/run/docker.sock ──────────
+# 背景（Issue #30）：服务进程的补充组在 user manager 启动那一刻冻结；而标准部署从不碰
+# docker 组成员关系 —— 那个按钮从第一天起就会报 permission denied。收尾做两件事（幂等、尽力而为）：
+#   ① 把部署用户加进 docker 组（getent / usermod 是 systemd 家族各发行版 —— Ubuntu/Debian/
+#      CentOS/Fedora/Arch —— 的通用件；没有 docker 组的环境静默跳过）；
+#   ② user manager 若还带着旧组快照就重建它（重建后 linger 自动拉起服务，新进程带上新组）。
+# ⚠️ 重建必须 stop → sleep 3 → start，**不能用 systemctl restart**：2026-10-09 实测（systemd 249）
+#    用 restart 时新管理器会因旧实例 cgroup 未回收而以 status=219/CGROUP 启动失败，且失败后
+#    不会自动回来（服务停摆到人工 start）；停、留回收间隔、再单独起，是实测可靠的姿势。
+#    脚本自身不受影响：ssh 会话在独立的 session scope（实测 cgroup 为 session-*.scope），
+#    重建只动 user@.service 的 cgroup。
+# ⚠️ 自动更新（QQ_AGENT_SOURCE_REVISION 有值）场景**跳过重建**：无人值守时不做停服动作，
+#    只加组（等下次交互部署或机器重启时自然生效）。
+# ⚠️ 下面几处 sudo 一律带 `-n`（非交互）：这些调用的 stdout/stderr 都被丢弃了，一旦 sudo 要
+#    密码，提示会被吞掉、部署看起来像卡死（用户只能盲输或 Ctrl+C）。`-n` 让它立刻失败并走
+#    "手工执行"那句提示 —— 与运行时 `sudo -n docker` 是同一纪律（2026-10-09 复核）。
+# ⚠️ 代价须知：把账号加进 docker 组等于给它 root 等价权限（docker 组可以挂载宿主文件系统）。
+#    这条自愈是「控制台里更新协议端」这个功能的前提，但它也把"控制台被拿下"的后果从应用级
+#    抬到了宿主 root —— 权衡见 docs/LINUX.md（2026-10-09 复核）。
+if getent group docker >/dev/null 2>&1; then
+  # 收尾段仍在 set -e 之下：每个可能失败的赋值都要自带保护，否则会把退出码弄坏
+  DOCKER_GID="$(getent group docker 2>/dev/null | cut -d: -f3 || true)"
+  if [[ -n "$DOCKER_GID" ]]; then
+    if ! id -nG "$(id -un)" | tr ' ' '\n' | grep -qx docker; then
+      if sudo -n usermod -aG docker "$(id -un)" >/dev/null 2>&1; then
+        printf '已把 %s 加入 docker 组（控制台「更新协议端」需要）\n' "$(id -un)"
+      else
+        printf '警告：把自己加入 docker 组失败；控制台「更新协议端」会报权限不足（可手工执行：sudo usermod -aG docker %s）\n' "$(id -un)" >&2
+      fi
+    fi
+    if [[ -z "${QQ_AGENT_SOURCE_REVISION:-}" ]]; then
+      MANAGER_UNIT="user@$(id -u).service"
+      SVC_PID="$(systemctl --user show "$SERVICE.service" -p MainPID --value 2>/dev/null || true)"
+      SVC_GROUPS=""
+      if [[ "$SVC_PID" =~ ^[0-9]+$ && -r "/proc/$SVC_PID/status" ]]; then
+        SVC_GROUPS=" $(grep '^Groups:' "/proc/$SVC_PID/status" 2>/dev/null | cut -d: -f2 | tr '\t' ' ' || true) "
+      fi
+      if [[ -n "$SVC_GROUPS" && "$SVC_GROUPS" != *" $DOCKER_GID "* ]]; then
+        printf '重建 user manager 让 docker 组生效（服务会停约 10 秒后自动恢复）……\n'
+        if sudo -n systemctl stop "$MANAGER_UNIT" 2>/dev/null; then
+          sleep 3
+          if ! sudo -n systemctl start "$MANAGER_UNIT" 2>/dev/null; then
+            # ⚠️ 重试前必须再等一次：这次失败通常正是 219/CGROUP（旧实例 cgroup 还没回收完），
+            # 紧接着重试会撞同一个竞态、白试一次。多留 3 秒，重试才有意义（2026-10-09 复核）。
+            sleep 3
+            sudo -n systemctl start "$MANAGER_UNIT" 2>/dev/null \
+              || printf '警告：user manager 没能启动；请执行：sudo systemctl start %s\n' "$MANAGER_UNIT" >&2
+          fi
+          for _ in {1..10}; do
+            systemctl --user is-active --quiet "$SERVICE.service" 2>/dev/null && break
+            sleep 1
+          done
+          if systemctl --user is-active --quiet "$SERVICE.service" 2>/dev/null; then
+            printf '服务已随新管理器恢复（docker 组已生效，控制台可用）\n'
+          else
+            printf '服务未能随新管理器恢复：%s。部署按失败处理，请检查：sudo systemctl start %s\n' \
+              "$SERVICE.service" "$MANAGER_UNIT" >&2
+            exit 1
+          fi
+        else
+          printf '警告：停 user manager 失败；请手工执行：sudo systemctl stop %s && sleep 3 && sudo systemctl start %s\n' "$MANAGER_UNIT" "$MANAGER_UNIT" >&2
+        fi
+      fi
+    fi
+  fi
+fi
 printf '\nConsole: http://%s:%s (%s mode)\nToken: %s/manage.sh token\n' "$HEALTH_HOST" "$PORT" "$MODE" "$INSTALL_DIR"
 [[ -z "$ROLLBACK_DIR" ]] || printf 'Rollback snapshot: %s\n' "$ROLLBACK_DIR"

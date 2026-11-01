@@ -1,0 +1,11 @@
+{
+  "id": "crash",
+  "apiVersion": 1,
+  "name": "崩溃夹具",
+  "version": "1.0.0",
+  "description": "调用 boom 时直接退出进程：验证看门狗的重启与「连续崩溃后停用」",
+  "capabilities": ["tools"],
+  "tools": [
+    { "name": "boom", "description": "让插件进程立刻退出", "parameters": { "type": "object", "properties": {} } }
+  ]
+}

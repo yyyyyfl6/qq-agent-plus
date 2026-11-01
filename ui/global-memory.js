@@ -3,6 +3,7 @@
 
 import { api } from './core/api.js';
 import { esc } from './core/dom.js';
+import { setBoxError, setHtmlIfChanged } from './core/dom-util.js';
 import { state } from './core/state.js';
 import { saveMemberNote } from './pages/memory.js';
 (function globalPersonMemoryConsole() {
@@ -28,27 +29,40 @@ import { saveMemberNote } from './pages/memory.js';
       #view-people-memory { min-width:0; }
       #global-memory-list { display:flex; flex-direction:column; }
       #global-memory-items { overflow:auto; min-height:0; }
-      .gm-head { display:flex; gap:8px; align-items:center; padding:10px 12px; border-bottom:1px solid var(--border-color, rgba(128,128,128,.2)); }
+      .gm-head { display:flex; gap:8px; align-items:center; padding:10px 12px; border-bottom:1px solid var(--border, rgba(128,128,128,.2)); }
       .gm-head strong { flex:1; }
-      .gm-person { display:block; width:100%; border:0; border-bottom:1px solid var(--border-color, rgba(128,128,128,.15)); background:transparent; color:inherit; text-align:left; padding:11px 12px; cursor:pointer; }
-      .gm-person:hover, .gm-person.active { background:var(--hover-bg, rgba(127,127,127,.10)); }
+      .gm-search { display:flex; gap:6px; padding:8px 12px; align-items:center; border-bottom:1px solid var(--border, rgba(128,128,128,.15)); }
+      .gm-search input { flex:1; min-width:0; }
+      .gm-search-results { padding:0 12px; }
+      .gm-search-result { padding:10px 0; border-bottom:1px solid var(--border, rgba(128,128,128,.12)); }
+      .gm-search-result p { margin:5px 0; white-space:pre-wrap; line-height:1.5; }
+      .gm-search-result small { opacity:.65; }
+      /* 2026-10-09 复核：--border-color / --hover-bg 是写错的名字（全仓无定义）→ 永远走兜底的
+         死灰色、不跟主题；改成真实 token（--border / --hover），兜底保留给脱离控制台的场景。 */
+      .gm-person { display:block; width:100%; border:0; border-bottom:1px solid var(--border, rgba(128,128,128,.15)); background:transparent; color:inherit; text-align:left; padding:11px 12px; cursor:pointer; }
+      .gm-person:hover, .gm-person.active { background:var(--hover, rgba(127,127,127,.10)); }
       .gm-person-title { display:flex; gap:8px; align-items:center; }
       .gm-person-title strong { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-      .gm-count { margin-left:auto; font-size:12px; opacity:.7; }
-      .gm-sub { margin-top:4px; font-size:12px; opacity:.65; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+      .gm-count { margin-left:auto; font-size: var(--fs-sm, 12px); opacity:.7; }
+      .gm-sub { margin-top:4px; font-size: var(--fs-sm, 12px); opacity:.65; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
       .gm-toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px; }
-      .gm-chip { display:inline-block; padding:2px 7px; margin:2px 4px 2px 0; border-radius:999px; font-size:12px; background:rgba(127,127,127,.12); }
-      .gm-memory { margin:10px 0; padding:12px; border:1px solid var(--border-color, rgba(128,128,128,.2)); border-radius:10px; }
+      .gm-chip { display:inline-block; padding:2px 7px; margin:2px 4px 2px 0; border-radius:var(--r-pill, 999px); font-size: var(--fs-sm, 12px); background:rgba(127,127,127,.12); }
+      .gm-memory { margin:10px 0; padding:12px; border:1px solid var(--border, rgba(128,128,128,.2)); border-radius:var(--r-input, 10px); }
       .gm-memory-content { white-space:pre-wrap; line-height:1.55; }
-      .gm-memory-meta { margin-top:7px; font-size:12px; opacity:.65; }
+      .gm-memory-meta { margin-top:7px; font-size: var(--fs-sm, 12px); opacity:.65; }
       .gm-section { margin:16px 0; }
       .gm-section h3 { margin:0 0 8px; }
-      .gm-note { padding:10px 12px; margin:0 0 12px; border-radius:8px; background:rgba(127,127,127,.08); font-size:13px; line-height:1.5; }
+      .gm-note { padding:10px 12px; margin:0 0 12px; border-radius:var(--r-sm, 8px); background:rgba(127,127,127,.08); font-size: var(--fs-md, 13px); line-height:1.5; }
       .gm-empty { padding:24px 14px; opacity:.6; }
-      .gm-status { font-size:12px; opacity:.75; }
+      .gm-status { font-size: var(--fs-sm, 12px); opacity:.75; }
       .gm-note-field { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
       .gm-note-field input { flex:1 1 240px; min-width:0; }
-      .gm-anynote { padding:8px 12px; border-bottom:1px solid var(--border-color, rgba(128,128,128,.15)); font-size:13px; }
+      /* 新建印象那块的来源会话与多行正文：跟输入框同一套外观，各占满一行 */
+      .gm-anynote select, .gm-anynote textarea {
+        flex:1 1 100%; min-width:0; font:inherit; padding:6px 8px; color:inherit;
+        border:1px solid var(--border, rgba(128,128,128,.25)); border-radius:var(--r-input,10px); background:transparent;
+      }
+      .gm-anynote { padding:8px 12px; border-bottom:1px solid var(--border, rgba(128,128,128,.15)); font-size: var(--fs-md, 13px); }
       .gm-anynote > summary { cursor:pointer; opacity:.8; }
       .gm-anynote .gm-note-field { margin-top:8px; }
       /* 列表栏很窄：这一行的两个输入框各占满一行，别挤成两三个字符宽 */
@@ -122,6 +136,12 @@ import { saveMemberNote } from './pages/memory.js';
     // /api/memory-files 仍是兼容入口；每个 detail 返回的是 GlobalPersonMemoryStore
     // 在该 sourceChatKey 可见的人物。这里只按 QQ 合并，sourceChatKeys 仅保留来源。
     const summary = await api('/api/memory-files');
+    const stats = summary.stats;
+    const statsNode = document.getElementById('gm-memory-stats');
+    if (statsNode && stats) {
+      const kb = Math.max(0, Math.round((Number(stats.index?.bytes) || 0) / 1024));
+      statsNode.textContent = `共 ${stats.entries} 条印象 · ${stats.people} 人 · 手写 ${stats.manual} 条 · 检索索引 ${stats.index?.docs || 0} 条 / ${kb} KB · 自动印象保留 ${stats.limits?.days ? `${stats.limits.days} 天` : '不过期'} · 每人上限 ${stats.limits?.max ?? 50} 条（手写不删）`;
+    }
     const files = Array.isArray(summary.files) ? summary.files : [];
     const sourceFiles = files.filter((file) => Number(file.impressionCount) > 0);
     const details = await mapLimit(sourceFiles, 6, async (file) => {
@@ -148,10 +168,12 @@ import { saveMemberNote } from './pages/memory.js';
     const box = document.getElementById('global-memory-items');
     if (!box) return;
     if (!people.length) {
-      box.innerHTML = '<div class="gm-empty">还没有人物长期记忆</div>';
+      setHtmlIfChanged(box, '<div class="gm-empty">还没有人物长期记忆（名单只列有印象的人；没有印象的人用上面的「新建人物印象」补）</div>');
       return;
     }
-    box.innerHTML = people.map((person) => {
+    // setHtmlIfChanged：内容没变就不碰 DOM。这个页面每 15s 轮询一次（还有一个 focus 监听），
+    // 无条件 innerHTML 会把正在读长印象的人每 15 秒弹回顶部一次（2026-10-08 审查）。
+    const rendered = setHtmlIfChanged(box, people.map((person) => {
       const sources = person.sourceChatKeys || [];
       const title = person.name || person.userId || '未知人物';
       const subtitle = person.userId
@@ -161,7 +183,10 @@ import { saveMemberNote } from './pages/memory.js';
         <div class="gm-person-title"><strong>${esc(title)}</strong><span class="gm-count">${(person.impressions || []).length} 条</span></div>
         <div class="gm-sub">${esc(subtitle)}</div>
       </button>`;
-    }).join('');
+    }).join(''));
+    // 只有真的重画了才重挂监听：内容没变时 DOM 是原样复用的，再 addEventListener 会让 15s
+    // 轮询把监听叠成多份——点一次等于点 N 次（2026-10-10 审查 P1；写法与 ui/pages/features.js 一致）。
+    if (!rendered) return;
     box.querySelectorAll('[data-gm-key]').forEach((button) => {
       button.addEventListener('click', () => {
         selectedKey = button.dataset.gmKey || '';
@@ -204,7 +229,7 @@ import { saveMemberNote } from './pages/memory.js';
     if (!box) return;
     const person = people.find((item) => item.key === selectedKey);
     if (!person) {
-      box.innerHTML = '<div class="empty-hint">← 选择人物查看全局长期记忆</div>';
+      setHtmlIfChanged(box, '<div class="empty-hint">← 选择人物查看全局长期记忆</div>');
       return;
     }
 
@@ -235,16 +260,16 @@ import { saveMemberNote } from './pages/memory.js';
     // 15 秒轮询会重建整块详情：不保留草稿的话，正在输入的字会被擦掉
     const noteValue = noteKey && noteDraft.key === noteKey ? noteDraft.value : savedNote;
     const noteHtml = noteKey ? `
-      <div class="gm-section"><h3>备注</h3>
+      <div class="gm-section"><h3>备注（称呼/代号）</h3>
         <div class="gm-note-field">
           <input type="text" id="gm-note-input" maxlength="200" value="${esc(noteValue)}" placeholder="留空 = 不设备注（如 老王）" />
           <button class="btn btn-small" type="button" id="gm-note-save">保存备注</button>
           <span class="gm-status" id="gm-note-status"></span>
         </div>
-        <div class="gm-status">备注用于聊天记录、记忆与提示词里的称呼（与“会话记忆”页共用同一份数据）。</div>
+        <div class="gm-status">备注用于聊天记录、记忆与提示词里的称呼（与“会话记忆”页共用同一份数据）；在群里让机器人"以后叫他 X"，它记的也是这一份。</div>
       </div>` : '';
 
-    box.innerHTML = `
+    const rendered = setHtmlIfChanged(box, `
       <div class="detail-header">
         <h2>${esc(person.name || person.userId || '未知人物')}</h2>
         <div class="sub">${person.userId ? `QQ ${esc(person.userId)} · ` : ''}${memories.length} 条全局长期印象</div>
@@ -260,7 +285,9 @@ import { saveMemberNote } from './pages/memory.js';
       </div>
       ${noteHtml}
       <div class="gm-section"><h3>来源会话</h3><div>${sourceHtml}</div></div>
-      <div class="gm-section"><h3>长期印象</h3>${memoryHtml}</div>`;
+      <div class="gm-section"><h3>长期印象</h3>${memoryHtml}</div>`);
+    // 同 renderList：内容没变就别重挂监听（备注保存/整理/删除点一次会变成 N 次）。
+    if (!rendered) return;
 
     const status = box.querySelector('#gm-action-status');
     const noteInput = box.querySelector('#gm-note-input');
@@ -316,7 +343,11 @@ import { saveMemberNote } from './pages/memory.js';
     if (!ui) return;
     const seq = ++loadSeq;
     if (force || !people.length) {
-      ui.items.innerHTML = '<div class="gm-empty">正在读取全局人物记忆…</div>';
+      // 占位符必须走 setBoxError：它会把 __renderedHtml 清掉。直接写 innerHTML 的话，
+      // 强制刷新时数据若没变，setHtmlIfChanged 会判成"没变化"跳过重画 —— 占位符就永远
+      // 留在列表里（点「刷新」后卡在"正在读取…"，只有 F5 能救；dom-util 的注释里写过
+      // 同一个坑，2026-10-12 复审）。
+      setBoxError(ui.items, '<div class="gm-empty">正在读取全局人物记忆…</div>');
     }
     try {
       const next = await fetchPeople();
@@ -327,7 +358,7 @@ import { saveMemberNote } from './pages/memory.js';
       renderDetail();
     } catch (error) {
       if (seq !== loadSeq) return;
-      ui.items.innerHTML = `<div class="gm-empty">加载失败：${esc(error?.message || error)}</div>`;
+      setBoxError(ui.items, `<div class="gm-empty">加载失败：${esc(error?.message || error)}</div>`);
     }
   }
 
@@ -336,6 +367,49 @@ import { saveMemberNote } from './pages/memory.js';
     if (!view?.classList.contains('active')) return;
     loadGlobalMemory(false);
   }
+
+  async function searchMemory() {
+    const input = document.getElementById('gm-search-query');
+    const box = document.getElementById('gm-search-results');
+    const button = document.getElementById('gm-search-btn');
+    if (!input || !box || !button) return;
+    const query = String(input.value || '').trim();
+    if (!query) {
+      box.innerHTML = '<div class="gm-empty">输入关键词或短句再搜索。</div>';
+      return;
+    }
+    const person = people.find((item) => item.key === selectedKey);
+    const chatKey = person ? sourceFor(person) : '';
+    button.disabled = true;
+    box.innerHTML = '<div class="gm-empty">正在检索…</div>';
+    try {
+      const params = new URLSearchParams({ query, limit: '8' });
+      if (chatKey) params.set('chatKey', chatKey);
+      const result = await api(`/api/memory/search?${params}`);
+      const rows = Array.isArray(result?.results) ? result.results : [];
+      box.innerHTML = rows.length ? rows.map((entry) => `
+        <div class="gm-search-result">
+          <strong>${esc(entry.target || entry.userId || '某人')}</strong>
+          <p>${esc(entry.content || '')}</p>
+          <small>${esc(fmtTime(entry.lastObservedAt || entry.createdAt))} · 相关度 ${Number(entry.score || 0).toFixed(2)}${entry.origin === 'manual' ? ' · 手写' : ''}</small>
+        </div>`).join('') : '<div class="gm-empty">没有找到相关记忆；换一个更具体的关键词/人名再试。</div>';
+    } catch (error) {
+      box.innerHTML = `<div class="gm-empty">检索失败：${esc(error?.message || error)}</div>`;
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  document.getElementById('gm-search-btn')?.addEventListener('click', searchMemory);
+  document.getElementById('gm-search-query')?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') { event.preventDefault(); void searchMemory(); }
+  });
+  document.getElementById('gm-search-clear')?.addEventListener('click', () => {
+    const input = document.getElementById('gm-search-query');
+    const box = document.getElementById('gm-search-results');
+    if (input) input.value = '';
+    if (box) box.innerHTML = '';
+  });
 
   document.getElementById('gm-refresh')?.addEventListener('click', () => loadGlobalMemory(true));
 
@@ -353,10 +427,21 @@ import { saveMemberNote } from './pages/memory.js';
     button.disabled = true;
     if (status) status.textContent = '保存中…';
     try {
-      await saveMemberNote(qq, note);
+      // hadNote 用 saveMemberNote 的返回值：它内部在写入**之前**重取过服务端现值；
+      // 这里自己读 state.config 可能是过期缓存（群里刚 set_member_note 改过、或启动时没加载成功）。
+      const result = await saveMemberNote(qq, note);
       const input = document.getElementById('gm-anynote-text');
       if (input) input.value = '';
-      if (status) status.textContent = note ? `已保存：${qq}` : `已删除：${qq}`;
+      // 备注（memberNotes）与长期印象是两回事：设备注不会让人进上面的名单（名单只列有印象的人）。
+      // 不分开说的话，给"还没有印象"的人设完备注看起来像操作没生效（2026-10-13 反馈）。
+      // 只断言按 QQ 能确定的事：名单里有没有这个 QQ。名单里可能有按名字存的旧条目（没有 QQ，
+      // 那是另一个人），说"不在名单里"不算错，但也别据此断言"他没有长期印象"。
+      const inRoster = people.some((person) => String(person.userId || '') === qq);
+      if (status) {
+        status.textContent = note
+          ? (inRoster ? `已保存：${qq}` : `备注已保存：${qq}（上面的名单里没有这个 QQ —— 有长期印象的人按 QQ 列出）`)
+          : (result?.hadNote ? `已删除：${qq}` : `本来就没有备注：${qq}`);
+      }
       await loadGlobalMemory(true);   // 名单里有这个人的话，详情里的备注行也要跟着更新
     } catch (error) {
       if (status) status.textContent = `保存失败：${error?.message || error}`;
@@ -364,6 +449,96 @@ import { saveMemberNote } from './pages/memory.js';
       button.disabled = false;
     }
   });
+  // ── 新建人物印象 ────────────────────────────────────────────────────────
+  //  长期印象按 QQ 全局存，但每条都要挂在某个来源会话上（存储层就是这么建的），所以这里
+  //  必须让用户选一个来源会话。名单只列"有印象的人"，还没有印象的人从这儿补 —— 控制台
+  //  别处没有可用的建印象入口（会话记忆页那两个按钮按上游设计被 CSS 隐藏了）。
+  const chatLabel = (key) => {
+    const [kind, id] = String(key).split(':');
+    return kind === 'private' ? `私聊 ${id}` : `群 ${id}`;
+  };
+  async function fillNewImpressionChats() {
+    const select = document.getElementById('gm-newimp-chat');
+    if (!select || select.dataset.filled === '1') return;
+    let cfg = state.config;
+    if (!cfg?.allow) { try { cfg = await api('/api/config'); } catch { cfg = cfg || null; } }
+    const keys = [
+      ...((cfg?.allow?.groups || []).map((id) => `group:${String(id)}`)),
+      ...((cfg?.allow?.private || []).map((id) => `private:${String(id)}`))
+    ];
+    if (!keys.length) {
+      // 配置还没读到（或白名单本来就空）时**不**钉 filled：配置恢复后再展开要能重填。
+      select.innerHTML = '<option value="">（还没读到白名单会话）</option>';
+      return;
+    }
+    select.innerHTML = keys.map((key) => `<option value="${esc(key)}">${esc(chatLabel(key))}</option>`).join('');
+    select.dataset.filled = '1';
+  }
+
+  const newImpressionDetails = document.getElementById('gm-newimp');
+  newImpressionDetails?.addEventListener('toggle', (event) => {
+    if (event.target?.open) fillNewImpressionChats();
+  });
+  // Firefox 会把 <details> 的展开态带过刷新：首次渲染就已经展开时不会再触发 toggle，
+  // 不补这一下下拉就是空的（点保存只会得到"先选一个来源会话"）。
+  if (newImpressionDetails?.open) fillNewImpressionChats();
+
+  document.getElementById('gm-newimp-save')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    const status = document.getElementById('gm-newimp-status');
+    const qq = String(document.getElementById('gm-newimp-qq')?.value || '').trim();
+    const chatKey = String(document.getElementById('gm-newimp-chat')?.value || '').trim();
+    const lines = String(document.getElementById('gm-newimp-text')?.value || '')
+      .split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    if (!/^\d{1,15}$/.test(qq)) { if (status) status.textContent = 'QQ 号要填纯数字'; return; }
+    if (!/^(group|private):\d+$/.test(chatKey)) { if (status) status.textContent = '先选一个来源会话'; return; }
+    if (!lines.length) { if (status) status.textContent = '印象内容不能为空（一行一条）'; return; }
+    button.disabled = true;
+    if (status) status.textContent = '保存中…';
+    try {
+      // 备注必须带上**服务端现值**：这条写入内部会调 setMemberNote，空串是"删除备注"语义。
+      // state.config 可能过期（群里刚让机器人改过称呼），所以这里自己重取一次；取不到就中止 ——
+      // 宁可这次不写，也不能拿空串去删掉别人的备注。
+      const cfgNow = await api('/api/config').catch(() => null);
+      if (!cfgNow) {
+        if (status) status.textContent = '读取当前备注失败，已中止（避免误删备注）';
+        return;
+      }
+      const note = String(cfgNow?.memberNotes?.[qq] || '');
+      // 这条接口是"整体替换"语义，基线必须取**服务端此刻**的印象 —— 不能只信页面上那份名单：
+      // 用户填表这几秒里，机器人（memory_append）或自动整理都可能刚写进新印象，拿缓存的名单当基线
+      // 会把那条静默删掉，页面还回报"已保存"。与 orchestrator 写回前重读现值是同一口径。
+      // 详情接口给的是**该人物的全局印象**（members(chatKey) 返回的是整份成员，不只是本会话的来源）。
+      const detail = await api(`/api/memory-files/${chatKey.replace(':', '_')}`).catch(() => null);
+      const serverNow = (Array.isArray(detail?.members) ? detail.members : [])
+        .find((member) => String(member.userId || '') === qq);
+      // 读不到就退回页面缓存那份（比一条都不带强，也与改动前一致）
+      const base = serverNow ? serverNow.impressions
+        : people.find((person) => String(person.userId || '') === qq)?.impressions;
+      const known = (base || []).map((entry) => String(entry?.content || '').trim()).filter(Boolean);
+      const merged = [...new Set([...known, ...lines])];
+      const result = await api(`/api/memory-files/${chatKey.replace(':', '_')}/members/${qq}`, {
+        method: 'PUT',
+        body: JSON.stringify({ name: '', note, impressions: merged })
+      });
+      // 服务端会截到上限（每位默认最多 50 条）且**截的是尾部**（新加的行排在最后）：不回读就会
+      // "输入框清空了 + 提示已保存"，用户以为写进去了（2026-10-14 复审 P2）。
+      const kept = Array.isArray(result?.member?.impressions) ? result.member.impressions.length : merged.length;
+      if (kept < merged.length) {
+        if (status) status.textContent = `只写进去 ${kept} 条（服务端上限 50 条）：这次要加的排在末尾被截掉了，先删几条旧的再试；输入框里还留着`;
+        return;
+      }
+      if (status) status.textContent = `已保存：${qq}（来源 ${chatKey}）`;
+      const input = document.getElementById('gm-newimp-text');
+      if (input) input.value = '';
+      await loadGlobalMemory(true);
+    } catch (error) {
+      if (status) status.textContent = `保存失败：${error?.message || error}`;
+    } finally {
+      button.disabled = false;
+    }
+  });
+
   document.querySelector('[data-tab="people-memory"]')?.addEventListener('click', () => {
     // app.js 的通用 tab handler 先完成视图切换；随后刷新人物全局视图。
     setTimeout(() => loadGlobalMemory(true), 0);

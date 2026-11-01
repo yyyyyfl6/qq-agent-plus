@@ -1,8 +1,25 @@
+import { readJsonBounded } from '../core/http-body.js';
+
+/**
+ * 服务端探测协议端 WebUI 用的地址。
+ *
+ * 与 SNOWLUMA_WEBUI_URL 分开：后者是给**宿主机浏览器**的链接（容器部署时是
+ * 127.0.0.1:5099），而容器内的 Agent 要探的是 compose 网络里的 snowluma:5099。
+ * 两者混用会造成"控制台显示协议端离线，但浏览器能打开"的假故障。
+ */
+export function snowlumaApiBase(env = process.env) {
+  return String(
+    env.SNOWLUMA_INTERNAL_URL
+    || env.SNOWLUMA_WEBUI_URL
+    || 'http://127.0.0.1:5099'
+  ).replace(/\/+$/, '');
+}
+
 // Linux 全栈部署的 SnowLuma / noVNC 端口是 5099 / 6081，上游旧默认值 15099 / 16081 会导致状态误报
 const DEFAULT_ENDPOINTS = Object.freeze({
   dsh: process.env.DSH_URL || 'http://127.0.0.1:3080/',
   bridge: process.env.BRIDGE_URL || 'http://127.0.0.1:3100/api/status',
-  snowluma: `${String(process.env.SNOWLUMA_WEBUI_URL || 'http://127.0.0.1:5099').replace(/\/+$/, '')}/api/ui/public`,
+  snowluma: `${snowlumaApiBase()}/api/ui/public`,
   novnc: process.env.QQ_AGENT_NOVNC_URL || 'http://127.0.0.1:6081/'
 });
 
@@ -22,10 +39,13 @@ function legacyFlags(id, endpoints) {
 export const SNOWLUMA_WEBUI_URL = String(
   process.env.SNOWLUMA_WEBUI_URL || 'http://127.0.0.1:5099'
 ).replace(/\/+$/, '');
+// 服务端调用（状态探测、改密钥）走这个；没有单独配置时与浏览器链接同源。
+export const SNOWLUMA_API_URL = snowlumaApiBase();
 
 async function responseJson(response) {
   try {
-    return await response.json();
+    // 有界读（1MB）：集成端点响应本应很小，超限按解析失败处理（2026-10-09 审查）
+    return await readJsonBounded(response, 1024 * 1024);
   } catch {
     return {};
   }
@@ -74,7 +94,7 @@ export async function updateSnowLumaPassword({
   newPassword,
   confirmPassword,
   fetchFn = fetch,
-  baseUrl = SNOWLUMA_WEBUI_URL
+  baseUrl = SNOWLUMA_API_URL
 }) {
   const current = String(currentPassword ?? '');
   const next = String(newPassword ?? '');

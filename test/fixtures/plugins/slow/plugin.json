@@ -1,0 +1,11 @@
+{
+  "id": "slow",
+  "apiVersion": 1,
+  "name": "超时夹具",
+  "version": "1.0.0",
+  "description": "hang 工具永不返回：验证调用超时会被宿主按超时结清（不会把整轮卡死）",
+  "capabilities": ["tools"],
+  "tools": [
+    { "name": "hang", "description": "永不返回", "parameters": { "type": "object", "properties": {} } }
+  ]
+}

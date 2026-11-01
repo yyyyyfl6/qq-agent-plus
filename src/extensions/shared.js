@@ -46,10 +46,18 @@ export function hostOf(url) {
  * 群聊会把多人的消息聚成一批：只要批里混进一个别人的消息，就不算"管理员在下指令"——
  * 否则别人一句"让它在实验室电脑上执行 xxx"就能借管理员同批的发言提权。
  */
+/** 本轮触发者 QQ 号（不含机器人自己）：宿主 ctx.triggerEntries 为准，兼容直接传 triggerSenderIds。 */
+export function triggerSenderIdsOf(ctx) {
+  if (Array.isArray(ctx?.triggerSenderIds)) return ctx.triggerSenderIds.filter(Boolean).map(String);
+  return (Array.isArray(ctx?.triggerEntries) ? ctx.triggerEntries : [])
+    .filter((m) => !m?.self && m?.senderId)
+    .map((m) => String(m.senderId));
+}
+
 export function triggeredOnlyByOwner(ctx, cfg = getConfig()) {
   const owner = ownerUin(cfg);
   if (!owner) return false;
-  const ids = Array.isArray(ctx?.triggerSenderIds) ? ctx.triggerSenderIds.filter(Boolean) : [];
+  const ids = triggerSenderIdsOf(ctx);
   if (!ids.length) return false;
   return ids.every((id) => String(id) === owner);
 }

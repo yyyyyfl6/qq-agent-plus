@@ -193,7 +193,14 @@ test('删除本机转写：只删托管目录，配置里指向别处的文件�
   fs.writeFileSync(outside, 'mine');
   await request('/api/config', { method: 'POST', body: { asr: { localModel: outside } } });
 
-  const removed = await request('/api/asr/uninstall', { method: 'POST' });
+  // 不可逆删除（约 500MB 模型+构建产物）必须显式 confirm：不带 confirm 的请求一律 409，
+  // 托管目录原地保留（2026-10-07 复审 P3；此前唯一防线是前端对话框）。
+  const noConfirm = await request('/api/asr/uninstall', { method: 'POST' });
+  assert.equal(noConfirm.status, 409, '不带 confirm 必须拒绝');
+  assert.match(noConfirm.body.error, /显式确认/);
+  assert.equal(fs.existsSync(managed), true, '被拒绝的删除不许动任何文件');
+
+  const removed = await request('/api/asr/uninstall', { method: 'POST', body: { confirm: true } });
   assert.equal(removed.status, 200);
   assert.equal(fs.existsSync(managed), false, '托管目录应被删掉');
   assert.equal(fs.existsSync(outside), true, '托管目录外的文件不能删');
@@ -232,12 +239,16 @@ test('安装进行中不许删除（会被构建写回去，白白浪费一次�
     fs.rmSync(slow, { force: true });
   });
   await app.start();
-  const post = async (route) => {
-    const response = await fetch(`http://127.0.0.1:${port}${route}`, { method: 'POST' });
+  const post = async (route, body) => {
+    const response = await fetch(`http://127.0.0.1:${port}${route}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body)
+    });
     return { status: response.status, body: await response.json() };
   };
   assert.equal((await post('/api/asr/install')).status, 202);
-  const refused = await post('/api/asr/uninstall');
+  const refused = await post('/api/asr/uninstall', { confirm: true });
   assert.equal(refused.status, 409);
   assert.match(refused.body.error, /安装还在进行中/);
 });

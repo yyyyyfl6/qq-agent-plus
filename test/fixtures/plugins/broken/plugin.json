@@ -1,0 +1,11 @@
+{
+  "id": "broken",
+  "apiVersion": 99,
+  "name": "坏 manifest 夹具",
+  "version": "1.0.0",
+  "description": "apiVersion 不匹配：必须被拒载并给出可读原因",
+  "capabilities": ["tools"],
+  "tools": [
+    { "name": "whatever", "description": "不该有机会被调用", "parameters": { "type": "object", "properties": {} } }
+  ]
+}

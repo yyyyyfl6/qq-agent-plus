@@ -1085,15 +1085,22 @@ export const UNKNOWN_VENDOR = '未知渠道';
 export function vendorOfConfig(cfg) {
   const c = cfg || {};
   const api = c.api || {};
-  const base = String(api.baseUrl || '').trim();
+  const provs = Array.isArray(c.providers) ? c.providers : [];
+  const byId = api.provider ? provs.find((p) => p && p.id === api.provider) : null;
+  if (byId && byId.displayName) return String(byId.displayName);
+  return vendorOfBaseUrl(c, api.baseUrl);
+}
+
+/** 指定端点的渠道身份：优先 providers 里按 baseURL 匹配到的 displayName，回落 URL host。
+ * 兜底模型接管后请求实际发往 api.fallback.baseUrl，记账要按这个端点归属渠道 ——
+ * 不能拿当前主配置倒推（vendorOfConfig 注释同款约定："历史会话用它自己记录的 vendor"）。 */
+export function vendorOfBaseUrl(cfg, baseUrl) {
+  const c = cfg || {};
+  const base = String(baseUrl || '').trim();
   const provs = Array.isArray(c.providers) ? c.providers : [];
   const norm = (u) => String(u || '').replace(/\/+$/, '');
-
-  const byId = api.provider ? provs.find((p) => p && p.id === api.provider) : null;
   const byUrl = base ? provs.find((p) => p && p.baseURL && norm(p.baseURL) === norm(base)) : null;
-  const hit = byId || byUrl;
-  if (hit && hit.displayName) return String(hit.displayName);
-
+  if (byUrl && byUrl.displayName) return String(byUrl.displayName);
   if (base) {
     try { return new URL(base).host; } catch { /* 非法 URL */ }
   }

@@ -2,6 +2,7 @@
 // 单独一个文件是为了让 tts.js 与 tts-doubao.js 都能直接 import —— 之前把它当参数传进适配器，
 // 会被 ops scan 当成"未定义调用点"误报（和插件里的 rng 同一类）。
 import { watchTimeWindow } from '../core/time-gate.js';
+import { readTextBounded } from '../core/http-body.js';
 
 export const DEFAULT_TIMEOUT_MS = 30000;
 
@@ -21,7 +22,8 @@ export async function callJson(fetchFn, url, { method = 'POST', headers = {}, bo
       body: JSON.stringify(body),
       signal: controller.signal
     });
-    const text = await res.text();
+    // 有界读：TTS 网关的 JSON 响应正常远小于 1MB，超限视为上游异常并中断（2026-10-09 审查）
+    const text = await readTextBounded(res, 1024 * 1024);
     let parsed = null;
     try { parsed = JSON.parse(text); } catch { /* 下面按原文报错 */ }
     return { ok: res.ok, status: res.status, parsed, text };

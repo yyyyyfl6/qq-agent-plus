@@ -4,22 +4,46 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 
 const { runHealthCheck } = await import('../src/core/health-check.js');
 const { openDatabase } = await import('../src/core/sqlite.js');
 const { readOwnerUin } = await import('../src/core/notify-owner.js');
+const { todayKey } = await import('../src/core/util.js');
 
-function makeDataDir({ withDb = true, withUpdaterState = false, withMarker = false, outboundAgoMs = 0, inboundAgoMs = 0, inboundState = 'pending', inboundAvailableInMs = null, runtimePaused = false, budgetDegraded = false, extraInbound = null } = {}) {
+// docker-socket 探针会读真实 /var/run/docker.sock，而本文件多条用例断言的是"全绿 / healthy"。
+// 2026-10-10 实测（issue #30）：更新器的部署前门禁跑在加固 unit 里，若该单元继承的用户管理器
+// 没有 docker 组，套接字必然不可访问、sudo 回退又必被 NoNewPrivileges 挡死，本文件恰好 3 条
+// 用例必红、门禁拒绝升级 —— 而 CI / 开发机的测试进程都在 docker 组里，这个机器环境依赖一直
+// 不可见。这里统一把 DOCKER_HOST 指向自建的可读假套接字，让本文件与机器环境解耦；
+// "不可访问 → 报红"的真实失败路径由下面那条专用用例（000 权限套接字 + 注入 NNP 状态）覆盖。
+const dockerSockDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-health-sock-'));
+const dockerSock = path.join(dockerSockDir, 'docker.sock');
+fs.writeFileSync(dockerSock, '');
+process.env.DOCKER_HOST = `unix://${dockerSock}`;
+after(() => fs.rmSync(dockerSockDir, { recursive: true, force: true }));
+
+// 每个用例的数据目录都记下来，整文件跑完统一清：在此之前这些目录是**只建不删**的，
+// 单跑这个文件多跑几次就会在系统临时目录里堆一地 qq-health-*（本仓的测试套件只在整轮结束时
+// 兜底扫一遍，单跑没有那道网；2026-10-16 连续单跑时数出 87 个）
+const madeDataDirs = [];
+after(() => {
+  for (const dir of madeDataDirs) {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 句柄占用就算了 */ }
+  }
+});
+
+function makeDataDir({ withDb = true, withUpdaterState = false, withMarker = false, outboundAgoMs = 0, inboundAgoMs = 0, inboundState = 'pending', inboundAvailableInMs = null, runtimePaused = false, budgetDegraded = false, budgetPolicy = 'degrade', extraInbound = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-health-'));
+  madeDataDirs.push(dir);
   if (runtimePaused || budgetDegraded) {
     fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({
       runtime: { mode: 'active', paused: runtimePaused },
-      api: { budget: budgetDegraded ? { enabled: true, dailyYuan: 1, onExceed: 'degrade' } : {} }
+      api: { budget: budgetDegraded ? { enabled: true, dailyYuan: 1, onExceed: budgetPolicy } : {} }
     }));
   }
   if (budgetDegraded) {
-    fs.writeFileSync(path.join(dir, 'usage-today.json'), JSON.stringify({ dayKey: 'test', estimatedYuan: 2, unpricedRuns: 0 }));
+    fs.writeFileSync(path.join(dir, 'usage-today.json'), JSON.stringify({ dayKey: todayKey(), estimatedYuan: 2, unpricedRuns: 0 }));
   }
   if (withDb) {
     const db = openDatabase(path.join(dir, 'messages.sqlite'));
@@ -61,6 +85,71 @@ const okFetch = async () => ({ ok: true, status: 200, json: async () => ({ statu
 const badFetch = async () => { throw new Error('ECONNREFUSED'); };
 const okStatfs = () => ({ bavail: 100, bsize: 1024 * 1024 * 1024 });          // 100GB
 const lowStatfs = () => ({ bavail: 0.2, bsize: 1024 * 1024 * 1024 });          // 0.2GB
+
+test('docker-socket：主进程被 NNP 加固时报红并指向修法，不再拿巡检的 sudo 当证据', async (t) => {
+  // 2026-10-09 审查：巡检 unit 没有 NNP，而控制台主 unit 有（标准部署）—— 旧逻辑会让
+  // "巡检进程能 sudo" 被当成"更新会走回退"，用户点按钮照样失败，是一条永不过期的假绿。
+  if (process.platform === 'win32') return t.skip('需要 POSIX 权限位造 EACCES（Windows 无法复现）');
+  if (process.getuid?.() === 0) return t.skip('root 无视权限位，造不出 EACCES');
+  const dir = makeDataDir({});
+  const sock = path.join(dir, 'fake-docker.sock');
+  fs.writeFileSync(sock, '');
+  fs.chmodSync(sock, 0o000);
+  const prevHost = process.env.DOCKER_HOST;
+  process.env.DOCKER_HOST = `unix://${sock}`;
+  try {
+    const r = await runHealthCheck({
+      dataDir: dir, fetchImpl: okFetch, statfs: okStatfs, notify: null,
+      service: 'qq-agent-linux.service', noNewPrivsStatus: true
+    });
+    const item = r.checks.find((c) => c.name === 'docker-socket');
+    assert.ok(item, '巡检必须包含 docker-socket 一项');
+    assert.equal(item.ok, false, '主进程加固且直连不可用 → 报红（旧行为在这里出假绿）');
+    assert.match(String(item.detail), /NoNewPrivileges/);
+  } finally {
+    if (prevHost === undefined) delete process.env.DOCKER_HOST;
+    else process.env.DOCKER_HOST = prevHost;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('docker-socket：主进程未加固且 sudo -n docker 可用 → 报"走回退"而不是红（防永不过期误报）', async (t) => {
+  // health-check 里"直连不可用但 sudo 回退可用 → 报绿"那一支是防误报的防线：报红会每 5 分钟
+  // 失败一次、连击 3 次通知 owner，而条件不会自愈（也不会有"已恢复"）。加了可注入的
+  // sudoDockerProbe 之后这条分支才有确定性覆盖 —— 此前只在"无 docker 组 + 未加固 + 免密
+  // sudo"的真实机器上被偶然走到，文件级 DOCKER_HOST 解耦后就再也碰不到了（2026-10-10 审查）。
+  if (process.platform === 'win32') return t.skip('需要 POSIX 权限位造 EACCES（Windows 无法复现）');
+  if (process.getuid?.() === 0) return t.skip('root 无视权限位，造不出 EACCES');
+  const prevHost = process.env.DOCKER_HOST;
+  try {
+    const run = async (sudoOk) => {
+      const dir = makeDataDir({});
+      const sock = path.join(dir, 'fake-docker.sock');
+      fs.writeFileSync(sock, '');
+      fs.chmodSync(sock, 0o000);
+      process.env.DOCKER_HOST = `unix://${sock}`;
+      try {
+        const r = await runHealthCheck({
+          dataDir: dir, fetchImpl: okFetch, statfs: okStatfs, notify: null,
+          service: 'qq-agent-linux.service', noNewPrivsStatus: false,
+          sudoDockerProbe: () => sudoOk
+        });
+        return r.checks.find((c) => c.name === 'docker-socket');
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    };
+    const fallback = await run(true);
+    assert.equal(fallback.ok, true, '有可用的 sudo 回退就不能报红（否则是永不过期的误报）');
+    assert.match(String(fallback.detail), /回退/);
+    const none = await run(false);
+    assert.equal(none.ok, false, '直连与回退都不可用才是真故障');
+    assert.match(String(none.detail), /回退都不可用/);
+  } finally {
+    if (prevHost === undefined) delete process.env.DOCKER_HOST;
+    else process.env.DOCKER_HOST = prevHost;
+  }
+});
 
 test('全绿：控件/OneBot/水位/磁盘/完整性都过 → healthy，退出码 0', async () => {
   const dir = makeDataDir();
@@ -327,6 +416,11 @@ test('通知一直失败：记下 notifyError，且不谎报在 notified 里', a
 test('health.json 落盘含 streaks 与最后结果，权限 0600', async () => {
   const dir = makeDataDir();
   await runHealthCheck({ dataDir: dir, fetchImpl: okFetch, statfs: okStatfs, notify: null });
+  // 标题里的 0600 得真判一次：这是"部署机上别人读不到巡检状态"的那条属性。
+  // Windows 的 statSync().mode 没有 POSIX 权限语义，所以只在类 Unix 上断言（CI 是 Linux）。
+  if (process.platform !== 'win32') {
+    assert.equal(fs.statSync(path.join(dir, 'health.json')).mode & 0o777, 0o600, 'health.json 应当是 0600');
+  }
   const state = JSON.parse(fs.readFileSync(path.join(dir, 'health.json'), 'utf8'));
   assert.equal(typeof state.lastRunAt, 'number');
   assert.ok(Array.isArray(state.lastResults));
@@ -374,9 +468,108 @@ test('巡检：探测带超时，挂死的服务拖不住整轮', async () => {
     );
     assert.match(check.detail, /abort/i, `${name} 的失败原因应是被中止：${check.detail}`);
   }
-  // 两个探测各 60ms 上限；放宽到 1 秒只为避开 CI 抖动，仍然远小于 undici 的默认上限
-  assert.ok(elapsed < 1000, `整轮巡检不该被挂死服务拖住，实测 ${elapsed}ms`);
+  // 两个探测各 60ms 上限；上限放到 5 秒只为避开部署机/满载 CI 的调度抖动，
+  // 仍然远小于 undici 的默认上限，也足以抓住"被挂死服务拖住"的回归。
+  assert.ok(elapsed < 5000, `整轮巡检不该被挂死服务拖住，实测 ${elapsed}ms`);
   assert.equal(r.healthy, false);
   assert.equal(r.code, 1);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('预算策略 block 时同样豁免"到期未处理"（保留未读是设计使然，不该误报停滞）', async () => {
+  // 2026-10-08 二轮审查：只豁免 degrade 时，把超限策略设成 block 的用户每天都会收到一条
+  // "收发链路可能停滞"的误报 —— block 的语义就是"今天不处理、消息留到明天"。
+  const blocked = makeDataDir({
+    outboundAgoMs: 7 * 60 * 60 * 1000, inboundAgoMs: 70 * 60 * 1000, budgetDegraded: true, budgetPolicy: 'block'
+  });
+  const blockedRun = await runHealthCheck({
+    dataDir: blocked, fetchImpl: okFetch, statfs: okStatfs, notify: null,
+    outboundStaleMs: 6 * 60 * 60 * 1000
+  });
+  const blockedItem = blockedRun.checks.find((c) => c.name === 'outbound-freshness');
+  assert.equal(blockedItem.ok, true, `block 策略下不该报停滞：${blockedItem.detail}`);
+  assert.match(blockedItem.detail, /预算/);
+
+  // 反向：没有超预算时，同样的"到期未处理"必须照报（豁免不能变成"一律放行"）
+  const normal = makeDataDir({ outboundAgoMs: 7 * 60 * 60 * 1000, inboundAgoMs: 70 * 60 * 1000 });
+  const normalRun = await runHealthCheck({
+    dataDir: normal, fetchImpl: okFetch, statfs: okStatfs, notify: null,
+    outboundStaleMs: 6 * 60 * 60 * 1000
+  });
+  assert.equal(normalRun.checks.find((c) => c.name === 'outbound-freshness').ok, false);
+});
+
+test('预算豁免只认"今天"的用量文件：昨天的超限不豁免今天的停滞告警（2026-10-13 审查）', async () => {
+  // 昨天超限（degrade）后、今天第一笔会话还没把 usage-today.json 重写之前，旧实现会拿昨天
+  // 那份继续豁免 —— 真正的管道停滞被静默一整天（文件不重写 ⇒ 豁免自我延续）。
+  const dir = makeDataDir({ outboundAgoMs: 7 * 60 * 60 * 1000, inboundAgoMs: 70 * 60 * 1000 });
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  const yKey = `${yesterday.getFullYear()}-${pad(yesterday.getMonth() + 1)}-${pad(yesterday.getDate())}`;
+  fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({
+    runtime: { mode: 'active', paused: false },
+    api: { budget: { enabled: true, dailyYuan: 1, onExceed: 'degrade' } }
+  }));
+  fs.writeFileSync(path.join(dir, 'usage-today.json'), JSON.stringify({ dayKey: yKey, estimatedYuan: 2, unpricedRuns: 0 }));
+  const r = await runHealthCheck({ dataDir: dir, fetchImpl: okFetch, statfs: okStatfs, notify: null, outboundStaleMs: 6 * 60 * 60 * 1000 });
+  const item = r.checks.find((c) => c.name === 'outbound-freshness');
+  assert.equal(item.ok, false, `昨天的用量文件不该豁免今天的停滞告警：${item.detail}`);
+  assert.doesNotMatch(item.detail, /预算/, '这条不是"预算豁免"分支');
+});
+
+// 插件（v1）：巡检是**独立进程**，拿不到运行中注册表的状态 —— 它只查磁盘与配置：
+// 装了几个、授权几个、manifest 是否合法、这台机器能不能隔离。这条用例钉住其中三态。
+test('插件：总开关关着跳过；开着且 manifest 合法为绿；manifest 坏掉要报红并点名', async () => {
+  const dir = makeDataDir({});
+  const writeCfg = (plugins) => fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({ plugins }));
+  const writeManifest = (body) => {
+    fs.mkdirSync(path.join(dir, 'plugins', 'demo'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'plugins', 'demo', 'plugin.json'), JSON.stringify(body));
+  };
+  const run = () => runHealthCheck({ dataDir: dir, fetchImpl: okFetch, statfs: okStatfs, notify: null });
+  const itemOf = (result) => result.checks.find((c) => c.name === 'plugins');
+
+  writeCfg({ enabled: false });
+  writeManifest({ id: 'demo', apiVersion: 1, name: '演示', version: '1.0.0', capabilities: ['tools'] });
+  const off = itemOf(await run());
+  assert.equal(off.ok, true, off.detail);
+  assert.match(off.detail, /总开关关着/);
+
+  writeCfg({ enabled: true, enabledIds: ['demo'], settings: {} });
+  const good = itemOf(await run());
+  assert.equal(good.ok, true, good.detail);
+  assert.match(good.detail, /已装 1 个，授权 1 个/);
+
+  // 升级留下的 .backup-* 里有 plugin.json 且目录名与 id 不符 —— 它不该让巡检报红
+  fs.mkdirSync(path.join(dir, 'plugins', '.backup-demo-123'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'plugins', '.backup-demo-123', 'plugin.json'), JSON.stringify({
+    id: 'demo', apiVersion: 1, name: '旧版', version: '0.9.0', capabilities: ['tools']
+  }));
+  const withBackup = itemOf(await run());
+  assert.equal(withBackup.ok, true, withBackup.detail);
+  assert.match(withBackup.detail, /已装 1 个/, '内部目录不该被算成一个插件');
+
+  writeManifest({ id: 'demo', apiVersion: 99, name: '演示', version: '1.0.0', capabilities: ['tools'] });
+  const bad = itemOf(await run());
+  assert.equal(bad.ok, false, 'manifest 不合法必须报出来（宿主会拒载，巡检不能装作没事）');
+  assert.match(bad.detail, /apiVersion 不匹配/);
+  assert.match(bad.detail, /demo/);
+});
+
+test('控制台交互体检：persist=false 不写 health.json，integrityCheck=false 跳过全库扫描', async () => {
+  const dir = makeDataDir({ withDb: true });
+  const healthFile = path.join(dir, 'health.json');
+  assert.equal(fs.existsSync(healthFile), false, '前置条件：临时目录里没有 health.json');
+  const r = await runHealthCheck({
+    dataDir: dir,
+    fetchImpl: okFetch,
+    statfs: okStatfs,
+    notify: null,
+    persist: false,
+    integrityCheck: false,
+    sudoDockerProbe: () => false
+  });
+  assert.equal(fs.existsSync(healthFile), false, '交互体检不能覆盖定时巡检的连击状态');
+  assert.equal(r.checks.some((c) => c.name === 'sqlite-integrity'), false,
+    '跳过全库 integrity_check，避免同步 DatabaseSync 卡住控制台事件循环');
 });

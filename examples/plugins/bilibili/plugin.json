@@ -1,0 +1,539 @@
+{
+  "id": "bilibili",
+  "apiVersion": 2,
+  "name": "B 站",
+  "version": "1.1.0",
+  "description": "搜索与查看 B 站视频、UP 主、热门、评论、字幕；把视频下载合流后发到群里；点赞/投币/收藏/关注/评论/发弹幕（写操作需管理员批准并按天限额）",
+  "entry": "index.mjs",
+  "capabilities": [
+    "tools",
+    "http",
+    "config",
+    "secrets",
+    "approval",
+    "quota",
+    "media",
+    "send",
+    "log"
+  ],
+  "httpDomains": [
+    "bilibili.com",
+    "bilivideo.com",
+    "hdslb.com",
+    "b23.tv"
+  ],
+  "settings": {
+    "groups": [
+      {
+        "key": "account",
+        "title": "账号（可选）",
+        "description": "不填也能搜索、看视频、读评论；点赞/投币/收藏/关注/评论/发弹幕需要登录。Cookie 由宿主加密保存，不会回显。",
+        "fields": [
+          {
+            "key": "sessdata",
+            "label": "SESSDATA",
+            "type": "secret",
+            "help": "浏览器登录 B 站后，开发者工具 → Cookie 里的 SESSDATA"
+          },
+          {
+            "key": "bili_jct",
+            "label": "bili_jct（CSRF）",
+            "type": "secret",
+            "help": "写操作必须；与 SESSDATA 在同一个 Cookie 里"
+          },
+          {
+            "key": "buvid3",
+            "label": "buvid3",
+            "type": "secret",
+            "help": "可选，部分接口需要"
+          },
+          {
+            "key": "dedeuserid",
+            "label": "DedeUserID",
+            "type": "secret",
+            "help": "可选，收藏夹/历史需要（B 站 UID）"
+          },
+          {
+            "key": "ownerMid",
+            "label": "主人 B 站 UID（可选）",
+            "type": "text",
+            "help": "填了就只允许这个账号写入：每次点赞/投币/收藏/关注/评论/弹幕前用 nav 核对实际登录 UID，不一致直接拒绝。留空 = 不限制（但仍受管理员批准与配额约束）"
+          }
+        ]
+      },
+      {
+        "key": "playback",
+        "title": "观看与发送",
+        "fields": [
+          {
+            "key": "quality",
+            "label": "默认清晰度",
+            "type": "select",
+            "default": "32",
+            "options": [
+              {
+                "value": "16",
+                "label": "360P"
+              },
+              {
+                "value": "32",
+                "label": "480P"
+              },
+              {
+                "value": "64",
+                "label": "720P"
+              },
+              {
+                "value": "80",
+                "label": "1080P"
+              }
+            ],
+            "help": "未登录一般只能取到 480P；清晰度越高文件越大"
+          },
+          {
+            "key": "sendVideo",
+            "label": "允许把视频发到群里",
+            "type": "boolean",
+            "default": false,
+            "help": "关闭时 watch 只返回视频信息与链接，不发文件"
+          },
+          {
+            "key": "maxFileMb",
+            "label": "单个文件上限（MB）",
+            "type": "number",
+            "default": 60,
+            "min": 5,
+            "max": 80
+          },
+          {
+            "key": "asrForRead",
+            "label": "无字幕视频用语音转写",
+            "type": "boolean",
+            "default": true,
+            "help": "需要宿主配置过语音识别（控制台 → 设置 → 语音识别）。关闭后无字幕视频只给弹幕与评论。"
+          },
+          {
+            "key": "readMaxMinutes",
+            "label": "转写上限（分钟）",
+            "type": "number",
+            "default": 20,
+            "min": 1,
+            "max": 30,
+            "help": "超过这个时长的视频不再走转写（太慢），只读字幕/弹幕/评论。"
+          }
+        ]
+      },
+      {
+        "key": "limits",
+        "title": "读内容偏好",
+        "fields": [
+          {
+            "key": "commentCount",
+            "label": "每次读取评论条数",
+            "type": "number",
+            "default": 20,
+            "min": 5,
+            "max": 50
+          },
+          {
+            "key": "danmakuCount",
+            "label": "每次读取弹幕条数",
+            "type": "number",
+            "default": 30,
+            "min": 10,
+            "max": 100
+          }
+        ]
+      }
+    ]
+  },
+  "approvals": [
+    {
+      "action": "interact",
+      "label": "点赞 / 投币 / 收藏 / 关注",
+      "description": "会改变你在 B 站的账号数据",
+      "defaultUses": 1
+    },
+    {
+      "action": "comment",
+      "label": "发表评论",
+      "description": "会以你的账号发布公开评论",
+      "defaultUses": 1
+    },
+    {
+      "action": "danmaku",
+      "label": "发送弹幕",
+      "description": "会以你的账号在视频里发一条公开弹幕",
+      "defaultUses": 1
+    }
+  ],
+  "quotas": {
+    "interact": 30,
+    "comment": 10,
+    "danmaku": 20
+  },
+  "tools": [
+    {
+      "name": "search",
+      "description": "搜索 B 站视频。返回标题、BV 号、UP 主、播放量、时长与链接。需要看内容时再用 video 或 watch。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "keyword": {
+            "type": "string",
+            "description": "搜索关键词"
+          },
+          "page": {
+            "type": "number",
+            "description": "页码，默认 1"
+          },
+          "order": {
+            "type": "string",
+            "enum": [
+              "relevance",
+              "click",
+              "pubdate"
+            ],
+            "description": "排序：relevance（综合，默认）/ click（播放多）/ pubdate（最新）"
+          }
+        },
+        "required": [
+          "keyword"
+        ]
+      }
+    },
+    {
+      "name": "video",
+      "description": "查看一个 B 站视频的详情：标题、UP 主、简介、播放/点赞/投币/收藏、分 P、以及前若干条评论。bvid 或 av 号都行。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "bvid": {
+            "type": "string",
+            "description": "BV 号（BV1xx…）或 av 号"
+          },
+          "withComments": {
+            "type": "boolean",
+            "description": "是否带评论，默认 true"
+          },
+          "withSubtitles": {
+            "type": "boolean",
+            "description": "是否列出字幕语言，默认 false"
+          }
+        },
+        "required": [
+          "bvid"
+        ]
+      }
+    },
+    {
+      "name": "user",
+      "description": "查看一个 UP 主的资料、直播状态与最近投稿（按 UID）。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "mid": {
+            "type": "string",
+            "description": "UP 主的 UID"
+          },
+          "withVideos": {
+            "type": "boolean",
+            "description": "是否带最近投稿，默认 true"
+          }
+        },
+        "required": [
+          "mid"
+        ]
+      }
+    },
+    {
+      "name": "popular",
+      "description": "B 站当前热门视频（综合热门、排行榜、每周必看）。适合回答“最近 B 站有什么好看的”。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "popular（默认）/ ranking / weekly"
+          }
+        }
+      }
+    },
+    {
+      "name": "account",
+      "description": "看当前登录账号与消息：whoami（我是谁/登录是否有效/主人绑定是否一致）、doctor（环境与登录自检）、notifications（未读回复/@/点赞）、history、favorites、followings。需要配置 Cookie。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "what": {
+            "type": "string",
+            "enum": [
+              "history",
+              "favorites",
+              "followings",
+              "doctor",
+              "whoami",
+              "notifications"
+            ],
+            "description": "whoami 当前账号 / doctor 自检 / history 历史 / favorites 收藏夹 / followings 关注列表"
+          },
+          "mediaId": {
+            "type": "string",
+            "description": "收藏夹 id（favorites 时用；不填先列收藏夹）"
+          },
+          "page": {
+            "type": "number",
+            "description": "页码，默认 1"
+          },
+          "cursor": {
+            "type": "string",
+            "description": "history 翻页用：填上一次返回的 nextCursor，不填从头开始"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "reply",
+              "at",
+              "like"
+            ],
+            "description": "notifications 用：reply 回复我的（默认）/ at @我的 / like 收到的赞"
+          },
+          "limit": {
+            "type": "number",
+            "description": "notifications 用：最多返回条数，默认 20，最大 50"
+          }
+        },
+        "required": [
+          "what"
+        ]
+      }
+    },
+    {
+      "name": "login",
+      "timeoutMs": 30000,
+      "description": "B 站扫码登录。action=start：请求一张登录二维码（channel=chat 发到当前会话；channel=console 返回给控制台网页显示）；action=poll：查扫码结果，成功把 Cookie 安全保存并立即生效；action=status / logout。控制台「扫码登录」按钮走的就是这条路。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "start",
+              "poll",
+              "status",
+              "logout"
+            ],
+            "description": "start 发码 / poll 查结果 / status 看登录 / logout 退出"
+          },
+          "channel": {
+            "type": "string",
+            "enum": [
+              "chat",
+              "console"
+            ],
+            "description": "二维码去向：chat=发到当前会话（默认）；console=返回给控制台网页（不占发送队列）"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      }
+    },
+    {
+      "name": "read",
+      "timeoutMs": 300000,
+      "description": "看懂一个视频（两段式）：先零下载读文字——字幕全文（没有字幕轨就用宿主的语音识别转写）、弹幕按热度密度采样、热门评论含楼中楼；如果还需要看画面，把需要的时间点（mm:ss）用 frames 参数再调一次，会抽出那些帧并转成文字描述。回答“这个视频讲了什么”优先用它，别用 watch 下整段视频。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "bvid": {
+            "type": "string",
+            "description": "视频 BV 号"
+          },
+          "frames": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "第二段：要看的画面时间点列表（[\"02:31\", \"10:05\"] 这种 mm:ss）。第一次调用不要传。"
+          }
+        },
+        "required": [
+          "bvid"
+        ]
+      }
+    },
+    {
+      "name": "watch",
+      "timeoutMs": 240000,
+      "description": "观看一个视频：取 DASH 音视频流，由宿主合流成 mp4。配置允许且当前是群聊时会把文件发到群里；否则只返回标题、时长、清晰度和链接。大视频会失败，换更低清晰度。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "bvid": {
+            "type": "string",
+            "description": "BV 号或 av 号"
+          },
+          "page": {
+            "type": "number",
+            "description": "分 P 序号，默认 1"
+          },
+          "quality": {
+            "type": "string",
+            "enum": [
+              "16",
+              "32",
+              "64",
+              "80"
+            ],
+            "description": "清晰度：16=360P 32=480P 64=720P 80=1080P，不填用设置里的默认值"
+          },
+          "send": {
+            "type": "boolean",
+            "description": "是否把合流后的文件发到当前群（默认按设置）"
+          }
+        },
+        "required": [
+          "bvid"
+        ]
+      }
+    },
+    {
+      "name": "interact",
+      "description": "对视频或 UP 主做互动：like（点赞/取消）、coin（投币）、favorite（收藏到默认收藏夹）、follow（关注/取关）、triple（一键三连：点赞+投币1枚+收藏到默认收藏夹，已做过的自动跳过）。需要先在插件设置里打开「允许使用」，每次执行都要管理员批准这个具体目标。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "like",
+              "coin",
+              "favorite",
+              "follow",
+              "triple"
+            ],
+            "description": "like 点赞 / coin 投币 / favorite 收藏 / follow 关注 / triple 一键三连"
+          },
+          "bvid": {
+            "type": "string",
+            "description": "视频 BV 号（like/coin/favorite 需要）"
+          },
+          "mid": {
+            "type": "string",
+            "description": "UP 主 UID（follow 需要）"
+          },
+          "undo": {
+            "type": "boolean",
+            "description": "true = 取消点赞/取关"
+          },
+          "count": {
+            "type": "number",
+            "description": "投币枚数 1-2，默认 1"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "action": "interact",
+      "actionTarget": [
+        "bvid",
+        "mid"
+      ]
+    },
+    {
+      "name": "comment",
+      "description": "在视频下发一条评论；传 rpid 时改为回复那条具体评论（内联回复，对方会收到通知）。root 用于回复楼中楼（传根评论 rpid）。需要先开评论开关，且每次都要管理员批准「视频 + 完整正文」。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "bvid": {
+            "type": "string",
+            "description": "视频 BV 号"
+          },
+          "text": {
+            "type": "string",
+            "description": "评论内容（1-500 字）"
+          },
+          "timestamps": {
+            "type": "boolean",
+            "description": "可选：把正文里的 mm:ss 自动换成可跳转的视频时间戳链接（默认 false）"
+          },
+          "rpid": {
+            "type": "string",
+            "description": "可选：要回复的评论 rpid（video 返回的评论里有）；不传就是发顶层评论"
+          },
+          "root": {
+            "type": "string",
+            "description": "可选：根评论 rpid；回复一级评论不用传"
+          }
+        },
+        "required": [
+          "bvid",
+          "text"
+        ]
+      },
+      "action": "comment",
+      "actionTarget": "bvid",
+      "actionPreview": "text"
+    },
+    {
+      "name": "danmaku",
+      "description": "读取一个视频的弹幕，按出现时间排序取前若干条。只读；要发弹幕用 danmaku_send。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "bvid": {
+            "type": "string",
+            "description": "视频 BV 号"
+          },
+          "text": {
+            "type": "string",
+            "description": "要发送的弹幕（不填=只读取）"
+          },
+          "progressMs": {
+            "type": "number",
+            "description": "弹幕出现的时间（毫秒），默认 5000"
+          }
+        },
+        "required": [
+          "bvid"
+        ]
+      }
+    },
+    {
+      "name": "danmaku_send",
+      "action": "danmaku",
+      "actionTarget": "bvid",
+      "actionPreview": "text",
+      "timeoutMs": 30000,
+      "description": "在视频里发一条弹幕（会以你的账号公开展示）。需要先在插件设置里打开开关，每次发送都要管理员批准**弹幕全文+这个视频**。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "bvid": {
+            "type": "string",
+            "description": "视频 BV 号"
+          },
+          "text": {
+            "type": "string",
+            "description": "弹幕内容（1-100 字）"
+          },
+          "progressMs": {
+            "type": "number",
+            "description": "弹幕出现的时间（毫秒），默认 5000"
+          }
+        },
+        "required": [
+          "bvid",
+          "text"
+        ]
+      }
+    }
+  ],
+  "engines": {
+    "minVersion": "0.9.5"
+  },
+  "httpMaxBytes": 200000
+}

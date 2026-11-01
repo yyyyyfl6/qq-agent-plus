@@ -632,7 +632,7 @@ export class AssetObserver {
     };
   }
 
-  memorySummary({ query = '' } = {}) {
+  memorySummary({ query = '', limit = 0 } = {}) {
     const summary = readMemoryAssetSummary(this.dataDir);
     if (!this.memory) return summary;
     const q = cleanText(query, 100).toLowerCase();
@@ -662,7 +662,15 @@ export class AssetObserver {
       }
     }
     members.sort((a, b) => b.updatedAt - a.updatedAt);
-    return { ...summary, entries: members };
+    // limit>0 时只回最近更新的那些（这个接口是"每个会话 × 每个成员"的全量遍历，
+    // 多群实例能到上千行 —— 全量回给前端等于让它一次性渲染上千行表格）。
+    // 带上 total，界面才能说清楚"只列了最近 N 条"（2026-10-08 审查）。
+    const cap = Number(limit) > 0 ? Math.max(1, Math.min(2000, Math.round(Number(limit)))) : 0;
+    return {
+      ...summary,
+      entries: cap && members.length > cap ? members.slice(0, cap) : members,
+      total: members.length
+    };
   }
 
   addMemory({ chatKey, userId, name = '', content }) {

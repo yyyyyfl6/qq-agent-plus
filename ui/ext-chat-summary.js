@@ -33,7 +33,7 @@ import { extChatOptions, extFlash, extFmtTime, extHead, extLoadChats, extOnTab }
     const draft = view.draft;
     box.innerHTML = `
       ${extHead({
-        icon: 'ext-summary', title: '群聊总结', toggleId: 'cs-enabled', enabled: c.enabled,
+        icon: 'summary', title: '群聊总结', toggleId: 'cs-enabled', enabled: c.enabled,
         sub: '群友问"刚才聊了啥 / 我错过了什么"时，机器人会读最近的聊天、按话题整理后用自己的口吻发出来。'
           + '每次总结是一次长输入的模型调用，有每会话、全局两道每小时上限。'
       })}
@@ -53,6 +53,19 @@ import { extChatOptions, extFlash, extFmtTime, extHead, extLoadChats, extOnTab }
               <option value="casual" ${c.style === 'casual' ? 'selected' : ''}>随口复盘（三五句，像群友）</option>
             </select></div>
         </div>
+        <div class="field-row">
+          <div class="field" style="flex:2"><label>专属指令（逗号分隔；完整匹配，后面可跟参数）</label>
+            <input type="text" id="cs-commands" value="${esc((c.commands || []).join(', '))}" placeholder="/总结, 总结一下" /></div>
+          <div class="field"><label>谁能用指令</label>
+            <select id="cs-access">
+              <option value="everyone" ${c.commandAccess !== 'owner' ? 'selected' : ''}>所有人（受上面的额度约束）</option>
+              <option value="owner" ${c.commandAccess === 'owner' ? 'selected' : ''}>只有管理员</option>
+            </select></div>
+        </div>
+        <div class="hint">和「切鱼 / 切猫」一样在唤醒模型之前处理：命中的消息不进模型，总结直接发到群里。
+          用法：<code>${esc((c.commands || ['/总结'])[0] || '/总结')}</code>（默认条数）、<code>${esc((c.commands || ['/总结'])[0] || '/总结')} 200</code>（最近 200 条）、
+          <code>${esc((c.commands || ['/总结'])[0] || '/总结')} 3h</code>（最近 3 小时）、<code>${esc((c.commands || ['/总结'])[0] || '/总结')} 周末聚餐</code>（侧重点）。
+          不想要指令就清空这一栏（模型仍可在聊天里按需调用总结）。</div>
         <div class="ext-actions"><button class="btn btn-primary" id="cs-save">保存设置</button><span class="ext-flash" id="cs-flash"></span></div>
       </details>
 
@@ -108,7 +121,9 @@ import { extChatOptions, extFlash, extFmtTime, extHead, extLoadChats, extOnTab }
       maxInputChars: Number($('#cs-chars').value),
       maxPerHourPerChat: Number($('#cs-chat-hour').value),
       maxPerHour: Number($('#cs-hour').value),
-      style: $('#cs-style').value
+      style: $('#cs-style').value,
+      commands: $('#cs-commands').value.split(/[,，]/).map((x) => x.trim()).filter(Boolean),
+      commandAccess: $('#cs-access').value
     });
     const save = async (patch) => {
       try {

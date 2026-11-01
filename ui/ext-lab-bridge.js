@@ -48,7 +48,7 @@ import { extChatOptions, extFlash, extFmtTime, extHead, extLoadChats, extOnTab, 
     const ownerChat = (view.chats || []).filter((x) => String(x.key).startsWith('private:'));
     box.innerHTML = `
       ${extHead({
-        icon: 'ext-lab', title: '大肥鱼桥', toggleId: 'lab-enabled', enabled: c.enabled,
+        icon: 'fish', title: '大肥鱼桥', toggleId: 'lab-enabled', enabled: c.enabled,
         sub: '让机器人把管理员在 QQ 里交代的活派给<strong>实验室电脑上的 DeepSeek Harness</strong>，跑完把结果发回来。'
           + '只认管理员本人的指令；派发结果不确定时<strong>不会自动重试</strong>（免得同一件事在实验室电脑上执行两遍）。'
       })}
@@ -83,6 +83,12 @@ import { extChatOptions, extFlash, extFmtTime, extHead, extLoadChats, extOnTab, 
           <div class="field"><label>轮询间隔（秒）</label><input type="number" id="lab-poll" min="2" max="120" value="${esc(c.pollSeconds ?? 5)}" /></div>
           <div class="field"><label>回报最多字数</label><input type="number" id="lab-report-chars" min="100" max="3000" value="${esc(c.reportMaxChars ?? 900)}" /></div>
         </div>
+        <div class="field"><label>专属指令（逗号分隔；只认管理员本人）</label>
+          <input type="text" id="lab-commands" value="${esc((c.commands || []).join(', '))}" placeholder="/lab, /大肥鱼" />
+          <div class="hint">和「切鱼 / 切猫」一样在唤醒模型之前处理，不经过模型、不花聊天 token：
+            <code>${esc((c.commands || ['/lab'])[0] || '/lab')} 要做的事</code> 派任务、<code>${esc((c.commands || ['/lab'])[0] || '/lab')}</code> 看最近任务、
+            <code>${esc((c.commands || ['/lab'])[0] || '/lab')} 结果 3</code>、<code>${esc((c.commands || ['/lab'])[0] || '/lab')} 取消 3</code>、<code>${esc((c.commands || ['/lab'])[0] || '/lab')} ping</code>。
+            非管理员发同样的话会被当成普通消息。</div></div>
         <div class="checkbox-row"><input type="checkbox" id="lab-private" ${c.privateOnly !== false ? 'checked' : ''} /><label for="lab-private">只在与管理员的私聊里可用（推荐；关掉后群里管理员也能派活，但同批消息混进别人的话一律拒绝）</label></div>
         <div class="checkbox-row"><input type="checkbox" id="lab-report" ${c.reportBack !== false ? 'checked' : ''} /><label for="lab-report">任务结束后把结果摘要发回下指令的会话</label></div>
         <div class="ext-actions">
@@ -164,7 +170,8 @@ node lab-bridge-agent.mjs</pre>
       pollSeconds: Number($('#lab-poll').value),
       reportMaxChars: Number($('#lab-report-chars').value),
       privateOnly: $('#lab-private').checked,
-      reportBack: $('#lab-report').checked
+      reportBack: $('#lab-report').checked,
+      commands: $('#lab-commands').value.split(/[,，]/).map((x) => x.trim()).filter(Boolean)
     };
   }
 

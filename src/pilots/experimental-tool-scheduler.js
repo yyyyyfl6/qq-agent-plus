@@ -14,7 +14,16 @@ export const EXPERIMENTAL_READ_ONLY_TOOLS = new Set([
   'person_memory_lookup',
   'web_search',
   'web_fetch',
-  'dice'          // 纯计算、无 IO 与副作用，可并行
+  'dice',         // 纯计算、无 IO 与副作用，可并行
+  'get_message_reactions',  // 协议端只读查询（贴了哪些表情、谁贴的）
+  'get_group_profile',      // 协议端只读查询（群详情/公告/荣誉），无本地副作用
+  'list_group_files',       // 协议端只读查询（群文件目录）
+  'group_file_url',         // 取下载直链（只读）
+  'list_group_album',       // 协议端只读查询（相册/照片列表）
+  'get_user_info',          // 陌生人资料（只读）
+  'translate_text',         // 翻译（只读）
+  'knowledge_search',       // 本地知识库只读检索
+  'meme_lookup'             // 本地梗库只读检索
 ]);
 
 // 这些也是“读取/观察”类工具，但当前不做并发预启动：
@@ -32,7 +41,10 @@ export const EXPERIMENTAL_ORDERED_READ_TOOLS = new Set([
   'get_message_images',
   'get_message_audio',
   'get_group_member_list',   // 走协议端的读，保持串行
-  'generate_image'           // 按张计费的生成：串行 + 结果决定下一步
+  'generate_image',          // 按张计费的生成：串行 + 结果决定下一步
+  'read_image_text',         // OCR：与 get_message_images/get_message_audio 同类的观察动作，不并发
+  'life_feed_next',          // 生活层取候选：会标记 offered / 占当日额度，串行
+  'life_feed_feedback'       // 生活层回写：改本地队列状态，串行
 ]);
 
 export const EXPERIMENTAL_TERMINAL_TOOL = 'finish';
@@ -47,13 +59,34 @@ export const EXPERIMENTAL_SAME_ROUND_ACTION_TOOLS = new Set([
   'schedule_wake',
   'memory_append',
   'memory_remove',
+  'meme_remember', // 本地梗库写入
   'collect_sticker',
   'sticker_note',
   'report_feedback',
   'friend_request_propose',
   'remind',        // 本地持久化写入
   'group_game',    // 开局/结束：本地状态 + 对外公告
-  'send_voice'     // 对外发送
+  'send_voice',    // 对外发送
+  'share_bilibili', // 对外发送封面+标题链接，并回写生活层队列
+  'set_group_card', // 对外写：改自己的群名片
+  'set_group_ban',  // 对外写：禁言/解禁
+  'kick_group_member', // 对外写：移出群
+  'recall_message', // 对外写：撤回消息
+  'set_group_admin', // 对外写：设置/取消群管理员
+  'react_to_message', // 对外写：给消息贴表情回应
+  'send_qq_voice',    // 对外发送：QQ 内置语音角色
+  'group_sign',       // 对外写：群签到
+  'set_group_todo',   // 对外写：把消息设成群待办
+  'set_my_signature', // 对外写：改个性签名（有每日闸门）
+  'set_my_status',    // 对外写：改在线状态（有每日闸门）
+  'set_remark',       // 对外写：给好友/群设备注（有每日闸门）
+  'set_member_note',  // 本地持久化写入：设"称呼/代号"（不影响后续动作的参数）
+  'send_group_file',  // 对外写：发文件到群
+  'like_album_photo', // 对外写：相册点赞
+  'comment_album_photo', // 对外写：相册评论
+  'upload_to_group_album', // 对外写：传图进群相册（默认关，控制台开）
+  'set_my_avatar',    // 对外写：换 QQ 头像（账号级外观，默认关；有每日闸门）
+  'set_my_profile'    // 对外写：改 QQ 昵称/个性说明/性别（默认关；与签名共享闸门）
 ]);
 
 export function experimentalToolSchedulerConfig(cfg = {}) {
@@ -212,7 +245,10 @@ export class ExperimentalToolBatch {
       let resolve;
       let reject;
       const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
-      deferred.set(index, { resolve, reject });
+      // 挂一个空 catch：宿主是逐个 await 的，靠后的那格被 reject 时可能还没有人接 handler，
+      // 裸 reject 会变成 unhandledRejection，被 server.js 记成进程级 critical 异常（2026-10-13 全项目审查）。
+      promise.catch(() => {});
+      deferred.set(index, { resolve, reject, promise });
       this.pending.set(index, promise);
     }
 

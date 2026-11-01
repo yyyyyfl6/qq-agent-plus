@@ -32,6 +32,7 @@ export function createRouter(deps = {}) {
   const keyEndpointAllowed = deps.keyEndpointAllowed || (() => true);
   const tokenFp = deps.tokenFp || null;
   const apiFallthrough = deps.apiFallthrough === true;
+  const metrics = deps.metrics || null;
   const routes = [];
 
   function add(method, path, handler, opts = {}) {
@@ -72,6 +73,26 @@ export function createRouter(deps = {}) {
     const url = new URL(req.url, 'http://127.0.0.1');
     const pathname = url.pathname;
     const method = String(req.method || 'GET').toUpperCase();
+    // 指标：在 writeHead/end 上各挂一次（只记第一次），SSE 也在 writeHead 时记一笔。
+    if (metrics && typeof res.writeHead === 'function' && typeof res.end === 'function') {
+      const startedNs = process.hrtime.bigint();
+      let recorded = false;
+      const record = (status) => {
+        if (recorded) return;
+        recorded = true;
+        metrics.recordHttp(status, Number(process.hrtime.bigint() - startedNs) / 1e6);
+      };
+      const originalWriteHead = res.writeHead.bind(res);
+      res.writeHead = (status, ...rest) => {
+        record(status);
+        return originalWriteHead(status, ...rest);
+      };
+      const originalEnd = res.end.bind(res);
+      res.end = (...args) => {
+        record(res.statusCode || 200);
+        return originalEnd(...args);
+      };
+    }
     // #6：每个 HTTP 请求一个 trace id，回在响应头里（控制台/脚本按它去捞日志）。
     // remember:false —— 它不该覆盖 /api/status 的 lastTraceId（那是"最近一次运行"的 id）。
     const traceId = newTraceId();

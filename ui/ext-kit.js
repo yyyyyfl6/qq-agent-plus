@@ -8,6 +8,7 @@
 import { api } from './core/api.js';
 import { esc } from './core/dom.js';
 import { formatChatTitle } from './core/format.js';
+import { iconSvg } from './core/icons.js';
 
 /** 点中某个 tab 时调用 loader（另外导出给命令面板等主动跳转用）。 */
 function extOnTab(tabName, loader) {
@@ -61,7 +62,7 @@ function extHead({ icon, title, sub, enabled, toggleId }) {
   return `
     <div class="ext-head">
       <div class="ext-head-copy">
-        <h2><span class="ext-icon" data-ico="${esc(icon)}" aria-hidden="true"></span>${esc(title)}</h2>
+        <h2><span class="ext-icon" aria-hidden="true">${iconSvg(icon, { size: 20 })}</span>${esc(title)}</h2>
         <p class="muted">${sub}</p>
       </div>
       <label class="ext-switch" title="启用 / 停用">

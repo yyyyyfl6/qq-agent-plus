@@ -154,6 +154,31 @@ test('prompt exposes sticker IDs and exact unique labels remain compatible', () 
   ], '无语团子'), null);
 });
 
+test('prompt 用 localNote 优先；全角/半角引号查询也能命中', () => {
+  const entries = [
+    { id: 'st-1', desc: 'GIF', localNote: '哈士奇：指着镜头，适合威胁', url: 'https://example.com/1.png' },
+    { id: 'st-2', desc: '他说"别动"', localNote: '', url: 'https://example.com/2.png' }
+  ];
+  const prompt = buildStickerContext(entries, 10);
+  assert.match(prompt, /哈士奇：指着镜头/);
+  assert.equal(prompt.includes('GIF'), false, '不能把采集时的格式名当成备注');
+  assert.equal(findSticker(entries, '他说“别动”')?.id, 'st-2', '模型传全角引号也要命中半角备注');
+});
+
+test('send_sticker 找不到表情不刷异常面板', async () => {
+  const manager = new StickerManager({ call: async () => [] });
+  const tool = buildToolDefs().find((x) => x.name === 'send_sticker');
+  const result = await tool.execute({
+    chatKey: 'group:1',
+    stickers: manager,
+    sender: {},
+    session: { leaseId: 'lease', triggerText: '测试', sent: [] },
+    emit: () => {}
+  }, { stickerId: 'missing-sticker' });
+  assert.equal(result.isError, true);
+  assert.equal(result.reportIncident, false, '预期内的"找不到"不该进异常库');
+});
+
 test('sticker list keeps familiar ones and rotates unused ones in', () => {
   // 复现用户反馈的场景：收藏很多，但发过的图永远占住名额，其余永远不露面。
   const entries = [];
@@ -286,7 +311,7 @@ test('抬头在"只有一个/全都没用过"与"全都用过"两个边界不再
 
 test('清单把两类来源标出来：QQ 收藏表情 vs 本地图库（发出去是图片）', () => {
   const entries = [
-    { id: '3808482642_1', desc: '真表情', url: 'https://p.qpic.cn/qq_expression/x/1', source: 'qq', useCount: 1, lastUsedAt: 1 },
+    { id: '10086_1', desc: '真表情', url: 'https://p.qpic.cn/qq_expression/x/1', source: 'qq', useCount: 1, lastUsedAt: 1 },
     { id: 'collected_-100', desc: '收藏的图片', url: 'https://multimedia.nt.qq.com.cn/download?fileid=x', source: 'ai', useCount: 0 },
     { id: 'manual_abc', desc: '手动上传的图', localFile: 'sticker-assets/manual_abc.png', source: 'manual', useCount: 0 }
   ];
@@ -501,4 +526,41 @@ test('收藏双闸（#9）：会话额度互不影响；全局额度共享（配
   const globalDenied = manager.collectPeek(t0 + 5, 'group:3');
   assert.equal(globalDenied.ok, false, '全局 4 张已满，第三个会话也受限');
   assert.equal(globalDenied.scope, 'global');
+});
+
+
+test('收藏配额记账：成功扣一次、取不到图退还（事前原子消费，2026-10-03 全量审查）', async (t) => {
+  const http = await import('node:http');
+  const png = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c6300010000050001' + '0d0a2db4' + '0000000049454e44ae426082', 'hex');
+  const server = http.createServer((req, res) => {
+    if (req.url.includes('missing')) { res.writeHead(404); res.end('nope'); return; }
+    res.writeHead(200, { 'content-type': 'image/png' });
+    res.end(png);
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise((r) => server.close(r)));
+  const { updateConfig, DEFAULT_CONFIG } = await import('../src/core/config.js');
+  updateConfig({
+    security: { ...DEFAULT_CONFIG.security, allowPrivateImageHosts: true },
+    sticker: { ...DEFAULT_CONFIG.sticker, collectEnabled: true, maxCollectPerHour: 5, maxCollectPerHourPerChat: 5 }
+  });
+  const manager = new StickerManager({ async call() { return []; } });
+  const chatKey = 'group:quota-1';
+  const base = manager.collectQuota.snapshot();
+  const port = server.address().port;
+  await manager.collect('-601', { url: `http://127.0.0.1:${port}/a.png`, note: 'x', chatKey });
+  const afterOk = manager.collectQuota.snapshot();
+  assert.equal((afterOk.chats[chatKey] || 0) - (base.chats[chatKey] || 0), 1, '收藏成功要扣一次额度');
+  await assert.rejects(() => manager.collect('-602', { url: `http://127.0.0.1:${port}/missing.png`, note: 'x', chatKey }), /取不到/);
+  const afterFail = manager.collectQuota.snapshot();
+  assert.equal((afterFail.chats[chatKey] || 0) - (base.chats[chatKey] || 0), 1, '失败的那次要退还（净消耗仍为 1）');
+});
+
+test('控制台预览失效的收藏表情：返回 404，不把 STICKER_LINK_DEAD 记成系统异常', () => {
+  const app = fs.readFileSync(new URL('../src/console/app.js', import.meta.url), 'utf8');
+  const at = app.indexOf("router.add('GET', '/api/assets/stickers/image'");
+  assert.ok(at > 0, '图片路由结构变了就更新这条用例');
+  const slice = app.slice(at, at + 1800);
+  assert.match(slice, /error\?\.code === 'STICKER_LINK_DEAD'\) return json\(res, 404/,
+    '失效链只是预览失败，直接 404；抛出去会在异常面板留红项');
 });

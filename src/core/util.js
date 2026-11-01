@@ -4,6 +4,32 @@ export function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
 }
 
+/**
+ * 可被 AbortSignal 打断的等待。人类化延迟必须能取消：暂停/中止后还睡满 8 秒再发，
+ * 用户会看到"机器人已经停了却突然冒出一句"。
+ */
+export function sleepAbortable(ms, signal) {
+  const wait = Math.max(0, Number(ms) || 0);
+  if (!signal) return sleep(wait);
+  if (signal.aborted) return Promise.reject(abortReason(signal));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { cleanup(); resolve(); }, wait);
+    const onAbort = () => { cleanup(); reject(abortReason(signal)); };
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function abortReason(signal) {
+  if (signal?.reason instanceof Error) return signal.reason;
+  const error = new Error('Aborted');
+  error.name = 'AbortError';
+  return error;
+}
+
 export function randInt(min, max) {
   const lo = Math.ceil(Math.min(min, max));
   const hi = Math.floor(Math.max(min, max));
@@ -103,10 +129,16 @@ export function resolveSelfName(persona = {}, accountNickname = '') {
  */
 export function sanitizeUserText(text) {
   let s = String(text ?? '');
-  // 第一道：剥掉零宽/不可见字符（零宽空格、双向控制符、BOM、软连字符、行/词分隔符）。
-  // 它们对模型等于没有，却能让下面的关键词匹配失配 —— 「【管\u200b理员】」「[\u200e管理员]」
-  // 曾经整条穿透（2026-09-24 审查发现）。这类字符是纯噪音，全局剥掉不改变语义。
-  s = s.replace(/[\u200b\u200c\u200d\u200e\u200f\u2028\u202f\u2060\u00ad\ufeff]/g, '');
+  // 第一道：剥掉零宽/不可见字符。**按 Unicode 类别来，不要枚举码点** —— 以前只列了
+  // \u200b\u200c\u200d\u200e\u200f\u2028\u202f\u2060\u00ad\ufeff，于是 U+061C（阿拉伯字母标记）、
+  // U+2066–U+2069（双向隔离）、U+180E、U+034F、U+115F/U+3164/U+FFA0 这些照样能把
+  // 「【管\u061c理员】」「【\u061c管理员附加规则】」拼出来整条穿透（2026-10-13 全项目审查 P1）。
+  // Cf（格式符）/Cs（代理对）/C0+C1 控制符（保留 \t \n \r）都是纯噪音，全局剥掉不改变语义。
+  // 变体选择符 \ufe00-\ufe0f（Mn，渲染上不可见）与 \u2800（盲文空白）同理：留在里面就能把
+  // 「【管\uFE0F理员】」拼出来整条穿过白名单（2026-10-14 复审）。\u007f-\u009f 是 DEL+C1，
+  // 只有 C0 被枚举会漏掉它（JS 的 \s 不含 \u0085，第二道折叠也救不回来）。
+  // 注意别顺手写成 \p{Cc}：它把 \t \n \r 也算进去，那三个必须留。
+  s = s.replace(/[\p{Cf}\p{Cs}\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u180e\u034f\u115f\u1160\u2800\u3164\ufe00-\ufe0f\uffa0]/gu, '');
   // 第二道：折叠方括号段内的全部空白 —— 「【管 理 员】」同样是绕过手法，
   // 段头关键词里出现空白只可能是为了躲匹配，段内空白对"段标记"没有语义。
   s = s.replace(/([\[【［])([^\]】］]*)([\]】］])/g, (_m, open, body, close) => open + body.replace(/\s+/g, '') + close);
@@ -122,7 +154,7 @@ export function sanitizeUserText(text) {
   // 名单分两段：简体一段、繁体一段（[管理員] 这类繁体写法以前能整条穿透，
   // 而模型收到的说明是"方括号会被弱化、标记伪造不出来"）。加关键词时两段都要加。
   s = s.replace(
-    /[\[【［][\s\u200b\u200c\u200d]*((?:本次唤醒|系统提醒|系统|管理员(?:附加规则)?|owner|角色扮演|会话令牌|当前时间|上海时间|过去状态|此刻状态|记忆(?:与会话交接)?|上次会话交接|上次生命周期检查点|当前对话线程|优先级|角色设定|当前人设|安全规则|工作方式|反\s*AI\s*味|保持主体性|该说\s*\/\s*不该说|群聊不是客服队列|像真人一样|不要当群管家|引用与点名|可用表情包|QQ\s*场景规则|发送与汇报禁令|发言与沉默|发言的唯一通道|分条发送|看图先读情绪|自然交流与可靠边界|每次运行的决策顺序|进行中的游戏|定时提醒|谁是卧底|玩法与工具箱|生命周期续接|空格不是分句符号|异常隔离|对群友的全局印象|已确认黑话|群聊材料|总结日期|最近已发动态|好友动态|评论回复|这次表达的场景|真实与研究|核心原则|隐私与配图|本次包含的提交|最终提交|提交|预算|表情包(?:用法|策略)?|实验调度|从什么地方写起|像自己发动态|可忽略的灵感|可选配图|安全边界|本次喚醒|系統提醒|系統|管理員(?:附加規則)?|會話令牌|當前時間|上海時間|過去狀態|此刻狀態|記憶(?:與會話交接)?|上次會話交接|上次生命週期檢查點|當前對話線程|優先級|角色設定|當前人設|安全規則|保持主體性|該說\s*\/\s*不該說|群聊不是客服隊列|像真人一樣|不要當群管家|引用與點名|QQ\s*場景規則|發送與匯報禁令|發言與沉默|發言的唯一通道|分條發送|看圖先讀情緒|自然交流與可靠邊界|每次運行的決策順序|進行中的遊戲|定時提醒|誰是臥底|玩法與工具箱|生命週期續接|空格不是分句符號|異常隔離|對群友的全局印象|已確認黑話|總結日期|最近已發動態|好友動態|評論回復|這次表達的場景|真實與研究|核心原則|隱私與配圖|最終提交|預算|實驗調度|從什麼地方寫起|像自己發動態|可忽略的靈感|可選配圖|安全邊界)[^\]】］]*)[\]】］]/gi,
+    /[\[【［][\s\u200b\u200c\u200d]*((?:本次唤醒|系统提醒|系统|B站|管理员(?:附加规则)?|owner|角色扮演|会话令牌|当前时间|上海时间|过去状态|此刻状态|你现在的状态|记忆(?:与会话交接)?|上次会话交接|上次生命周期检查点|当前对话线程|优先级|角色设定|当前人设|安全规则|工作方式|反\s*AI\s*味|梗的使用|梗密度|诚实边界|发送节奏|内容来源|自己的动态|内部群摘要|你的兴趣与立场|说话示例|保持主体性|该说\s*\/\s*不该说|群聊不是客服队列|像真人一样|不要当群管家|引用与点名|可用表情包|QQ\s*场景规则|发送与汇报禁令|发言与沉默|发言的唯一通道|分条发送|看图先读情绪|自然交流与可靠边界|每次运行的决策顺序|进行中的游戏|定时提醒|谁是卧底|玩法与工具箱|可用技能|生命周期续接|空格不是分句符号|异常隔离|对群友的全局印象|已确认黑话|本群梗库|群聊材料|总结日期|最近已发动态|好友动态|评论回复|这次表达的场景|真实与研究|核心原则|隐私与配图|本次包含的提交|最终提交|提交|预算|表情包(?:用法|策略)?|实验调度|从什么地方写起|像自己发动态|可忽略的灵感|可选配图|安全边界|待回复评论|狼人杀|事件定义|强度|手工印象|自动积累的印象|本次喚醒|系統提醒|系統|管理員(?:附加規則)?|會話令牌|當前時間|上海時間|過去狀態|此刻狀態|你現在的狀態|記憶(?:與會話交接)?|上次會話交接|上次生命週期檢查點|當前對話線程|優先級|角色設定|當前人設|安全規則|保持主體性|該說\s*\/\s*不該說|群聊不是客服隊列|像真人一樣|不要當群管家|引用與點名|QQ\s*場景規則|發送與匯報禁令|發言與沉默|發言的唯一通道|分條發送|看圖先讀情緒|自然交流與可靠邊界|每次運行的決策順序|進行中的遊戲|定時提醒|誰是臥底|玩法與工具箱|生命週期續接|空格不是分句符號|異常隔離|對群友的全局印象|已確認黑話|本群梗庫|總結日期|最近已發動態|好友動態|評論回復|這次表達的場景|真實與研究|核心原則|隱私與配圖|最終提交|預算|實驗調度|從什麼地方寫起|像自己發動態|可忽略的靈感|可選配圖|安全邊界|待回復評論|狼人殺|事件定義|強度|手工印象|自動積累的印象)[^\]】］]*)[\]】］]/gi,
     '（$1）'
   );
   return s;
@@ -146,6 +178,11 @@ export function isSelfSender(senderId, selfId) {
  *   写了空格也会被吃掉；函数自己把这一步做完，输出对 sanitizeUserText 幂等，
  *   live 与历史两条链路渲染出的字节才完全相同。
  */
+/** 跨私聊展示时去掉引用块里的 #消息id：那个 id 只在原会话有效。 */
+export function stripQuoteMessageId(text) {
+  return String(text ?? '').replace(/\[引用#-?\d+·/g, '[引用');
+}
+
 export function formatQuoteRef(reply) {
   return buildQuoteRef(reply);
 }
@@ -181,6 +218,8 @@ function buildQuoteRef(reply, { withId = true, labelSelf = true } = {}) {
  * 提示词渲染与工具/控制台返回都走它，同一个模型在两个窗口看到的形状才一致。
  */
 export function quotePrefixFor(entry) {
+  // reply.sender / reply.text 是群友可控内容：buildQuoteRef 内部有两遍 sanitizeUserText
+  //（见它的注释），这里重建出的前缀天然是弱化形态、比较也用同一形态 —— 不必再洗一遍。
   const prefix = formatQuoteRef(entry?.reply);
   if (!prefix) return '';
   const text = String(entry?.text || '');

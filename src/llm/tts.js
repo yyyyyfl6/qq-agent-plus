@@ -3,11 +3,13 @@
 //   volc    —— 火山引擎「语音合成」v1 HTTP（openspeech.bytedance.com/api/v1/tts，AppID + Access Token）
 //   doubao  —— 火山引擎「豆包语音合成 2.0」v3 HTTP 流式（api/v3/tts/unidirectional，X-Api-Key）
 //   minimax —— MiniMax T2A v2（api.minimax.chat/v1/t2a_v2，音频是 hex 编码）
+//   mimo    —— 小米 MiMo（token-plan 的 chat/completions 音频输出，支持导演指令/情绪）
 // volc / minimax 按官方文档实现、机器上没有凭据未实测；doubao 2026-09-28 用真实账号实测通过
-// （音频、语速、音量、格式、错误码都核过）。填好凭据后点控制台「试听」即可验证。
+// （音频、语速、音量、格式、错误码都核过）。mimo 2026-10-25 用 token-plan 账号实测通过。
 import crypto from 'node:crypto';
 import { synthesizeSpeech as openaiSpeech } from './tts-openai.js';
 import { synthesizeDoubao, explainVolcError } from './tts-doubao.js';
+import { synthesizeMimo } from './tts-mimo.js';
 import { callJson } from './tts-http.js';
 import { ttsServiceOfBaseUrl, ttsServiceOf, ttsKeyFor } from './tts-presets.js';
 
@@ -116,10 +118,11 @@ export async function synthesizeSpeech(args = {}) {
   // 认不出才用配置里的 provider（手写的 config.json 也就不用再猜 provider）
   const declared = String(args?.cfg?.provider || '').trim().toLowerCase();
   const inferred = ttsServiceOfBaseUrl(args?.cfg?.baseUrl || '')?.provider || '';
-  const provider = inferred || (['openai', 'volc', 'volcengine', 'doubao', 'minimax'].includes(declared) ? declared : 'openai');
+  const provider = inferred || (['openai', 'volc', 'volcengine', 'doubao', 'minimax', 'mimo'].includes(declared) ? declared : 'openai');
   // Key 按"当前这家"取（keys 映射 → 旧的单 apiKey 兜底），再交给适配器
   const resolved = { ...(args.cfg || {}), apiKey: ttsKeyFor(args?.cfg, ttsServiceOf(args?.cfg)?.id) };
   const next = { ...args, cfg: resolved };
+  if (provider === 'mimo') return synthesizeMimo(next);
   if (provider === 'doubao') return synthesizeDoubao(next);
   if (provider === 'volc' || provider === 'volcengine') return synthesizeVolc(next);
   if (provider === 'minimax') return synthesizeMinimax(next);

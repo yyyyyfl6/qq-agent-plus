@@ -307,6 +307,56 @@ test('人设正文与自定义规则在写入侧夹住长度（防止粘贴事�
   updateConfig({ persona: { roleText: PERSONAS?.xiaojingyu?.text ?? '默认人设', templateId: 'xiaojingyu' } });
 });
 
+test('表情判定标准在写入侧夹到 2000 字（控制台文本域同口径，2026-10-10）', async () => {
+  const { updateConfig, getConfig, setRuntimeConfig } = await import('../src/core/config.js');
+
+  updateConfig({ sticker: { collectCriteria: 'c'.repeat(2500) } });
+  assert.equal(getConfig().sticker.collectCriteria.length, 2000, '超长按 2000 夹住');
+
+  // 不改这一项时不动存量（与上面人设长文本同一设计取舍）：塞一个超长存量值，保存无关字段 → 不被截断
+  setRuntimeConfig({ ...getConfig(), sticker: { ...getConfig().sticker, collectCriteria: 'x'.repeat(3000) } });
+  updateConfig({ sticker: { enabled: true } });
+  assert.equal(getConfig().sticker.collectCriteria.length, 3000, '无关保存不回头截断存量值');
+
+  // 清空 = 回内置默认；别影响同文件后续用例
+  updateConfig({ sticker: { collectCriteria: '' } });
+  assert.equal(getConfig().sticker.collectCriteria, '');
+});
+
+test('标量 patch（{asr: 5}）按"这次没改"处理，不清空整段（否则连凭据映射一起丢）', async () => {
+  const { updateConfig, getConfig } = await import('../src/core/config.js');
+  updateConfig({ asr: { provider: 'tencent', baseUrl: '', model: '', apiKey: 'K', apiKeyProvider: 'tencent' } });
+  updateConfig({ asr: 5 });
+  const asr = getConfig().asr;
+  assert.equal(asr.provider, 'tencent', '标量 patch 不该清空这一段');
+  assert.equal(asr.apiKey, 'K', '凭据也不该丢');
+  updateConfig({ tts: [] });
+  assert.equal(typeof getConfig().tts, 'object', '数组 patch 同理');
+});
+
+test('tts 的派生位与 has[A-Z] 通配同样不落盘（hasApiKeyService 是 sanitize 生成的）', async () => {
+  const { updateConfig, getConfig } = await import('../src/core/config.js');
+  updateConfig({ tts: { hasApiKeyService: true, hasApiKey: true, keyServices: ['doubao'], currentService: 'doubao' } });
+  const tts = getConfig().tts;
+  assert.equal('hasApiKeyService' in tts, false, 'has[A-Z] 派生位一律不落盘（tts 段原先漏了通配）');
+  assert.equal('hasApiKey' in tts, false);
+  assert.equal('keyServices' in tts, false);
+  assert.equal('currentService' in tts, false);
+  assert.equal(String(tts.apiKeyService || ''), '', '归属字段本身是配置（默认空串），不能被当派生位删掉');
+});
+
+test('webSearch 的派生位（sanitize 生成的 hasApiKey）不落盘', async () => {
+  const { updateConfig, getConfig } = await import('../src/core/config.js');
+  updateConfig({
+    webSearch: { deepseek: { hasApiKey: true, apiKey: 'K' }, hasApiKey: true, providers: [{ id: 'x', hasApiKey: true, apiKey: 'P' }] }
+  });
+  const ws = getConfig().webSearch;
+  assert.equal('hasApiKey' in ws, false, '顶层派生位不落盘');
+  assert.equal('hasApiKey' in ws.deepseek, false, '内置服务子对象里的派生位不落盘');
+  assert.equal('hasApiKey' in ws.providers[0], false, '自定义服务列表里的派生位不落盘');
+  assert.equal(ws.deepseek.apiKey, 'K', '真 Key 不受影响');
+});
+
 test('三个带凭据映射的段（asr/tts/imageGen）：手改坏成标量/数组时归一化成对象，keys 同理', async () => {
   // 2026-10-02 全量审查：非对象形态会让 { ...keys } 展开成字符索引的垃圾映射，
   // 还会绕过控制台下发的"整包清空"（那条在 secret-keys.js 单独修）。这里钉住落盘/合并侧的归一化。
@@ -326,4 +376,31 @@ test('三个带凭据映射的段（asr/tts/imageGen）：手改坏成标量/数
   // 正常写入照旧
   updateConfig({ asr: { provider: 'tencent', keys: { tencent: { secretId: 'AKID', secretKey: 'SK' } } } });
   assert.deepEqual(getConfig().asr.keys.tencent, { secretId: 'AKID', secretKey: 'SK' });
+});
+
+test('坏形状的 allow/deny/blocklist/providers/customPersonas/store.keywords 归一化', () => {
+  updateConfig({
+    allow: { groups: '123456', private: { a: 1 } },
+    deny: { groups: null, private: 'x' },
+    blocklist: { '123': '456' },
+    providers: {},
+    customPersonas: {},
+    store: { keywords: 'not-an-array' }
+  });
+  const cfg = getConfig();
+  assert.deepEqual(cfg.allow.groups, []);
+  assert.ok(Array.isArray(cfg.allow.private), '私聊名单必须是数组（管理员 QQ 可能被自动补入）');
+  assert.deepEqual(cfg.deny.groups, []);
+  assert.ok(Array.isArray(cfg.deny.private));
+  assert.deepEqual(cfg.blocklist['123'], []);
+  assert.deepEqual(cfg.providers, []);
+  assert.deepEqual(cfg.customPersonas, []);
+  assert.deepEqual(cfg.store.keywords, []);
+});
+
+test('updateConfig 的校验错误带 httpStatus=400 标记（控制台据此区分用户输入）', () => {
+  assert.throws(() => updateConfig({ server: { port: 0 } }),
+    (error) => error.httpStatus === 400 && /Invalid server port/.test(error.message));
+  assert.throws(() => updateConfig({ runtime: { mode: 'nope' } }),
+    (error) => error.httpStatus === 400 && /Invalid runtime mode/.test(error.message));
 });

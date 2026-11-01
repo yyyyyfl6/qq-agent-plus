@@ -1,0 +1,21 @@
+{
+  "id": "weather",
+  "apiVersion": 1,
+  "name": "天气",
+  "version": "1.0.0",
+  "description": "查一个城市现在的天气与未来三天（最高/最低温、降水概率、天气现象），走 Open-Meteo 公开接口，不需要 Key",
+  "entry": "index.mjs",
+  "capabilities": ["tools", "http", "config"],
+  "tools": [
+    {
+      "name": "current",
+      "description": "查某个城市当前天气与三天预报：现在的温度/体感/天气现象/湿度/风速，今天的最高最低温与降水概率，以及未来三天（明天起）的预报。不传 city 就用配置里的默认城市。城市名：中国城市可用中文，境外城市请传英文名（Tokyo/New York），上游的中文地理编码只收录中国城市。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "city": { "type": "string", "description": "城市名，中英文都行（例如 上海 / Shanghai / Tokyo）" }
+        }
+      }
+    }
+  ]
+}

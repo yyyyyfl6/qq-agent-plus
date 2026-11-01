@@ -100,3 +100,22 @@ test('redactSecretFields：has* 布尔与 *From 保留；循环引用不炸', ()
   assert.equal(out.password, '[redacted]');
   assert.equal(out.self, '[circular]');
 });
+
+test('sanitizeConfigSecrets：MCP env/args 用 ****** 掩码，不能把真 Key 从前端回传里冲掉', () => {
+  const out = sanitizeConfigSecrets({
+    mcp: {
+      enabled: true,
+      servers: [{
+        id: 'github',
+        command: 'npx',
+        args: ['-y', '@x/y', '--token=ghp_secret'],
+        env: { GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_secret', ROOT: '/data/knowledge' }
+      }]
+    }
+  });
+  const server = out.mcp.servers[0];
+  assert.equal(server.env.GITHUB_PERSONAL_ACCESS_TOKEN, '******');
+  assert.equal(server.env.ROOT, '/data/knowledge');
+  assert.equal(server.args.at(-1), '******');
+  assert.equal(server.args[0], '-y');
+});

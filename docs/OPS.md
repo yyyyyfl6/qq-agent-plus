@@ -28,9 +28,17 @@ node src/ops.js health-check            # 只巡检并输出 JSON（退出码 0=
 node src/ops.js health-check --confirm  # 允许在"连续 3 次失败"或"恢复"时私聊 admin.ownerUin
 ```
 
-7 项检查：控制台 `/healthz`、OneBot `get_status`、入站处理水位（到期未处理或重试耗尽的入站消息；
+11 项检查：控制台 `/healthz`、OneBot `get_status`、协议端版本（`protocol-version`：落后基线不算
+不健康，明细里提示去控制台一键升级）、Docker 套接字可读写性（`docker-socket`，Issue #30）、
+入站处理水位（`outbound-freshness`：到期未处理或重试耗尽的入站消息；
 `runtime.mode=observe`、Agent 暂停、当日预算降级时自动跳过）、磁盘余量（< 1GB 报警）、
-`auto-update.json` 的 `status=failed`、部署中断标记 `.deploy-in-progress`、`messages.sqlite` 完整性检查。
+`auto-update.json` 的 `status=failed`、部署中断标记 `.deploy-in-progress`、`messages.sqlite` 完整性检查、
+媒体工具（`media-tools`：缺 ffmpeg/ffprobe 时给安装提示，视频合流、抽帧与图片转码依赖它们）、
+插件（`plugins`：总开关关着就跳过；开着时报"装了几个/授权几个"，manifest 有问题逐条给原因；
+本机 Node 不支持权限隔离时也报红 —— 那种情况下插件不会被加载，见 docs/PLUGINS.md）。
+
+OneBot 事件新鲜度不是巡检项，而是控制台侧的告警：连接显示在线但超过 10 分钟没有任何入站事件或
+心跳时提示（此前这种情况会被当作正常在线）。
 
 - 结果落在 `data/health.json`：`streaks` 记每类检查的连续失败数，`lastResults` 是最近一次明细。
 - **抑制抖动**：同一检查连续失败到**第 3 次**才发一条 QQ 私聊告警；恢复正常时补发一条"已恢复"。
@@ -51,15 +59,39 @@ node src/ops.js install-timers --confirm   # 写入并启用 backup / process-gu
 | `audit` | `ops/audit-server.sh` | 服务、代码与数据体检：systemd user 服务/定时器、启动补丁链可执行性、全量 js 语法、未定义调用扫描、关键补丁标记、config.json 关键项（密钥只报告有/无）、sqlite 完整性、控制台与协议端运行态、最近日志、主机资源 | 部署后验收；出现问题时用于定位 |
 | `audit-host` | `ops/audit-host.sh` | 主机只读体检：失败单元、内存/磁盘/journald、Docker 容器与重启次数、监听端口、SSH 安全、防火墙、定时任务、可升级包、TLS 证书到期、备份现状 | 接手机器后的检查、例行巡检 |
 | `audit-prune` | —（改进方案 #5 新增） | 删除 `data/audit-log/` 下超过保留月数的 `audit-YYYYMM.jsonl`（控制台写操作的审计留痕）；默认保留 6 个月，先 `--dry-run` 预演 | 每月定时执行（`qq-agent-audit-prune.timer`）；磁盘吃紧时手动执行 |
-| `backup` | `ops/backup-qq-agent-data.sh` | 停止服务数秒 → tar.gz 打包数据目录 → 启动服务 → 仅保留最近 N 份；任何失败路径都会重新启动服务 | 每周定时执行（配合 `.timer`）；重大变更前手动执行 |
-| `scan` | `ops/scan-undefined-calls.py` + `ops/check-undefined-calls.sh` | 将注释/字符串/正则/模板串抹白后，查找「已调用但本文件既未定义也未 import」的函数名；默认只记录、不阻断（退出码恒为 0）；`--strict` 下有可疑调用则退出 1 | 修改 `src/*.js` 后；也可挂载到服务 `ExecStartPost` |
+| `backup` | `ops/backup-qq-agent-data.sh` | 停止服务数秒 → AES-256-GCM 加密打包数据目录（`*.tar.gz.enc`）→ 启动服务 → 仅保留最近 N 份；任何失败路径都会重新启动服务 | 每周定时执行（配合 `.timer`）；重大变更前手动执行 |
+| `restore` | —（0.9.9 新增） | 解密 → 路径校验 → 停服务 → 旧数据移到 `data.pre-restore-*` → 解包 → 以 observe 模式启动 → 健康检查；失败自动回滚。先 `--dry-run` 看归档条目，再 `--confirm` | 迁移、灾难恢复、备份演练 |
+| `prune` | —（0.9.9 新增） | 只删除 `state='acked'` 且超过保留期的消息；`pending` / `held` 永远不删。`--days=N` 不传时读 `store.retentionDays`（0 = 不删） | 历史消息占用磁盘时；先 `--dry-run` |
+| `scan` | `ops/scan-undefined-calls.py` + `ops/check-undefined-calls.sh` | 将注释/字符串/正则/模板串抹白后，查找「已调用但本文件既未定义也未 import」的函数名；默认只记录、不阻断（退出码 0）；`--strict` 下有可疑调用**或目录不存在**则退出 1（2026-10-03：路径写错也要让 CI 变红） | 修改 `src/*.js` 后；也可挂载到服务 `ExecStartPost` |
 | `watch-send` | `ops/watch-send.py` | 监视 outbox 表的 rowid 水位线：基线之后新增 failed 行报 SEND_FAIL，新增成功行报 SEND_OK；同时检查是否再次出现未定义函数事故 | 修复发送链路后的线上验证 |
 | `watch-login` | `ops/watch-login.py` | 每 15 秒轮询协议端 HTTP 端口，直至 QQ 登录成功，随后打印登录信息 / 控制台状态 / 最近日志 | 重启协议端容器或掉线重登后确认恢复 |
 | `guard` | `ops/guard-process-explosion.sh` | 用户进程数超过阈值时清理失控的 bash/grep/tr/sh/sleep 进程树并记录现场（仅 Linux） | 配合 `process-guard.timer` 每 10 分钟执行 |
 | `face-names` | `ops/export-face-names.sh` | 合并 SnowLuma 目录 / QQ 客户端配置 / 手工补充表，导出 `data/face-names.json` | QQ 新增表情、表情名不匹配时 |
+| `snowluma-version` | —（协议端管理新增） | 看协议端（SnowLuma）镜像版本与是否落后于项目基线 | 排查「表情显示成图片」、确认协议端状态 |
+| `snowluma-update` | —（协议端管理新增） | 把协议端镜像更新到项目基线（或 `--to` 指定镜像）：备份 .env/compose → pull → up -d → 等就绪，起不来自动回滚；`--dry-run` 预演 | 控制台「设置 → OneBot」一键更新的命令行等价 |
 | `deploy` | `ops/deploy_qq_agent.sh` | 非交互部署：设置模型凭据后调用源码目录的 `deploy-all.sh -y` | 新机器初始化、CI 或远程 SSH 环境中的部署 |
 | `console` | `ops/qq-console.bat` | 使用系统 `ssh` 建立控制台 / WebUI / 远程桌面三个端口的隧道，就绪后提示或打开控制台（Windows/macOS/Linux 通用） | 日常打开控制台 |
+| `plugins` | —（插件生态新增） | 插件管理：`list` 列出已装插件（版本/能力/来源）与已授权清单；`install <文件.tar.gz>` **从本地文件装**（别人发的包、自己打的包）——sha256 由它算给你核对，装完来源记录写「本地文件：<文件名>」；`uninstall <id> [--purge-data]` 卸载并可选删除插件数据 | 不打开控制台就能装/看；小白用户拿到包只会在控制台装，命令行这条给运维与作者自测 |
 | `install-timers` | `ops/systemd/` | 生成并安装四个 systemd user 定时器：备份（每周日 04:10）、进程看门狗（每 10 分钟）、健康巡检（每 5 分钟）、审计日志清理（每月 1 日 04:20） | 安装定时任务 |
+
+## 部署纪律：只改 `ui/` 就不要重启服务
+
+**重启会掐断 OneBot 连接**（实测每次约 3 秒：`Stopping → Started → 新进程建立 WS`），
+群消息在那几秒里收不到。控制台的 `ui/` 是**每个请求现从磁盘读**的（`src/console/app.js` 的
+`handleHttp` 静态分支：`statSync` + `readFileSync` + 内容哈希强 ETag），所以：
+
+| 改了什么 | 怎么部署 | 要重启吗 |
+| --- | --- | --- |
+| 只动 `ui/**`（前端页面、样式、文案） | `rsync -a --delete <新树>/ui/ /data/qq-agent/app/ui/` | **不要** |
+| 动 `src/**`、`package.json`、systemd unit、`.env` | 铺整棵树 + `systemctl --user restart qq-agent-linux.service` | 要 |
+
+不重启也**不会**让已打开的页面拿着旧 JS：`/api/status` 里的 `uiBuild` 戳是**按请求现算**的
+（2026-10-16 从"进程启动时算一次"改过来，就是为了让这条路成立），前端轮询发现它变了会提示
+「控制台已更新，点此刷新」。部署完可以这样确认没重启：
+
+```bash
+systemctl --user show -p MainPID --value qq-agent-linux.service   # 部署前后 PID 应相同
+```
 
 ## 常用示例
 
@@ -76,9 +108,38 @@ node src/ops.js scan
 node src/ops.js scan --ignore=
 node src/ops.js scan --log="$HOME/qq-agent-undefined-calls.log"   # 有可疑调用时追加记录
 
-# 备份（先预演，再执行；N 默认取 QQ_AGENT_KEEP=4）
+# 备份（默认 AES-256-GCM 加密；先预演，再执行；N 默认取 QQ_AGENT_KEEP=4）
 node src/ops.js backup --dry-run
 node src/ops.js backup --confirm --keep=4
+# 可选：把部署机的 .env / .deployment.json / deployment-access.txt 也加密进包
+# （归档顶层 stack-credentials/；恢复时不会自动写回，需人工取用）
+node src/ops.js backup --confirm --include-stack-creds
+# 密钥：QQ_AGENT_BACKUP_KEY（64 位 hex 或口令）优先；否则用
+# ~/.config/qq-agent/backup.key（首次备份自动生成，丢失则备份不可恢复）
+
+# 恢复演练（解密最近一份备份到临时目录 + SQLite integrity_check，不碰生产数据）
+node src/ops.js backup --drill
+
+# 恢复（确认前先 --dry-run 看归档条目；服务起不来会自动回滚）
+node src/ops.js restore --from ~/qq-agent/backups/qq-agent-data-xxxx.tar.gz.enc --dry-run
+node src/ops.js restore --from ~/qq-agent/backups/qq-agent-data-xxxx.tar.gz.enc --confirm
+
+# 历史消息清理（只删 state='acked' 且超期的；pending/held 永远不删）
+# 不传 --days 时读 config.json 的 store.retentionDays（0 = 不删）
+node src/ops.js prune --days=90 --dry-run
+node src/ops.js prune --days=90 --confirm
+
+# 插件卸载（默认保留 plugin-data 与凭据；--purge-data 一并删除；--dry-run 预览）
+node src/ops.js plugins uninstall my-plugin --confirm
+node src/ops.js plugins uninstall my-plugin --purge-data --confirm
+
+# 轻量指标（需控制台令牌）：JSON 或 Prometheus 文本
+# 含 HTTP 请求/延迟、进程 RSS/heap、event-loop 利用率、LLM 调用/失败/重试/今日成本、
+# outbox 各状态、入站队列最老年龄、OneBot 连接与发送失败、插件状态/RSS/调用统计。
+curl -s -H "x-console-token: $TOKEN" http://127.0.0.1:3210/api/metrics
+curl -s -H "x-console-token: $TOKEN" "http://127.0.0.1:3210/api/metrics?format=prometheus"
+# 最近一次巡检结果（health.json）
+curl -s -H "x-console-token: $TOKEN" http://127.0.0.1:3210/api/health
 
 # 审计日志清理（控制台写操作留痕，按自然月切文件；默认保留 6 个月）
 node src/ops.js audit-prune --dry-run
@@ -104,9 +165,10 @@ QQ_AGENT_MODEL_API_KEY=... QQ_AGENT_MODEL_BASE_URL=... QQ_AGENT_MODEL=... \
 # 控制台隧道
 SSHHOST=user@your-server node src/ops.js console --open
 node src/ops.js console --print        # 只打印 ssh 命令
-# Windows 且本机没有 Node：双击仓库根目录 console-tunnel.bat
-#   console-tunnel.bat test            # 连通性自检（输出 TEST_OK / 非零退出）
-#   console-tunnel.bat forget          # 清除记住的服务器地址
+# 本机没有 Node：只下载一个脚本即可（不用克隆仓库）
+#   Windows:      console-tunnel.bat [test|forget]
+#   macOS/Linux:  bash console-tunnel.sh [test|forget]
+#   test 做连通性自检（输出 TEST_OK / 非零退出）；forget 清除记住的服务器地址
 
 # 定时器
 node src/ops.js install-timers --print
@@ -115,7 +177,10 @@ node src/ops.js install-timers --confirm
 
 ## 环境变量
 
-所有带默认值的路径均可覆盖；默认值对应「部署根目录 `/data/qq-agent`」的标准布局。
+所有带默认值的路径均可覆盖。注意：`install.sh` / `deploy-all.sh` 默认部署到
+`/mnt/data/qq-agent`，而 `ops.js` 的历史默认仍是 `/data/qq-agent`。用安装器装完后请先
+`export QQ_AGENT_DIR=/mnt/data/qq-agent`（或显式传 `--dir` / `--data`），否则体检、备份和
+定时器会看错目录。
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -123,11 +188,13 @@ node src/ops.js install-timers --confirm
 | `QQ_AGENT_APP_DIR` | `$QQ_AGENT_DIR/app` | 应用目录（`src/`、`ui/`、自带 `.runtime/node`） |
 | `QQ_AGENT_DATA_DIR` | `$QQ_AGENT_DIR/data` | 数据目录（config.json、sqlite、sessions） |
 | `QQ_AGENT_BACKUP_DIR` | `$HOME/qq-agent/backups` | 备份输出目录 |
+| `QQ_AGENT_BACKUP_KEY` | 空 | 备份加密密钥（64 位 hex 或口令）；不设则读密钥文件 |
+| `QQ_AGENT_BACKUP_KEY_FILE` | `~/.config/qq-agent/backup.key` | 密钥文件；首次加密备份自动生成（0600） |
 | `QQ_AGENT_SERVICE` | `qq-agent-linux.service` | systemd user 服务名 |
 | `QQ_AGENT_KEEP` | `4` | `backup` 保留份数（也可用 `--keep=N`） |
 | `QQ_AGENT_USER` | 当前登录用户 | 进程/定时任务检查的目标用户 |
 | `QQ_AGENT_NODE` | 自动查找 `$APP_DIR/.runtime/node-*/bin/node` | 执行 `--check` 使用的 node |
-| `QQ_AGENT_LOG` | `$HOME/qq-agent-undefined-calls.log` | 启动自检报告文件（`scan --log=` 可显式覆盖） |
+| `QQ_AGENT_LOG` | —（无消费者） | 历史遗留名：`scan` 的报告文件只认 `--log=` 显式指定，这个环境变量**不生效**（ops.js 帮助原文自述"仅文档用途"） |
 | `QQ_AGENT_LOG_LEVEL` | `info` | 应用日志级别（`error`/`warn`/`info`/`debug`，改进方案 #6） |
 | `QQ_AGENT_LOG_FORMAT` | `text` | 应用日志格式（`text` 保持原观感 / `json` 单行供 journald 过滤） |
 | `QQ_AGENT_CONSOLE_PORT` | `3210` | 控制台端口 |
@@ -146,11 +213,12 @@ node src/ops.js install-timers --confirm
 | `QQ_AGENT_VNC_PORT` | `6081` | QQ 远程桌面 / 扫码端口（`console` 隧道） |
 | `QQ_AGENT_SYSTEMD_DIR` | `~/.config/systemd/user` | `install-timers` 写入目录 |
 | `QQ_AGENT_SRC_DIR` | `$HOME/qq-agent-src` | `deploy` 的源码 checkout 目录（也可用 `--dir=`） |
-| `QQ_AGENT_ROOT_DIR` | `QQ_AGENT_DIR` | `deploy` 的部署根目录（也可用 `--root-dir=`） |
+| ~~`QQ_AGENT_ROOT_DIR`~~ | — | 已废弃：该环境变量**不生效**（代码从不读取）；`deploy` 的部署根目录请用 `--root-dir=` 参数，或直接用 `QQ_AGENT_DIR` |
 | `QQ_AGENT_MODEL_API_KEY` / `QQ_AGENT_MODEL_KEY_FILE` | 无（必填其一） | 模型凭据（文件优先级低于环境变量） |
 | `QQ_AGENT_MODEL_BASE_URL` / `QQ_AGENT_MODEL` | 无（必填） | 模型网关地址 / 模型名 |
-| `SNOWLUMA_IMAGE` | `motricseven7/snowluma:v1.14.15` | 协议端镜像（`deploy`） |
-| `QQ_AGENT_IMAGE_MIRROR` | 空 | 拉镜像失败时改走镜像站（逗号分隔多个；等价于 `deploy-all.sh --image-mirror`）。国内连不上 Docker Hub 时用，用法见 `docs/LINUX.md` |
+| `SNOWLUMA_IMAGE` | `motricseven7/snowluma:v1.14.22` | 协议端镜像（`deploy`）；已部署的实例可在控制台「设置 → OneBot → 协议端」一键升级/回滚 |
+| `QQ_AGENT_SNOWLUMA_DIR` | `<root>/snowluma` | 协议端 compose 项目目录（一键更新与体检读它的 `.env`） |
+| `QQ_AGENT_IMAGE_MIRROR` | 空 | 追加自己的镜像站（逗号分隔多个；等价于 `deploy-all.sh --image-mirror`），排在**内置兜底列表之前**。留空时也会先用内置的公共加速站（`docker.1panel.live`、`docker.m.daocloud.io`），所以国内直连不上 Docker Hub 的开箱安装通常不用设它；用法见 `docs/LINUX.md` |
 | `QQ_AGENT_ONEBOT_WS_PORT` | `3391` | 协议端 WebSocket 端口（`deploy`） |
 | `SSHHOST` / `QQ_AGENT_SSH` | **必填**（缺失直接报错退出） | 服务器地址；两种写法都支持：`SSHHOST=host` 或 `SSHHOST=user@host` / `QQ_AGENT_SSH=user@host` |
 | `SSHUSER` | `ubuntu` | SSH 登录用户 |
@@ -180,11 +248,12 @@ node src/ops.js install-timers --confirm
 
 | 子命令 | 退出码 |
 | --- | --- |
-| `scan` | 默认恒为 0（只记录、不阻断）；`--strict` 下有可疑调用则退出 1 |
+| `scan` | 默认 0（只记录、不阻断）；`--strict` 下有可疑调用或目录不存在则退出 1 |
 | `watch-send` | 0 = 工具层成功发出消息；1 = 发送失败或再次出现未定义函数；2 = 超时 |
 | `watch-login` | 0 = 已登录；1 = 超时或缺少令牌 |
 | `backup` / `deploy` / `install-timers` / `audit-prune` | 0 = 成功；1 = 参数或执行失败（缺少 `--confirm` 亦返回 1） |
-| `audit` / `audit-host` / `guard` | 恒为 0（问题仅体现在 NG / [注意] 行数） |
+| `audit` / `audit-host` | 恒为 0（问题仅体现在 NG / [注意] 行数） |
+| `guard` | 0 = 正常或仅告警；超阈值且未加 `--confirm` 时返回 1（真实清理需显式确认） |
 
 ## 定时任务
 
@@ -227,3 +296,8 @@ scp user@host:/data/qq-agent/data/messages.sqlite ./messages.sqlite
   - `scan` 默认带项目已知误报忽略表（等价于原 `check-undefined-calls.sh`），`--ignore=` 可
     关闭；`--log=文件` 等价于原启动自检的日志行为；
   - `audit` 的第 4 节会打印每个文件的未定义调用明细，并在结论中重复计数。
+
+## `ops scan --strict` 的覆盖边界
+
+只覆盖**同行裸标识符调用**（"调用点有、定义没有"那类历史事故）。不覆盖 `this.x.y()` 之类的属性调用，
+且行首的裸调用会被误当成"定义" —— 它是一道粗筛，不是类型检查。

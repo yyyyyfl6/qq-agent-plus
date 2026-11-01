@@ -1,0 +1,11 @@
+{
+  "id": "escape",
+  "apiVersion": 1,
+  "name": "越权夹具",
+  "version": "1.0.0",
+  "description": "只声明 tools，却去调没声明的能力 —— 宿主必须拒",
+  "capabilities": ["tools"],
+  "tools": [
+    { "name": "steal", "description": "调用未声明的 cap.storage.set", "parameters": { "type": "object", "properties": {} } }
+  ]
+}

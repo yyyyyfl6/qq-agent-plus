@@ -18,7 +18,9 @@ import {
   syncGraduatedFeatureNavigation
 } from '../core/dom-util.js';
 import { $, $$, esc } from '../core/dom.js';
+import { iconSvg } from '../core/icons.js';
 import { chatNameOf, clampInt, fmtTime, fmtTok, formatChatTitle } from '../core/format.js';
+import { unzipStickerImages } from '../core/zip-images.js';
 import { state } from '../core/state.js';
 function assetStateText(active, exists, activeText = '运行中') {
   if (active) return activeText;
@@ -65,15 +67,17 @@ function renderStickerAssets(data) {
   return favHint + `<div class="asset-sticker-grid">${entries.map((entry) => {
     const title = entry.localNote || entry.desc || entry.id;
     const tags = (entry.tags || []).map((tag) => `<span>${esc(tag)}</span>`).join('');
-    return `<article class="asset-sticker">
+    const selected = (state.assetStickerSelectedIds || []).includes(String(entry.id));
+    return `<article class="asset-sticker ${selected ? 'selected' : ''}">
+      ${state.assetStickerSelectMode ? `<label class="asset-sticker-select"><input type="checkbox" data-sticker-select="${esc(entry.id)}" ${selected ? 'checked' : ''} aria-label="选择表情 ${esc(title)}" /></label>` : ''}
       <div class="asset-sticker-media">
         ${entry.hasImage
           ? `<img loading="lazy" src="/api/assets/stickers/image?id=${encodeURIComponent(entry.id)}" alt="${esc(title)}" />`
           : '<span class="muted">无图片</span>'}
       </div>
       <div class="asset-sticker-body">
-        <strong title="${esc(entry.id)}">${esc(title)}</strong>
-        ${entry.desc && entry.localNote ? `<span>${esc(entry.desc)}</span>` : ''}
+        <strong title="${esc(title)}">${esc(title)}</strong>
+        ${entry.desc && entry.localNote ? `<span title="${esc(entry.desc)}">${esc(entry.desc)}</span>` : ''}
         ${tags ? `<div class="asset-tags">${tags}</div>` : ''}
         <small>${entry.source === 'qq' ? 'QQ 收藏' : entry.source === 'ai' ? 'AI 收藏' : '手动'} · 使用 ${fmtTok(entry.useCount)} 次</small>
         <div class="asset-actions">
@@ -93,7 +97,7 @@ function renderSlangAssets(data) {
   if (!entries.length) return '<div class="empty-hint">黑话库为空</div>';
   const statusText = { candidate: '候选', confirmed: '已确认', rejected: '已拒绝' };
   return `<div class="asset-table-wrap"><table class="asset-table">
-    <thead><tr><th>词条</th><th>含义</th><th>状态</th><th>出现</th><th>证据</th><th>操作</th></tr></thead>
+    <thead><tr><th>词条</th><th>含义</th><th>状态</th><th class="r">出现</th><th class="r">证据</th><th class="actions-col">操作</th></tr></thead>
     <tbody>${entries.map((entry) => `<tr>
       <td><strong>${esc(entry.content)}</strong>${entry.risk ? `<small>${esc(entry.risk)}</small>` : ''}</td>
       <td>${esc(entry.meaning || '-')}${entry.usage ? `<small>${esc(entry.usage)}</small>` : ''}</td>
@@ -115,7 +119,7 @@ function renderSlangResearch(data) {
   const entries = data?.discoveries || [];
   if (!entries.length) return '<div class="empty-hint">当前没有黑话研究记录</div>';
   return `<div class="asset-table-wrap"><table class="asset-table">
-    <thead><tr><th>词条</th><th>来源</th><th>证据</th><th>研究结论</th><th>状态</th><th>操作</th></tr></thead>
+    <thead><tr><th>词条</th><th>来源</th><th>证据</th><th>研究结论</th><th>状态</th><th class="actions-col">操作</th></tr></thead>
     <tbody>${entries.map((entry) => {
       const evidence = (entry.evidence || []).slice(-2)
         .map((item) => item.text).filter(Boolean).join('；');
@@ -267,7 +271,7 @@ function renderIdentityAssets(data) {
   const people = data?.entries || [];
   if (!people.length) return '<div class="empty-hint">统一身份库为空</div>';
   return `<div class="asset-table-wrap"><table class="asset-table">
-    <thead><tr><th>QQ</th><th>首选名称</th><th>别名</th><th>会话</th><th>消息</th><th>好友</th><th>画像备注</th><th>操作</th></tr></thead>
+    <thead><tr><th>QQ</th><th>首选名称</th><th>别名</th><th class="r">会话</th><th class="r">消息</th><th>好友</th><th>画像备注</th><th class="actions-col">操作</th></tr></thead>
     <tbody>${people.map((person) => {
       const aliases = [...new Set((person.aliases || []).map((item) =>
         typeof item === 'string' ? item : item?.alias).filter(Boolean))];
@@ -291,8 +295,13 @@ function renderIdentityAssets(data) {
 function renderMemoryAssets(data) {
   const entries = data?.entries || [];
   if (!entries.length) return '<div class="empty-hint">当前没有会话记忆</div>';
-  return `<div class="asset-table-wrap"><table class="asset-table">
-    <thead><tr><th>会话</th><th>人物</th><th>印象</th><th>最近更新</th><th>操作</th></tr></thead>
+  // 接口带 limit（默认 500，按最近更新截断）：截过就要说出来，否则用户以为"就这么多"
+  // （2026-10-08 审查：limit 加了但界面没说）
+  const total = Number(data?.total) || entries.length;
+  const capped = total > entries.length
+    ? `<div class="hint">共 ${total} 条，按最近更新只列前 ${entries.length} 条。</div>` : '';
+  return `${capped}<div class="asset-table-wrap"><table class="asset-table">
+    <thead><tr><th>会话</th><th>人物</th><th>印象</th><th>最近更新</th><th class="actions-col">操作</th></tr></thead>
     <tbody>${entries.map((entry, index) => `<tr>
       <td>${esc(formatChatTitle(entry.chatKey, chatNameOf(entry.chatKey)))}</td>
       <td><strong>${esc(entry.name || entry.userId)}</strong><small><code>${esc(entry.userId)}</code></small></td>
@@ -342,6 +351,73 @@ function finishAssetMutation(overlay) {
   return loadAssetObservatory().finally(() => { window.scrollTo?.(0, scrollY); });
 }
 
+function openStickerBatchImport() {
+  const overlay = modelModalShell({
+    head: '批量导入表情包',
+    body: `<div class="sticker-batch-progress"><progress id="sticker-batch-progress" max="1" value="0"></progress><span id="sticker-batch-progress-text">选择 ZIP 压缩包或多张图片（最多 100 张）</span></div><div class="field"><label for="sticker-batch-files">图片或 ZIP 压缩包（单张不超过 8 MiB）</label><input id="sticker-batch-files" type="file" accept=".zip,application/zip,image/png,image/jpeg,image/gif,image/webp" multiple /></div><p class="muted">使用当前配置的模型逐张分析，结果可修改后再选择性导入。</p><div id="sticker-batch-list" class="sticker-batch-list"></div>`,
+    foot: '<button class="btn" id="sticker-batch-cancel">关闭</button><button class="btn" id="sticker-batch-analyze">分析图片</button><button class="btn btn-primary" id="sticker-batch-import" disabled>导入已勾选项</button>'
+  });
+  const filesInput = overlay.querySelector('#sticker-batch-files');
+  const list = overlay.querySelector('#sticker-batch-list');
+  const analyze = overlay.querySelector('#sticker-batch-analyze');
+  const importer = overlay.querySelector('#sticker-batch-import');
+  const progress = overlay.querySelector('#sticker-batch-progress');
+  const progressText = overlay.querySelector('#sticker-batch-progress-text');
+  const rows = [];
+  const setProgress = (done, total, label) => { progress.max = Math.max(1, total); progress.value = done; progressText.textContent = `${label} ${done}/${total}`; };
+  const draw = () => {
+    list.innerHTML = rows.map((row, index) => `<article class="sticker-batch-row" data-row="${index}"><img src="${row.preview}" alt="待导入图片 ${index + 1}" /><div class="sticker-batch-fields"><label><input type="checkbox" data-field="selected" ${row.selected ? 'checked' : ''} /> 导入</label><label>名称<input data-field="desc" maxlength="80" value="${esc(row.desc)}" /></label><label>自动备注<textarea data-field="localNote" maxlength="300">${esc(row.localNote)}</textarea></label><label>标签<input data-field="tags" value="${esc(row.tags.join(', '))}" /></label><label>使用场景<textarea data-field="usage" maxlength="300">${esc(row.usage)}</textarea></label><small>${esc(row.status === 'error' ? row.error : row.status)}</small></div></article>`).join('');
+    importer.disabled = !rows.some((row) => row.selected && row.status === '已分析');
+  };
+  filesInput.addEventListener('change', () => {
+    rows.forEach((row) => URL.revokeObjectURL(row.preview)); rows.splice(0, rows.length);
+    const selectedFiles = [...(filesInput.files || [])];
+    (async () => {
+      try {
+        let files = [];
+        for (const file of selectedFiles) files.push(...(/\.zip$/i.test(file.name) ? await unzipStickerImages(file) : [file]));
+        if (files.length > 100) throw new Error('每批最多处理 100 张图片');
+        files.forEach((file) => rows.push({ file, preview: URL.createObjectURL(file), status: '待分析', selected: true, desc: '', localNote: '', tags: [], usage: '' }));
+        progressText.textContent = `已读取 ${rows.length} 张图片`;
+      } catch (error) { progressText.textContent = `压缩包读取失败：${error.message}`; }
+      draw();
+    })();
+  });
+  list.addEventListener('input', (event) => {
+    const field = event.target.dataset.field; const row = rows[Number(event.target.closest('[data-row]')?.dataset.row)];
+    if (!row || !field) return;
+    if (field === 'selected') row.selected = event.target.checked;
+    else row[field] = field === 'tags' ? event.target.value.split(/[,，\s]+/).filter(Boolean) : event.target.value;
+    importer.disabled = !rows.some((item) => item.selected && item.status === '已分析');
+  });
+  overlay.querySelector('#sticker-batch-cancel').addEventListener('click', () => { rows.forEach((row) => URL.revokeObjectURL(row.preview)); closeModelModal(overlay); });
+  analyze.addEventListener('click', async () => {
+    if (!rows.length) return alert('请先选择图片'); analyze.disabled = true;
+    const pending = rows.filter((row) => row.status !== '已分析'); let done = 0;
+    for (const row of pending) {
+      setProgress(done, pending.length, '分析中');
+      if (row.status === '已分析') continue;
+      if (row.file.size > 8 * 1024 * 1024) { row.status = 'error'; row.error = '图片不能超过 8 MiB'; draw(); continue; }
+      row.status = '分析中…'; draw();
+      try { const imageDataUrl = await readAssetImage(row.file); const result = await api('/api/assets/stickers/analyze', { method: 'POST', body: JSON.stringify({ imageDataUrl }) }); Object.assign(row, result.metadata, { status: '已分析' }); }
+      catch (error) { row.status = 'error'; row.error = error.message; } done += 1; setProgress(done, pending.length, '分析中'); draw();
+    }
+    analyze.disabled = false;
+  });
+  importer.addEventListener('click', async () => {
+    importer.disabled = true; const selected = rows.filter((row) => row.selected && row.status === '已分析'); let imported = 0;
+    await withAssetWrite(async () => {
+      let done = 0;
+      for (const row of selected) {
+        try { await api('/api/assets/stickers', { method: 'POST', body: JSON.stringify({ imageDataUrl: await readAssetImage(row.file), desc: row.desc, localNote: row.localNote, tags: row.tags, usage: row.usage }) }); row.selected = false; row.status = '已导入'; imported += 1; }
+        catch (error) { row.status = 'error'; row.error = error.message; } done += 1; setProgress(done, selected.length, '导入中'); draw();
+      }
+      if (imported) await finishAssetMutation(overlay);
+    });
+    if (!imported) importer.disabled = false;
+  });
+}
+
 function openStickerAssetEditor(entry = null) {
   const editing = Boolean(entry);
   const overlay = modelModalShell({
@@ -351,7 +427,7 @@ function openStickerAssetEditor(entry = null) {
       <div class="field"><label>图片文件</label><input type="file" id="asset-sticker-file" accept="image/png,image/jpeg,image/gif,image/webp" /></div>
       <div class="field"><label>图片 URL</label><input type="text" id="asset-sticker-url" placeholder="未选择文件时使用" /></div>`}
       <div class="field"><label>名称</label><input type="text" id="asset-sticker-desc" maxlength="80" value="${esc(entry?.desc || '')}" /></div>
-      <div class="field"><label>AI 备注</label><textarea id="asset-sticker-note">${esc(entry?.localNote || '')}</textarea></div>
+      <div class="field"><label>自动备注</label><textarea id="asset-sticker-note">${esc(entry?.localNote || '')}</textarea></div>
       <div class="field"><label>标签</label><input type="text" id="asset-sticker-tags" value="${esc((entry?.tags || []).join(', '))}" /></div>
       <div class="field"><label>使用场景</label><textarea id="asset-sticker-usage">${esc(entry?.usage || '')}</textarea></div>`,
     foot: '<button class="btn" id="asset-editor-cancel">取消</button><button class="btn btn-primary" id="asset-editor-save">保存</button>'
@@ -388,6 +464,25 @@ function openStickerAssetEditor(entry = null) {
       button.disabled = false;
     }
   });
+}
+
+async function runStickerBulkAction(ids, label, action) {
+  const progress = $('#asset-sticker-bulk-progress');
+  const message = $('#asset-sticker-bulk-progress-text');
+  if (progress) { progress.hidden = false; progress.max = ids.length; progress.value = 0; }
+  let failed = 0;
+  await withAssetWrite(async () => {
+    for (let index = 0; index < ids.length; index += 1) {
+      try { await action(ids[index]); } catch (error) { failed += 1; if (message) message.textContent = `${label} ${index + 1}/${ids.length}：${error.message}`; }
+      if (progress) progress.value = index + 1;
+      if (message && !failed) message.textContent = `${label} ${index + 1}/${ids.length}`;
+    }
+  });
+  state.assetStickerSelectedIds = [];
+  await loadAssetObservatory();
+  const text = $('#asset-sticker-bulk-progress-text');
+  if (text) text.textContent = failed ? `完成，${failed} 项失败` : '全部完成';
+  if (failed) alert(`${label}：${ids.length - failed} 项成功，${failed} 项失败。失败项可重新选择后重试。`);
 }
 
 function openSlangAssetEditor(entry = null) {
@@ -628,7 +723,7 @@ function renderAssetObservatory() {
   box.innerHTML = `
     <div class="asset-head">
       <div><h2>AI 资产观测</h2><span class="muted">更新于 ${overview.generatedAt ? esc(fmtTime(overview.generatedAt)) : '-'}</span></div>
-      <button type="button" class="icon-btn" id="asset-refresh" title="刷新当前资产" aria-label="刷新当前资产">↻</button>
+      <button type="button" class="btn btn-small" id="asset-refresh" title="刷新当前资产" aria-label="刷新当前资产">${iconSvg('refresh', { size: 15 })}<span>刷新</span></button>
     </div>
     ${renderAssetSummary(overview)}
     <div class="asset-toolbar">
@@ -638,11 +733,13 @@ function renderAssetObservatory() {
         ).join('')}
       </div>
       <div class="asset-toolbar-actions">
+        ${kind === 'stickers' ? '<button type="button" class="btn btn-small" id="asset-sticker-batch">批量导入并分析</button>' : ''}
+        ${kind === 'stickers' ? `<button type="button" class="btn btn-small" id="asset-sticker-select-mode">${state.assetStickerSelectMode ? '退出多选' : '多选管理'}</button>` : ''}
         ${kind === 'slang-research'
           ? ''
           : '<button type="button" class="btn btn-small btn-primary" id="asset-add">＋ 新增</button>'}
         <div class="asset-search">
-        <input type="search" id="asset-query" value="${esc(state.assetQuery)}" placeholder="搜索" />
+        <input type="search" id="asset-query" value="${esc(state.assetQuery)}" placeholder="搜索" aria-label="搜索资产" />
         ${kind === 'slang' ? `<select id="asset-slang-status">
           <option value="" ${slangStatus ? '' : 'selected'}>全部状态</option>
           <option value="confirmed" ${slangStatus === 'confirmed' ? 'selected' : ''}>已确认</option>
@@ -662,6 +759,7 @@ function renderAssetObservatory() {
         </div>
       </div>
     </div>
+    ${kind === 'stickers' && state.assetStickerSelectMode ? `<div class="sticker-bulk-toolbar"><label><input id="asset-sticker-select-all" type="checkbox" /> 全选当前列表</label><span id="asset-sticker-selected-count">已选 ${state.assetStickerSelectedIds.length} 项</span><button class="btn btn-small" id="asset-sticker-bulk-analyze" ${state.assetStickerSelectedIds.length ? '' : 'disabled'}>AI 分析并写入</button><button class="btn btn-small btn-danger" id="asset-sticker-bulk-delete" ${state.assetStickerSelectedIds.length ? '' : 'disabled'}>批量删除</button><progress id="asset-sticker-bulk-progress" max="1" value="0" hidden></progress><span id="asset-sticker-bulk-progress-text" aria-live="polite"></span></div>` : ''}
     <div id="asset-content">${content}</div>`;
 
   $$('#asset-page [data-asset-kind]').forEach((button) => {
@@ -677,6 +775,41 @@ function renderAssetObservatory() {
   $('#asset-refresh')?.addEventListener('click', () =>
     loadAssetObservatory({ refreshStickers: kind === 'stickers' }));
   $('#asset-add')?.addEventListener('click', () => openAssetEditor(kind));
+  $('#asset-sticker-batch')?.addEventListener('click', openStickerBatchImport);
+  $('#asset-sticker-select-mode')?.addEventListener('click', () => {
+    state.assetStickerSelectMode = !state.assetStickerSelectMode;
+    state.assetStickerSelectedIds = [];
+    renderAssetObservatory();
+  });
+  $('#asset-sticker-select-all')?.addEventListener('change', (event) => {
+    state.assetStickerSelectedIds = event.target.checked
+      ? (state.assetDetail?.entries || []).map((entry) => String(entry.id)) : [];
+    renderAssetObservatory();
+  });
+  $$('#asset-content [data-sticker-select]').forEach((checkbox) => checkbox.addEventListener('change', () => {
+    const id = String(checkbox.dataset.stickerSelect);
+    const selected = new Set(state.assetStickerSelectedIds || []);
+    if (checkbox.checked) selected.add(id); else selected.delete(id);
+    state.assetStickerSelectedIds = [...selected];
+    const count = $('#asset-sticker-selected-count');
+    if (count) count.textContent = `已选 ${selected.size} 项`;
+    $('#asset-sticker-bulk-analyze').disabled = selected.size === 0;
+    $('#asset-sticker-bulk-delete').disabled = selected.size === 0;
+    checkbox.closest('.asset-sticker')?.classList.toggle('selected', checkbox.checked);
+  }));
+  $('#asset-sticker-bulk-delete')?.addEventListener('click', async () => {
+    const ids = [...state.assetStickerSelectedIds];
+    if (ids.length && await askForConfirmation(`确定批量删除选中的 ${ids.length} 个表情包？此操作不可撤销。`)) {
+      await runStickerBulkAction(ids, '删除中', async (id) => api(`/api/assets/stickers/${encodeURIComponent(id)}`, { method: 'DELETE', body: JSON.stringify({ confirm: true }) }));
+    }
+  });
+  $('#asset-sticker-bulk-analyze')?.addEventListener('click', async () => {
+    const ids = [...state.assetStickerSelectedIds];
+    if (ids.length) await runStickerBulkAction(ids, 'AI 分析中', async (id) => {
+      const result = await api('/api/assets/stickers/analyze', { method: 'POST', body: JSON.stringify({ stickerId: id }) });
+      await api(`/api/assets/stickers/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(result.metadata) });
+    });
+  });
   const search = () => {
     state.assetQuery = $('#asset-query')?.value || '';
     state.assetSlangStatus = $('#asset-slang-status')?.value || '';
@@ -993,14 +1126,14 @@ function bindFeatureAssetActions(rootSelector, kind, entries) {
   });
 }
 
-function renderIdentityFeaturePageImpl(status, identities, memories) {
+function renderIdentityFeaturePageImpl(status, identities, memories, options = {}) {
   const box = $('#identity-page');
   if (!box) return;
   const query = state.identityFeatureQuery || '';
   const __html = `
     <div class="asset-head">
       <div><h2>人物统一印象</h2><span class="muted" id="identity-feature-state">${status.active ? `运行中 · 最近索引 ${status.lastIndexedAt ? esc(fmtTime(status.lastIndexedAt)) : '-'}` : status.enabled ? `启动失败${status.error ? `：${esc(status.error)}` : ''}` : '当前已停用'}</span></div>
-      <button type="button" class="icon-btn" id="identity-feature-refresh" title="刷新人物与旧印象" aria-label="刷新人物与旧印象">↻</button>
+      <button type="button" class="btn btn-small" id="identity-feature-refresh" title="刷新人物与旧印象" aria-label="刷新人物与旧印象">${iconSvg('refresh', { size: 15 })}<span>刷新</span></button>
     </div>
     <div class="asset-summary">
       <div class="asset-summary-item"><span>统一人物</span><strong>${fmtTok(status.people)}</strong><small>按 QQ 号跨会话聚合</small></div>
@@ -1017,25 +1150,27 @@ function renderIdentityFeaturePageImpl(status, identities, memories) {
         <button type="button" class="btn btn-small" id="identity-add-person">＋ 人物</button>
         <button type="button" class="btn btn-small" id="identity-add-memory">＋ 旧印象</button>
         <div class="asset-search">
-          <input type="search" id="identity-feature-query" value="${esc(query)}" placeholder="搜索人物或印象" />
+          <input type="search" id="identity-feature-query" value="${esc(query)}" placeholder="搜索人物或印象" aria-label="搜索人物或印象" />
           <button type="button" class="btn btn-small" id="identity-feature-search">搜索</button>
         </div>
       </div>
     </div>
-    <section class="control-section">
+    <section class="settings-card">
       <h3>统一人物</h3>
       <div id="identity-feature-people">${renderIdentityAssets(identities)}</div>
     </section>
-    <section class="control-section">
+    <section class="settings-card">
       <h3>旧印象</h3>
       <div id="identity-feature-memories">${renderMemoryAssets(memories)}</div>
     </section>`;
-  if (!setHtmlIfChanged(box, __html)) return;
+  if (!setHtmlIfChanged(box, __html, options)) return;
 
   $('#identity-feature-refresh')?.addEventListener('click', () => loadIdentityFeaturePage());
   const search = () => {
     state.identityFeatureQuery = $('#identity-feature-query')?.value || '';
-    loadIdentityFeaturePage();
+    // force：搜索框此刻正拿着焦点，不 force 的话这次"用户自己点的搜索"会被焦点守卫挡掉，
+    // 结果还是上一批（2026-10-04 复审 P1）
+    loadIdentityFeaturePage({ force: true });
   };
   $('#identity-feature-search')?.addEventListener('click', search);
   $('#identity-feature-query')?.addEventListener('keydown', (event) => {
@@ -1066,7 +1201,10 @@ function renderFriendFeaturePageImpl(c, status) {
   const __html = `
     <div class="asset-head">
       <div><h2>好友管理</h2><span class="muted" id="friend-feature-state">${status.active ? '统一身份库运行中' : status.enabled ? '统一身份库启动失败' : '人物统一印象已停用'}</span></div>
-      <button type="button" class="icon-btn" id="friend-feature-refresh" title="刷新好友工作流" aria-label="刷新好友工作流">↻</button>
+      <div class="asset-head-actions">
+        <button type="button" class="btn btn-small" id="friend-feature-refresh" title="刷新好友工作流" aria-label="刷新好友工作流">${iconSvg('refresh', { size: 15 })}<span>刷新</span></button>
+        <button type="button" class="btn btn-primary btn-small" id="friend-feature-save">保存好友设置</button>
+      </div>
     </div>
     <div class="asset-summary">
       <div class="asset-summary-item"><span>主动候选待审批</span><strong>${fmtTok(proposalCounts.pending)}</strong><small>管理员批准后发送</small></div>
@@ -1074,17 +1212,32 @@ function renderFriendFeaturePageImpl(c, status) {
       <div class="asset-summary-item"><span>评估中</span><strong>${fmtTok(opportunityCounts.active)}</strong><small>${fmtTok(opportunityCounts.reviewFailed)} 次失败</small></div>
       <div class="asset-summary-item"><span>好友关系快照</span><strong>${status.friendProposal?.friendStatusTrusted ? '可信' : '不可用'}</strong><small>${status.friendProposal?.friendSnapshotAt ? esc(fmtTime(status.friendProposal.friendSnapshotAt)) : '未知时不触发'}</small></div>
     </div>
-    <section class="control-section">
+    <div class="hint friend-save-result" id="friend-feature-save-result"></div>
+    <section class="settings-card">
       <div class="control-section-title">
-        <div><h3>运行设置</h3><span class="muted">主动加好友已退役（Issue #10），下表配置不再生效；入站好友请求审批不受影响</span></div>
-        <button type="button" class="btn btn-primary btn-small" id="friend-feature-save">保存好友设置</button>
+        <div><h3>基础设置</h3><span class="muted">主动加好友已退役（Issue #10），以下主动配置不再生效；入站好友请求审批不受影响</span></div>
       </div>
       <div class="field-row">
-        <div class="field"><label>好友审批管理员 QQ</label><input type="text" id="cfg-identity-friend-owner" inputmode="numeric" value="${esc(friend.ownerUin || '')}" /></div>
+        <!-- 管理员 QQ 的唯一编辑入口在「设置 → 模型 API → 全局管理员 QQ」：这里从第一次渲染起
+             就是"提示 + hidden 镜像"，DOM 不再变化（原来渲染真输入框、随后被 stable-features 换成
+             hidden，于是"切走再回来这一格就没了"）。保存路径读的仍是 #cfg-identity-friend-owner。 -->
+        <div class="field"><label>好友审批管理员 QQ</label>
+          <span class="hint" style="margin:0">统一在「设置 → 模型 API → 全局管理员 QQ」里配置
+            <button type="button" class="link-btn" data-open-settings="api">去设置</button></span>
+          <input type="hidden" id="cfg-identity-friend-owner" data-global-admin-mirror="true" value="${esc(friend.ownerUin || '')}" /></div>
         <div class="field"><label>候选生成模式</label><select id="cfg-identity-friend-mode"><option value="triggered" ${friend.mode === 'triggered' ? 'selected' : ''}>消息触发评估</option><option value="prompt" ${friend.mode !== 'triggered' ? 'selected' : ''}>旧版提示词提名</option></select></div>
         <div class="field"><label>旧模式最低累计消息</label><input type="number" id="cfg-identity-friend-min-messages" min="1" max="10000" value="${esc(friend.minMessageCount ?? 50)}" /></div>
         <div class="field"><label>同一用户冷却天数</label><input type="number" id="cfg-identity-friend-cooldown" min="1" max="365" value="${esc(friend.cooldownDays ?? 30)}" /></div>
         <div class="field"><label>主动候选待审批上限</label><input type="number" id="cfg-identity-friend-max-pending" min="1" max="100" value="${esc(friend.maxPending ?? 10)}" /></div>
+      </div>
+      <div class="checkbox-row switch-row">
+        <input type="checkbox" id="cfg-identity-friend-dispatch" ${friend.activeDispatchEnabled === true ? 'checked' : ''} />
+        <label for="cfg-identity-friend-dispatch">管理员批准后主动发送好友申请</label>
+      </div>
+    </section>
+    <section class="settings-card">
+      <div class="control-section-title">
+        <div><h3>触发条件</h3><span class="muted">消息进入评估队列前先过这些门槛</span></div>
       </div>
       <div class="field-row">
         <div class="field"><label>抽签概率（%）</label><input type="number" id="cfg-friend-trigger-probability" min="0" max="100" step="0.1" value="${esc((Number(triggered.probability ?? 0.05) * 100).toFixed(1))}" /></div>
@@ -1092,19 +1245,27 @@ function renderFriendFeaturePageImpl(c, status) {
         <div class="field"><label>最低有效发言</label><input type="number" id="cfg-friend-trigger-min-messages" min="0" max="10000" value="${esc(triggered.minMessages ?? 50)}" /></div>
         <div class="field"><label>最低活跃日</label><input type="number" id="cfg-friend-trigger-min-days" min="0" max="365" value="${esc(triggered.minActiveDays ?? 3)}" /></div>
         <div class="field"><label>最低双向交流</label><input type="number" id="cfg-friend-trigger-min-exchanges" min="0" max="1000" value="${esc(triggered.minDirectExchanges ?? 3)}" /></div>
-      </div>
-      <div class="field-row">
         <div class="field"><label>触发消息最长延迟（分钟）</label><input type="number" id="cfg-friend-trigger-max-age" min="1" max="1440" value="${esc(triggered.maxTriggerAgeMinutes ?? 10)}" /></div>
         <div class="field"><label>好友快照最长缓存（分钟）</label><input type="number" id="cfg-friend-trigger-friend-age" min="1" max="1440" value="${esc(triggered.friendStatusMaxAgeMinutes ?? 15)}" /></div>
+      </div>
+    </section>
+    <section class="settings-card">
+      <div class="control-section-title">
+        <div><h3>频率与配额</h3><span class="muted">冷却、每日额度与提名分数线</span></div>
+      </div>
+      <div class="field-row">
         <div class="field"><label>抽签冷却（分钟）</label><input type="number" id="cfg-friend-trigger-draw-cooldown" min="1" max="10080" value="${esc(triggered.drawCooldownMinutes ?? 30)}" /></div>
         <div class="field"><label>每人每日抽签上限</label><input type="number" id="cfg-friend-trigger-max-draws" min="1" max="1000" value="${esc(triggered.maxDrawsPerUserPerDay ?? 6)}" /></div>
         <div class="field"><label>每日模型评估上限</label><input type="number" id="cfg-friend-trigger-max-reviews" min="0" max="1000" value="${esc(triggered.maxReviewsPerDay ?? 10)}" /></div>
         <div class="field"><label>提名分数线</label><input type="number" id="cfg-friend-trigger-threshold" min="0" max="100" value="${esc(triggered.scoreThreshold ?? 70)}" /></div>
-      </div>
-      <div class="field-row">
         <div class="field"><label>模型跳过冷却（天）</label><input type="number" id="cfg-friend-trigger-skip-cooldown" min="0" max="365" value="${esc(triggered.skipCooldownDays ?? 7)}" /></div>
         <div class="field"><label>评估失败冷却（分钟）</label><input type="number" id="cfg-friend-trigger-error-cooldown" min="1" max="10080" value="${esc(triggered.errorCooldownMinutes ?? 60)}" /></div>
         <div class="field"><label>评估排队期限（秒）</label><input type="number" id="cfg-friend-trigger-queue-age" min="5" max="3600" value="${esc(triggered.maxQueueAgeSeconds ?? 120)}" /></div>
+      </div>
+    </section>
+    <section class="settings-card">
+      <div class="control-section-title">
+        <div><h3>评分权重</h3><span class="muted">四项权重共同决定提名分数</span></div>
       </div>
       <div class="field-row">
         <div class="field"><label>互动质量权重</label><input type="number" id="cfg-friend-weight-quality" min="0" max="100" value="${esc(triggered.weights?.quality ?? 40)}" /></div>
@@ -1113,29 +1274,27 @@ function renderFriendFeaturePageImpl(c, status) {
         <div class="field"><label>关系稳定权重</label><input type="number" id="cfg-friend-weight-stability" min="0" max="100" value="${esc(triggered.weights?.stability ?? 10)}" /></div>
       </div>
       <div class="hint">已经是好友的用户不会进入抽签或模型评估；好友状态无法确认时同样不会触发。四项权重合计必须为 100。</div>
-      <div class="checkbox-row">
-        <input type="checkbox" id="cfg-identity-friend-dispatch" ${friend.activeDispatchEnabled === true ? 'checked' : ''} />
-        <label for="cfg-identity-friend-dispatch">管理员批准后主动发送好友申请</label>
-      </div>
+    </section>
+    <section class="settings-card">
+      <h3>入站好友请求</h3>
       <div class="field-row">
         <div class="field"><label>入站请求待审批上限</label><input type="number" id="cfg-identity-incoming-max-pending" min="1" max="500" value="${esc(incoming.maxPending ?? 50)}" /></div>
       </div>
-      <div class="checkbox-row">
+      <div class="checkbox-row switch-row">
         <input type="checkbox" id="cfg-identity-incoming-auto-whitelist" ${incoming.autoWhitelist !== false ? 'checked' : ''} />
         <label for="cfg-identity-incoming-auto-whitelist">同意或确认成为好友后自动加入私聊白名单</label>
       </div>
       <div class="hint" id="identity-friend-protocol">${esc(status.friendProposal?.protocolNote || '')}</div>
-      <div class="hint" id="friend-feature-save-result"></div>
     </section>
-    <section class="control-section" id="identity-incoming-friend-box">
+    <section class="settings-card" id="identity-incoming-friend-box">
       <h3>收到的好友请求</h3>
       <div class="identity-pilot-people" id="identity-incoming-friend-requests"></div>
     </section>
-    <section class="control-section" id="identity-friend-proposal-box">
-      <h3>Agent 主动好友候选</h3>
+    <section class="settings-card" id="identity-friend-proposal-box">
+      <h3>主动好友候选</h3>
       <div class="identity-pilot-people" id="identity-friend-proposals"></div>
     </section>
-    <section class="control-section" id="identity-friend-opportunity-box">
+    <section class="settings-card" id="identity-friend-opportunity-box">
       <h3>消息触发与评估记录</h3>
       <div class="identity-pilot-people" id="identity-friend-opportunities"></div>
     </section>`;
@@ -1209,7 +1368,7 @@ function renderSlangFeaturePage(c, status) {
   const __html = `
     <div class="asset-head">
       <div><h2>黑话研究</h2><span class="muted">${status.active ? `运行中 · 待研究 ${fmtTok(status.pendingResearch)} · 待入库 ${fmtTok(status.pendingAdmission)}` : status.enabled ? `启动失败${status.error ? `：${esc(status.error)}` : ''}` : '当前已停用'}</span></div>
-      <button type="button" class="icon-btn" id="slang-feature-refresh" title="刷新黑话状态" aria-label="刷新黑话状态">↻</button>
+      <button type="button" class="btn btn-small" id="slang-feature-refresh" title="刷新黑话状态" aria-label="刷新黑话状态">${iconSvg('refresh', { size: 15 })}<span>刷新</span></button>
     </div>
     <section class="control-section">
       <div class="control-section-title">
@@ -1217,7 +1376,10 @@ function renderSlangFeaturePage(c, status) {
         <button type="button" class="btn btn-primary btn-small" id="slang-feature-save">保存研究设置</button>
       </div>
       <div class="field-row">
-        <div class="field"><label>审批管理员 QQ</label><input type="text" id="cfg-slang-owner" inputmode="numeric" value="${esc(slang.ownerUin || c.identityPilot?.friendProposal?.ownerUin || '')}" /></div>
+        <div class="field"><label>审批管理员 QQ</label>
+          <span class="hint" style="margin:0">统一在「设置 → 模型 API → 全局管理员 QQ」里配置
+            <button type="button" class="link-btn" data-open-settings="api">去设置</button></span>
+          <input type="hidden" id="cfg-slang-owner" data-global-admin-mirror="true" value="${esc(slang.ownerUin || c.identityPilot?.friendProposal?.ownerUin || '')}" /></div>
         <div class="field"><label>最少出现次数</label><input type="number" id="cfg-slang-min-occurrences" min="2" max="20" value="${esc(slang.minOccurrences ?? 3)}" /></div>
         <div class="field"><label>最少发言人数</label><input type="number" id="cfg-slang-min-speakers" min="1" max="20" value="${esc(slang.minSpeakers ?? 2)}" /></div>
         <div class="field"><label>统计窗口（小时）</label><input type="number" id="cfg-slang-window-hours" min="1" max="720" value="${esc(slang.windowHours ?? 72)}" /></div>
@@ -1293,7 +1455,8 @@ async function saveSlangFeatureConfig() {
 async function loadSlangFeaturePage() {
   const box = $('#slang-page');
   if (!box) return;
-  box.innerHTML = '<div class="empty-hint">正在读取黑话研究配置…</div>';
+  box.__renderedHtml = null;   // 与 setBoxError 同理：直接写 innerHTML 就得清去重缓存，
+  box.innerHTML = '<div class="empty-hint">正在读取黑话研究配置…</div>';   // 否则下轮 HTML 与缓存相同会被跳过
   try {
     const [cfg, status] = await Promise.all([
       api('/api/config'),
@@ -1308,7 +1471,7 @@ async function loadSlangFeaturePage() {
   }
 }
 
-function renderIncidentFeaturePageImpl(c, status, incidents = []) {
+function renderIncidentFeaturePageImpl(c, status, incidents = [], options = {}) {
   const box = $('#incident-page');
   if (!box) return;
   const settings = c.incidentPilot || {};
@@ -1316,7 +1479,7 @@ function renderIncidentFeaturePageImpl(c, status, incidents = []) {
   const __html = `
     <div class="asset-head">
       <div><h2>异常</h2><span class="muted">${status.active ? '异常处理试点运行中' : status.exists ? '试点已停用，保留只读日志' : '异常处理试点尚未启用'}</span></div>
-      <button type="button" class="icon-btn" id="incident-feature-refresh" title="刷新异常" aria-label="刷新异常">↻</button>
+      <button type="button" class="btn btn-small" id="incident-feature-refresh" title="刷新异常" aria-label="刷新异常">${iconSvg('refresh', { size: 15 })}<span>刷新</span></button>
     </div>
     <div class="asset-summary">
       <div class="asset-summary-item"><span>待处理</span><strong>${fmtTok(counts.open)}</strong><small>尚未确认或解决</small></div>
@@ -1324,13 +1487,16 @@ function renderIncidentFeaturePageImpl(c, status, incidents = []) {
       <div class="asset-summary-item"><span>已确认</span><strong>${fmtTok(counts.acknowledged)}</strong><small>已看到，尚未解决</small></div>
       <div class="asset-summary-item"><span>告警待发送</span><strong>${fmtTok(status.pendingNotifications)}</strong><small>OneBot 恢复后发送</small></div>
     </div>
-    <section class="control-section">
+    <section class="settings-card">
       <div class="control-section-title">
         <div><h3>告警与策略</h3><span class="muted">启停由“设置 → 实验功能”统一控制</span></div>
         <button type="button" class="btn btn-primary btn-small" id="incident-feature-save">保存异常设置</button>
       </div>
       <div class="field-row">
-        <div class="field"><label>告警管理员 QQ</label><input type="text" id="cfg-incident-owner" inputmode="numeric" value="${esc(settings.ownerUin || '')}" /></div>
+        <div class="field"><label>告警管理员 QQ</label>
+          <span class="hint" style="margin:0">统一在「设置 → 模型 API → 全局管理员 QQ」里配置
+            <button type="button" class="link-btn" data-open-settings="api">去设置</button></span>
+          <input type="hidden" id="cfg-incident-owner" data-global-admin-mirror="true" value="${esc(settings.ownerUin || '')}" /></div>
         <div class="field"><label>同类异常合并窗口（分钟）</label><input type="number" id="cfg-incident-window" min="1" max="1440" value="${esc(settings.duplicateWindowMinutes ?? 10)}" /></div>
         <div class="field"><label>已解决日志保留天数</label><input type="number" id="cfg-incident-retention" min="1" max="3650" value="${esc(settings.retentionDays ?? 90)}" /></div>
       </div>
@@ -1341,7 +1507,7 @@ function renderIncidentFeaturePageImpl(c, status, incidents = []) {
       <div class="hint">关闭兼容策略后，未知旧写入仍不重试，但新消息可以继续处理。</div>
       <div class="hint" id="incident-feature-save-result"></div>
     </section>
-    <section class="control-section">
+    <section class="settings-card">
       <div class="control-section-title">
         <div><h3>异常日志</h3><span class="muted">删除日志不会解除未知写入或改变会话状态</span></div>
         <div class="settings-actions" style="margin:0">
@@ -1382,39 +1548,56 @@ function renderIncidentFeaturePageImpl(c, status, incidents = []) {
       </table></div>
       ${incidents.length ? '' : '<div class="empty-hint">当前筛选条件下没有异常日志</div>'}
     </section>`;
-  if (!setHtmlIfChanged(box, __html)) return;
+  if (!setHtmlIfChanged(box, __html, options)) return;
 
   $('#incident-feature-refresh')?.addEventListener('click', () => loadIncidentFeaturePage());
   $('#incident-feature-save')?.addEventListener('click', saveIncidentFeatureConfig);
+  // force：选完筛选项焦点还在这个 <select> 上，不 force 的话表格不刷新 —— 用户看到的是
+  // "筛选完全没反应"，而这一屏此刻正把没筛选的那批行当筛选结果看（2026-10-04 复审 P1）
   $('#incident-state-filter')?.addEventListener('change', (event) => {
     state.incidentState = event.target.value;
-    loadIncidentFeaturePage();
+    loadIncidentFeaturePage({ force: true });
   });
   $('#incident-severity-filter')?.addEventListener('change', (event) => {
     state.incidentSeverity = event.target.value;
-    loadIncidentFeaturePage();
+    loadIncidentFeaturePage({ force: true });
   });
-  $$('[data-incident-ack]', box).forEach((button) => button.addEventListener('click', async () => {
+  // 三个动作都要"失败看得见"：原来没有 try/catch，请求一失败就只剩一条控制台报错 ——
+  // 按钮点了没反应、行还挂着"待处理"，用户只会以为界面卡了（2026-10-08 审查）。
+  // 与同文件里的保存动作同一口径：出错弹一句原文，成功后重拉列表。
+  const incidentAction = (selector, run) => {
+    $$(selector, box).forEach((button) => button.addEventListener('click', async () => {
+      button.disabled = true;
+      try {
+        await run(button);
+      } catch (error) {
+        alert(error?.message || String(error));
+      } finally {
+        button.disabled = false;
+      }
+    }));
+  };
+  incidentAction('[data-incident-ack]', async (button) => {
     await api(`/api/incidents/${encodeURIComponent(button.dataset.incidentAck)}/acknowledge`, {
       method: 'POST', body: '{}'
     });
     loadIncidentFeaturePage();
-  }));
-  $$('[data-incident-resolve]', box).forEach((button) => button.addEventListener('click', async () => {
+  });
+  incidentAction('[data-incident-resolve]', async (button) => {
     const resolution = prompt('填写处理结果');
     if (!resolution?.trim()) return;
     await api(`/api/incidents/${encodeURIComponent(button.dataset.incidentResolve)}/resolve`, {
       method: 'POST', body: JSON.stringify({ resolution: resolution.trim() })
     });
     loadIncidentFeaturePage();
-  }));
-  $$('[data-incident-delete]', box).forEach((button) => button.addEventListener('click', async () => {
+  });
+  incidentAction('[data-incident-delete]', async (button) => {
     if (!await askForConfirmation('删除这条已解决的异常日志？业务状态和 Session 不会被删除。')) return;
     await api(`/api/incidents/${encodeURIComponent(button.dataset.incidentDelete)}`, {
       method: 'DELETE', body: JSON.stringify({ confirm: true })
     });
     loadIncidentFeaturePage();
-  }));
+  });
 }
 
 async function saveIncidentFeatureConfig() {
@@ -1450,10 +1633,13 @@ async function loadExperimentalFeatureStatuses() {
   const friendNode = $('#experiment-auto-friend-state');
   const slangNode = $('#slang-pilot-state');
   const incidentNode = $('#incident-pilot-state');
-  const [identityResult, slangResult, incidentResult] = await Promise.allSettled([
+  const livingNode = $('#living-memory-state');
+  const livingBadge = $('#living-memory-badge');
+  const [identityResult, slangResult, incidentResult, livingResult] = await Promise.allSettled([
       api('/api/identity-pilot/status'),
       api('/api/slang-pilot/status'),
-      api('/api/incident-pilot/status')
+      api('/api/incident-pilot/status'),
+      api('/api/living-memory/status')
   ]);
   if (identityResult.status === 'fulfilled') {
     const identity = identityResult.value;
@@ -1485,6 +1671,26 @@ async function loadExperimentalFeatureStatuses() {
   } else if (incidentNode) {
     incidentNode.textContent =
       `状态读取失败：${incidentResult.reason?.message || incidentResult.reason}`;
+  }
+  if (livingNode && livingResult.status === 'fulfilled') {
+    const payload = livingResult.value || {};
+    const cfg = payload.config || state.config?.livingMemory || {};
+    const status = payload.status || {};
+    const active = Number(status.stats?.active) || 0;
+    const mode = cfg.graduated === true ? '已固化' : '实验中';
+    if (livingBadge) {
+      livingBadge.textContent = mode;
+      livingBadge.classList.toggle('is-solid', cfg.graduated === true);
+    }
+    if (status.ok === false) {
+      livingNode.textContent = `初始化失败：${status.error || '未知错误'}`;
+    } else {
+      const running = cfg.enabled !== true ? '已停用' : status.initialized === false ? '等待首条记忆' : '运行中';
+      const recall = cfg.mode === 'active' ? '注入模式' : '影子模式';
+      livingNode.textContent = `${running} · ${recall} · ${active} 条活跃记忆`;
+    }
+  } else if (livingNode) {
+    livingNode.textContent = `状态读取失败：${livingResult.reason?.message || livingResult.reason}`;
   }
 }
 

@@ -8,7 +8,7 @@ import { DATA_DIR, getConfig } from '../core/config.js';
 import { IMAGE_EXTENSIONS, imageType } from '../core/image-type.js';
 import { resolveSelfName } from '../core/util.js';
 import {
-  loadStickerStore, saveStickerStore, mergeStickerLibrary,
+  loadStickerStore, saveStickerStore, mergeStickerLibrary, STICKER_SYNC_LIMIT,
   findSticker, formatStickerList, applyStickerNote, markStickerUsed,
   normalizeStickerEntry
 } from './stickers.js';
@@ -25,6 +25,19 @@ function stickerSourceKey(url) {
   const text = String(url || '');
   const fileid = /[?&]fileid=([^&]+)/.exec(text)?.[1];
   return fileid || text.slice(0, 120);
+}
+
+// 收藏判定的「判定标准」：配置 sticker.collectCriteria 填了就用它的，留空用下面这套内置默认。
+// 默认值 = 现状（老 config.json 一字不改照旧跑）；上限 2000 字，防把判定请求撑爆。
+export const STICKER_JUDGE_DEFAULT_CRITERIA = '判断标准只有一条：以后聊天时用得上吗。'
+  + '值得收：真正的表情包——带字的梗图、猫猫狗狗、卡通形象、抽象搞笑图，能拿来表达情绪、吐槽或怼人的。'
+  + '不值得收：本人或朋友的生活照、随手拍、自拍，以及跟聊天无关的截图（游戏、聊天记录、网页）、二维码、证件、广告、纯风景照。'
+  + '拿不准就问自己一句：以后聊天时真会用上吗。会就用得上才收，不会就别收。';
+
+/** 收藏判定的判定标准：配置里填了就用配置的，否则用内置默认（默认值即现状）。 */
+export function stickerJudgeCriteria(config = {}) {
+  const custom = String(config?.sticker?.collectCriteria || '').trim();
+  return custom ? custom.slice(0, 2000) : STICKER_JUDGE_DEFAULT_CRITERIA;
 }
 
 import { chatCompletionWithRetry } from '../llm/llm.js';
@@ -87,13 +100,33 @@ export class StickerManager {
     if (!force && this.syncedAt && now - this.syncedAt < ttl) {
       return { entries: this.entries, fromCache: true };
     }
-    if (this.syncing) return this.syncing;
-    this.syncing = (async () => {
+    if (this.syncing) {
+      if (!force) return this.syncing;
+      // 强同步不能被在途的普通同步吞掉：调用方（QQ 收藏自动收藏路径）刚加完收藏就
+      // force 同步，要的是"这份结果包含刚加的那条"；复用加收藏之前发起的在途请求，
+      // 新 emoji 不在 entries 里 → 随后的 peek 落空、备注永久丢失（2026-10-07 复审）。
+      // 等它 settle（成败都算）再实实在在地拉一次，并接管 this.syncing 的所有权，
+      // 免得旧请求收尾时把链尾清掉。
+      const inflight = this.syncing;
+      const chained = inflight.catch(() => {}).then(() => this.#runSync());
+      this.syncing = chained;
+      chained.then(() => { if (this.syncing === chained) this.syncing = null; }, () => { if (this.syncing === chained) this.syncing = null; });
+      return chained;
+    }
+    const run = this.#runSync();
+    this.syncing = run;
+    // 只有还归自己所有时才清：链式强同步会把 this.syncing 换成新链尾。
+    run.then(() => { if (this.syncing === run) this.syncing = null; }, () => { if (this.syncing === run) this.syncing = null; });
+    return run;
+  }
+
+  #runSync() {
+    return (async () => {
       try {
         // 同步窗口固定按上限拉，**不能**挂在 sticker.promptMaxStickers 上 ——
         // 那个设置只决定"系统提示里常驻几条"，改小它会让同步只拉到一小截，
         // 而 mergeStickerLibrary 会把没出现在这次响应里的 QQ 收藏剪掉（连同备注、使用计数）。
-        const count = 500;
+        const count = STICKER_SYNC_LIMIT;
         const data = await this.onebot.call('fetch_custom_face_detail', { count });
         const fetched = Array.isArray(data) ? data : (Array.isArray(data?.data) ? data.data : null);
         if (!fetched) throw new Error('fetch_custom_face_detail 返回 data 不是数组');
@@ -105,11 +138,8 @@ export class StickerManager {
       } catch (error) {
         // 同步失败不致命：本地缓存继续用
         return { entries: this.entries, fromCache: true, error: String(error?.message ?? error) };
-      } finally {
-        this.syncing = null;
       }
     })();
-    return this.syncing;
   }
 
   async list(query = '', limit = 48, force = false) {
@@ -496,7 +526,9 @@ export class StickerManager {
 
   /**
    * 收藏配额预检（#9 双闸：每会话 + 全局）：工具层在"看图判断"之前先问一句，别白跑一次视觉调用。
-   * 只查不记 —— 真正扣额度发生在 collect() 落库成功之后。返回 { ok, scope:'chat'|'global'|'' }。
+   * 只查不记 —— 真正的"扣/退"在 collect() 里（事前原子消费 + 失败退款，见 #collect 门面），
+   * 这里只是让工具层在做视觉判断**之前**先问一句，省掉一次白跑的看图调用。
+   * 返回 { ok, scope:'chat'|'global'|'' }。
    */
   collectPeek(now = Date.now(), chatKey = '') {
     this.#configureCollectQuota();
@@ -532,10 +564,8 @@ export class StickerManager {
       {
         role: 'system',
         content: `你是「${botName}」，一个混在 QQ 群里的普通群友，正在看群友刚发的一张图。`
-          + '判断标准只有一条：以后聊天时用得上吗。'
-          + '值得收：真正的表情包——带字的梗图、猫猫狗狗、卡通形象、抽象搞笑图，能拿来表达情绪、吐槽或怼人的。'
-          + '不值得收：本人或朋友的生活照、随手拍、自拍，以及跟聊天无关的截图（游戏、聊天记录、网页）、二维码、证件、广告、纯风景照。'
-          + '拿不准就问自己一句：以后聊天时真会用上吗。会就用得上才收，不会就别收。'
+          // 判定标准可配置：留空即内置默认（默认值 = 现状）；身份那句由代码补在前面。
+          + stickerJudgeCriteria(getConfig())
       },
       {
         role: 'user',
@@ -621,18 +651,34 @@ export class StickerManager {
     };
   }
 
-  /** 收藏一条消息里的图片（本地新增条目，不入 QQ 收藏）。 */
-  async collect(messageId, { url, note = '', srcKey = '', signal, chatKey = '' } = {}) {
-    note = String(note ?? '').slice(0, 300);
-    if (!getConfig().sticker?.collectEnabled) throw new Error('收藏表情功能未开启');
-    // 限频（#9 双闸：每会话 + 全局；只查，落库成功后才扣）
+  /**
+   * 收藏一条消息里的图片（本地新增条目，不入 QQ 收藏）。
+   * 限频（#9 双闸：每会话 + 全局）用**事前原子消费**，失败/写库失败再 refund 退回 ——
+   * 原来是 peek → 下载/判定/落库 → tryConsume（还忽略返回值）：两个并发收藏会双双通过 peek、
+   * 都落库并超上限（quota.js 文件头把这个形态列为并发下封不住的反例；生图 2026-10-01 已修）。
+   * 2026-10-03 全量审查。
+   */
+  async collect(messageId, opts = {}) {
+    const chatKey = String(opts?.chatKey || '');
     const now = Date.now();
-    const gate = this.collectPeek(now, chatKey);
+    this.#configureCollectQuota();
+    const gate = this.collectQuota.tryConsume(chatKey, now);
     if (!gate.ok) {
       throw new Error(gate.scope === 'chat'
         ? '本会话收藏太频繁了（每小时有上限），过一会儿再收'
         : '收藏太频繁了（全局每小时有上限），过一会儿再收');
     }
+    try {
+      return await this.#collect(messageId, opts);
+    } catch (error) {
+      this.collectQuota.refund(chatKey, now);   // 没成功就退回去（不能白扣用户的额度）
+      throw error;
+    }
+  }
+
+  async #collect(messageId, { url, note = '', srcKey = '', signal } = {}) {
+    note = String(note ?? '').slice(0, 300);
+    if (!getConfig().sticker?.collectEnabled) throw new Error('收藏表情功能未开启');
     url = String(url || '');
     if (!url) throw new Error('该消息没有可收藏的图片地址');
     const id = `collected_${messageId}`;
@@ -678,7 +724,6 @@ export class StickerManager {
       try { fs.rmSync(assetFile, { force: true }); } catch { /* 清不掉无害 */ }
       throw error;
     }
-    this.collectQuota.tryConsume(chatKey, now);   // 落库成功才扣额度
     return entry;
   }
 }

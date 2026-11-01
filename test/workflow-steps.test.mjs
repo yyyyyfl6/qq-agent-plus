@@ -90,3 +90,11 @@ test('.github/workflows 下每个 step 都有 run: 或 uses:', () => {
   }
   assert.deepEqual(problems, [], `工作流里有 GitHub 会拒载的孤儿 step：\n${problems.join('\n')}`);
 });
+
+test('release workflow 会校验 tag 与 package.json 版本一致（打错 tag 会被挡下）', async () => {
+  const fs = await import('node:fs');
+  const url = new URL('../.github/workflows/release.yml', import.meta.url);
+  const src = fs.readFileSync(url, 'utf8');
+  assert.ok(/GITHUB_REF_NAME#v/.test(src) && /package\.json/.test(src) && /PKG_VERSION/.test(src),
+    'release.yml 里要有 tag↔package.json 版本对账这一步（src/auto-update.js 按 tag 判版本）');
+});

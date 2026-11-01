@@ -1,0 +1,11 @@
+{
+  "id": "lazy-tools",
+  "apiVersion": 1,
+  "name": "懒启动夹具",
+  "version": "1.0.0",
+  "description": "只有工具、不观察消息也不起周期任务：这类插件由宿主按需起进程、空闲停掉",
+  "capabilities": ["tools"],
+  "tools": [
+    { "name": "ping", "description": "回一声", "parameters": { "type": "object", "properties": {} } }
+  ]
+}

@@ -5,6 +5,8 @@
 // ownerUin 的读取口径与 src/auto-update.js 的 autoUpdateOwner 保持一致（admin 一节存在时
 // 是唯一真相，老字段仅做无 admin 一节时的回退）。这里有意不 import auto-update.js：
 // 本模块会被 ops 定时器在任意环境加载，不背它的部署依赖。
+// http-body.js 是零依赖实现（只有 node 内建），带它不违背上面的约束。
+import { readJsonBounded } from './http-body.js';
 
 export function readOwnerUin(config = {}) {
   const hasAdmin = Boolean(
@@ -25,20 +27,22 @@ export function readOwnerUin(config = {}) {
  * 给 owner 发一条 QQ 私聊。
  * @returns {{ ok: boolean, detail: string }} 失败时 detail 带原因（供 health-check 记录）。
  */
-export async function sendOwnerText({ httpPort = 3390, token = '', ownerUin, text, fetchImpl = globalThis.fetch } = {}) {
+export async function sendOwnerText({ httpPort = 3390, httpUrl = '', token = '', ownerUin, text, fetchImpl = globalThis.fetch } = {}) {
   const owner = String(ownerUin || '').trim();
   if (!/^\d{5,15}$/.test(owner)) return { ok: false, detail: '未配置有效的全局管理员 QQ（admin.ownerUin）' };
   if (typeof fetchImpl !== 'function') return { ok: false, detail: '运行环境没有 fetch' };
+  // 容器里协议端是 compose 网络里的 snowluma:3000，不能拼 127.0.0.1；有完整 URL 就用它。
+  const base = String(httpUrl || '').trim().replace(/\/+$/, '') || `http://127.0.0.1:${httpPort}`;
   try {
     const headers = { 'content-type': 'application/json' };
     if (token) headers.authorization = `Bearer ${token}`;
-    const res = await fetchImpl(`http://127.0.0.1:${httpPort}/send_private_msg`, {
+    const res = await fetchImpl(`${base}/send_private_msg`, {
       method: 'POST',
       headers,
       body: JSON.stringify({ user_id: Number(owner), message: text })
     });
     if (!res.ok) return { ok: false, detail: `OneBot HTTP ${res.status}` };
-    const data = await res.json().catch(() => ({}));
+    const data = await readJsonBounded(res, 256 * 1024).catch(() => ({}));
     if (data?.status && data.status !== 'ok') return { ok: false, detail: `OneBot retcode ${data.retcode ?? data.status}` };
     return { ok: true, detail: '' };
   } catch (error) {

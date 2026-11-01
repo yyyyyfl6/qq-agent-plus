@@ -34,7 +34,8 @@ test('仓库根的关键文件/目录都在', () => {
     'roles/duzui-sunyou.md',
     'roles/wenrou-peiliao.md',
     'roles/jishu-zhai.md',
-    'roles/maoniang.md'
+    'roles/maoniang.md',
+    'roles/sunba.md'
   ]) {
     assert.ok(fs.existsSync(path.join(repoRoot, rel)), `缺少 ${rel}`);
   }
@@ -81,4 +82,26 @@ test('按硬编码路径部署/更新的入口文件没被挪走', () => {
   for (const rel of ['src/server.js', 'src/auto-update.js', 'scripts/configure-linux.mjs']) {
     assert.ok(deploy.includes(rel), `deploy.sh 的必需清单应包含 ${rel}`);
   }
+});
+
+test('用例不碰真实数据目录：引用 tools-core 必须先设 QQ_AGENT_DATA_DIR 且不得静态 import', () => {
+  // tools-core 在定义期就会读配置（buildToolDefs → getConfig，persist 会回写 data/config.json）：
+  // 用例必须先把 QQ_AGENT_DATA_DIR 指到临时目录、再用动态 import 载入；静态 import 先于任何
+  // 代码执行，env 来不及生效（2026-10-12 审查：两个用例文件曾回写真实仓库的 data/config.json）。
+  const offenders = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) { walk(full); continue; }
+      if (!/\.mjs$/.test(entry.name)) continue;
+      const src = fs.readFileSync(full, 'utf8');
+      const rel = path.relative(repoRoot, full);
+      const staticImport = /^\s*import\s[^;]*from\s*['"][^'"]*tools-core[^'"]*['"]/m.test(src);
+      const dynamicImport = /import\(\s*['"][^'"]*tools-core[^'"]*['"]/.test(src);
+      if (staticImport) offenders.push(`${rel}：静态 import tools-core（env 来不及生效），应改动态 import`);
+      else if (dynamicImport && !src.includes('QQ_AGENT_DATA_DIR')) offenders.push(`${rel}：动态 import tools-core 但没设 QQ_AGENT_DATA_DIR`);
+    }
+  };
+  walk(path.join(repoRoot, 'test'));
+  assert.deepEqual(offenders, [], `这些用例会把真实 data/ 当数据目录：\n${offenders.join('\n')}`);
 });

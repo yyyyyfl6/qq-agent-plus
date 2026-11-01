@@ -1,5 +1,5 @@
-// 扩展功能（src/extensions/*）：长期记忆 / 群聊总结 / 大肥鱼桥 / 趣味功能 + 实验室电脑端脚本。
-// 重点钉住：未启用不建库、记忆的可见范围、派发结果不确定时不重试、只认管理员本人。
+// 扩展功能（src/extensions/*）：群聊总结 / 大肥鱼桥 / 趣味功能 / 专属指令 + 实验室电脑端脚本。
+// 重点钉住：派发结果不确定时不重试、只认管理员本人、指令唤醒前消费且不重复执行。
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import fs from 'node:fs';
@@ -17,7 +17,6 @@ fs.writeFileSync(path.join(dataDir, 'config.json'), JSON.stringify({
 
 const { updateConfig } = await import('../src/core/config.js');
 const shared = await import('../src/extensions/shared.js');
-const lm = await import('../src/extensions/long-memory.js');
 const cs = await import('../src/extensions/chat-summary.js');
 const lab = await import('../src/extensions/lab-bridge.js');
 const fun = await import('../src/extensions/fun-tools.js');
@@ -54,112 +53,6 @@ test('triggeredOnlyByOwner：全部触发者都是管理员才算；混进别人
   assert.equal(shared.triggeredOnlyByOwner({ triggerSenderIds: ['10001', '20002'] }, cfg), false);
   assert.equal(shared.triggeredOnlyByOwner({ triggerSenderIds: [] }, cfg), false);
   assert.equal(shared.triggeredOnlyByOwner({ triggerSenderIds: ['10001'] }, { admin: {} }), false);
-});
-
-// ── 长期记忆 ────────────────────────────────────────────────────
-test('长期记忆：从没启用过不建库；只读接口不会把库建出来', () => {
-  const dir = tmp('lm0');
-  const rt = new lm.LongMemoryRuntime({ dataDir: dir });
-  rt.start();                       // 配置里 enabled=false
-  assert.equal(rt.memory.exists(), false);
-  assert.deepEqual(rt.memory.list({}).items, []);
-  assert.equal(rt.memory.count(), 0);
-  assert.equal(fs.existsSync(lm.longMemoryDatabasePath(dir)), false);
-});
-
-test('长期记忆：相似内容合并更新，不重复记；词法检索按相关度排序', () => {
-  const store = new lm.LongMemoryStore({ dataDir: tmp('lm1') });
-  const a = store.add({ chatKey: 'group:1', content: '阿杰 11 月 20 日考研，说考完请大家吃饭', importance: 4 });
-  assert.equal(a.merged, false);
-  const b = store.add({ chatKey: 'group:1', content: '阿杰 11 月 20 日考研，考完请大家吃饭' });
-  assert.equal(b.merged, true);
-  assert.equal(store.count(), 1);
-  assert.equal(store.get(a.entry.id).importance, 4, '合并时重要度取较大值');
-  store.add({ chatKey: 'group:1', content: '小林养了一只叫煤球的黑猫' });
-  store.add({ chatKey: 'group:1', content: '群里约好周六晚上一起打麻将' });
-  const hits = store.search('阿杰考得怎么样', { chatKey: 'group:1', scope: 'chat', limit: 3 });
-  assert.ok(hits.length >= 1);
-  assert.match(hits[0].entry.content, /阿杰/);
-  const cat = store.search('煤球最近还好吗', { chatKey: 'group:1', scope: 'chat', limit: 3 });
-  assert.match(cat[0].entry.content, /煤球/);
-});
-
-test('长期记忆：scope=chat 不跨会话；scope=global 时群里不召回私聊来源', () => {
-  const store = new lm.LongMemoryStore({ dataDir: tmp('lm2') });
-  store.add({ chatKey: 'group:1', content: '阿杰在群一说他要考研' });
-  store.add({ chatKey: 'private:9', content: '阿杰私聊说他其实很焦虑考研' });
-  assert.equal(store.search('阿杰 考研', { chatKey: 'group:2', scope: 'chat' }).length, 0);
-  const inGroup = store.search('阿杰 考研', { chatKey: 'group:2', scope: 'global' });
-  assert.ok(inGroup.length === 1 && inGroup[0].entry.chatKey === 'group:1');
-  const inPrivate = store.search('阿杰 考研', { chatKey: 'private:9', scope: 'global' });
-  assert.equal(inPrivate.length, 2);
-});
-
-test('长期记忆：超过上限按"不重要且久没想起"淘汰', () => {
-  const store = new lm.LongMemoryStore({ dataDir: tmp('lm3') });
-  const cfg = { longMemory: { maxEntries: 100 } };
-  // 每条用互不相干的汉字，避免触发"相似内容合并"
-  const content = (i) => [0x4e00, 0x5400, 0x5c00, 0x6400].map((b, k) => String.fromCharCode(b + i * 11 + k * 3)).join('');
-  for (let i = 0; i < 101; i += 1) {
-    store.add({ chatKey: 'group:1', content: content(i), importance: i === 0 ? 5 : 1 }, cfg);
-  }
-  assert.equal(store.count(), 100);
-  assert.equal(store.list({ q: content(0) }).total, 1, '重要度最高的那条保留');
-  assert.equal(store.list({ q: content(1) }).total, 0, '最早、最不重要的那条被淘汰');
-});
-
-test('长期记忆：自动提炼走增量水位，模型输出坏 JSON 也不炸', async () => {
-  updateConfig({ longMemory: { enabled: true } });
-  const rows = Array.from({ length: 12 }, (_, i) => ({ id: i + 1, chatKey: 'group:5', ts: Date.now(), senderId: '20002', senderName: '阿杰', text: `消息${i}` }));
-  const outputs = [
-    '```json\n{"memories":[{"content":"阿杰下周去北京出差","aboutUserId":"20002","aboutName":"阿杰","importance":3}]}\n```',
-    'not json at all'
-  ];
-  const rt = new lm.LongMemoryRuntime({
-    dataDir: tmp('lm4'), store: fakeStore(rows), log: () => {},
-    complete: async () => ({ message: { content: outputs.shift() } })
-  });
-  const first = await rt.extractChat('group:5');
-  assert.equal(first.added, 1);
-  assert.equal(rt.memory.extractState('group:5').lastMessageId, 12);
-  const second = await rt.extractChat('group:5');
-  assert.equal(second.note, '没有新消息', '水位之前的消息不再重复提炼');
-  rows.push({ id: 13, chatKey: 'group:5', ts: Date.now(), senderId: '20002', senderName: '阿杰', text: '又来一条' });
-  const third = await rt.extractChat('group:5');
-  assert.equal(third.added, 0);
-  const ctx = await rt.promptContext({ chatKey: 'group:5', triggerEntries: [{ senderName: '小明', text: '阿杰去北京了吗' }] });
-  assert.match(ctx, /长期记忆/);
-  assert.match(ctx, /北京出差/);
-  updateConfig({ longMemory: { enabled: false } });
-  assert.equal(await rt.promptContext({ chatKey: 'group:5', triggerEntries: [{ text: '阿杰去北京了吗' }] }), '', '关闭后不召回');
-});
-
-test('长期记忆：向量服务不同主机时不复用聊天模型 Key', async () => {
-  updateConfig({ longMemory: { enabled: true, embedding: { enabled: true, baseUrl: 'https://emb.other.com/v1', model: 'bge', apiKey: '' } } });
-  await assert.rejects(lm.embedTexts(['x'], { fetchFn: async () => { throw new Error('不该发请求'); } }), /不是同一家/);
-  let auth = '';
-  updateConfig({ longMemory: { embedding: { baseUrl: 'https://gateway.example.com/v1' } } });
-  const vecs = await lm.embedTexts(['a', 'b'], {
-    fetchFn: async (url, opts) => {
-      auth = opts.headers.authorization;
-      return jsonResponse(200, { data: [{ index: 1, embedding: [0, 1] }, { index: 0, embedding: [1, 0] }] });
-    }
-  });
-  assert.equal(auth, 'Bearer model-key');
-  assert.deepEqual(vecs, [[1, 0], [0, 1]], '按 index 排序');
-  updateConfig({ longMemory: { enabled: false, embedding: { enabled: false, baseUrl: '', model: '' } } });
-});
-
-test('长期记忆：控制台配置保存时 Key 留空/掩码保持原值，下发时不带 Key', () => {
-  lm.saveLongMemoryConfig({ embedding: { apiKey: 'emb-secret' } });
-  lm.saveLongMemoryConfig({ recallTopK: 6, embedding: { apiKey: '******' } });
-  assert.equal(lm.longMemoryConfig().embedding.apiKey, 'emb-secret');
-  const pub = lm.publicLongMemoryConfig();
-  assert.equal(pub.embedding.apiKey, undefined);
-  assert.equal(pub.embedding.hasApiKey, true);
-  assert.equal(pub.recallTopK, 6);
-  lm.saveLongMemoryConfig({ embedding: { clearApiKey: true } });
-  assert.equal(lm.longMemoryConfig().embedding.apiKey, '');
 });
 
 // ── 群聊总结 ────────────────────────────────────────────────────
@@ -335,9 +228,9 @@ test('扩展工具：关闭时全部不注入；打开后按场合注入', async
   const defs = ext.extensionToolDefs();
   const names = (kind) => defs.filter((d) => ext.extensionToolAvailable(d, { cfg: getConfig(), kind })).map((d) => d.name);
   assert.deepEqual(names('group'), []);
-  updateConfig({ longMemory: { enabled: true }, funTools: { enabled: true }, chatSummary: { enabled: true } });
-  assert.deepEqual(names('group').sort(), ['daily_fun', 'long_memory_forget', 'long_memory_save', 'long_memory_search', 'summarize_chat']);
-  updateConfig({ longMemory: { enabled: false }, funTools: { enabled: false }, chatSummary: { enabled: false } });
+  updateConfig({ funTools: { enabled: true }, chatSummary: { enabled: true } });
+  assert.deepEqual(names('group').sort(), ['daily_fun', 'summarize_chat']);
+  updateConfig({ funTools: { enabled: false }, chatSummary: { enabled: false } });
   assert.equal(ext.extensionToolAvailable({ name: 'send_message' }, {}), true, '普通工具不受影响');
 });
 
@@ -377,4 +270,81 @@ test('人设接口：试聊带上草稿卡与历史；起草校验格式；覆�
   const { getConfig } = await import('../src/core/config.js');
   assert.deepEqual(getConfig().customPersonas[0], { name: '旧卡', text: '新正文', behaviorProfile: 'legacy', customRules: '规则' });
   assert.equal((await call('PUT', '/api/persona-templates/custom_5', { text: 'x' })).code, 404);
+});
+
+// ── 专属指令 ────────────────────────────────────────────────────
+test('triggerSenderIdsOf：读宿主 ctx.triggerEntries（排除自己）', () => {
+  const ctx = { triggerEntries: [{ senderId: '10001' }, { senderId: 'self', self: true }, { senderId: '' }] };
+  assert.deepEqual(shared.triggerSenderIdsOf(ctx), ['10001']);
+  assert.equal(shared.triggeredOnlyByOwner(ctx, { admin: { ownerUin: '10001' } }), true);
+});
+
+test('指令匹配：完整词 + 参数；/总结 的条数 / 小时 / 侧重点', async () => {
+  const { matchCommand, parseSummaryArgs } = await import('../src/extensions/commands.js');
+  assert.equal(matchCommand('/总结', ['/总结']), '');
+  assert.equal(matchCommand(' /总结  200 ', ['/总结']), '200');
+  assert.equal(matchCommand('/总结x', ['/总结']), null);
+  assert.equal(matchCommand('我想/总结', ['/总结']), null);
+  assert.deepEqual(parseSummaryArgs('200'), { count: 200, hours: 0, focus: '' });
+  assert.deepEqual(parseSummaryArgs('3h'), { count: 0, hours: 3, focus: '' });
+  assert.deepEqual(parseSummaryArgs('5小时 周末 聚餐'), { count: 0, hours: 5, focus: '周末 聚餐' });
+});
+
+test('/总结：唤醒前消费、直接发出、同一条消息不重复；关掉功能或清空指令就不拦', async () => {
+  const { ExtensionCommands } = await import('../src/extensions/commands.js');
+  updateConfig({ chatSummary: { enabled: true, commands: ['/总结'], commandAccess: 'everyone', maxPerHourPerChat: 5 } });
+  const rows = Array.from({ length: 30 }, (_, i) => ({ id: i + 1, chatKey: 'group:9', ts: Date.now(), senderId: '2', senderName: '乙', text: `话${i}` }));
+  const sent = [];
+  const summary = new cs.ChatSummaryRuntime({
+    store: fakeStore(rows),
+    sender: { sendTextBatch: async (k, m) => { sent.push([k, m]); return { sent: m }; } },
+    complete: async ({ messages }) => ({ message: { content: `总结：${/最近|发言最多/.test(messages[1].content) ? 'ok' : ''}` } })
+  });
+  const replies = [];
+  const cmds = new ExtensionCommands({ getRuntimes: () => ({ chatSummary: summary }), send: async (k, t) => replies.push([k, t]), log: () => {} });
+  assert.equal(await cmds.consume('group:9', '2', '/总结 20', 'm1'), true);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0][0], 'group:9');
+  assert.match(sent[0][1][0], /总结：ok/);
+  assert.equal(await cmds.consume('group:9', '2', '/总结 20', 'm1'), true, '重复投递仍算已处理');
+  assert.equal(sent.length, 1, '但不会再总结一次');
+  assert.equal(await cmds.consume('group:9', '2', '随便聊聊', 'm2'), false);
+  updateConfig({ chatSummary: { commandAccess: 'owner' } });
+  assert.equal(await cmds.consume('group:9', '2', '/总结', 'm3'), false, '仅管理员时群友的 /总结 当普通消息');
+  updateConfig({ chatSummary: { commandAccess: 'everyone', commands: [] } });
+  assert.equal(await cmds.consume('group:9', '2', '/总结', 'm4'), false, '清空指令即关闭');
+  updateConfig({ chatSummary: { enabled: false, commands: ['/总结', '总结一下'] } });
+  assert.equal(await cmds.consume('group:9', '2', '/总结', 'm5'), false);
+});
+
+test('/lab：只认管理员私聊；派发、列表、重启后重放同一条消息不重复派发', async () => {
+  const { ExtensionCommands } = await import('../src/extensions/commands.js');
+  updateConfig({ labBridge: { enabled: true, baseUrl: 'http://127.0.0.1:8790', token: 'tok-1234567890abcdef', privateOnly: true, commands: ['/lab'] } });
+  const dir = tmp('labcmd');
+  let posts = 0;
+  const fetchFn = async (url) => {
+    if (String(url).endsWith('/v1/tasks')) { posts += 1; return jsonResponse(202, { id: `r${posts}` }); }
+    return jsonResponse(200, { status: 'running', output: '' });
+  };
+  const replies = [];
+  const make = () => {
+    const labRt = new lab.LabBridgeRuntime({ dataDir: dir, fetchFn, log: () => {} });
+    return { labRt, cmds: new ExtensionCommands({ getRuntimes: () => ({ labBridge: labRt }), send: async (k, t) => replies.push([k, t]), log: () => {} }) };
+  };
+  let { labRt, cmds } = make();
+  assert.equal(await cmds.consume('private:20002', '20002', '/lab rm -rf /', 'x1'), false, '非管理员当普通消息');
+  assert.equal(await cmds.consume('group:1', '10001', '/lab 看日志', 'x2'), false, '私聊限定时群里不拦');
+  assert.equal(posts, 0);
+  assert.equal(await cmds.consume('private:10001', '10001', '/lab 看一下 train.log', 'x3'), true);
+  assert.equal(posts, 1);
+  assert.match(replies.at(-1)[1], /已交给.*（#1）/);
+  assert.equal(labRt.get(1).originMid, 'x3');
+  labRt.stop();
+  ({ labRt, cmds } = make());   // 模拟重启：内存去重清空
+  assert.equal(await cmds.consume('private:10001', '10001', '/lab 看一下 train.log', 'x3'), true);
+  assert.equal(posts, 1, '同一条消息重放不会派第二次');
+  await cmds.consume('private:10001', '10001', '/lab', 'x4');
+  assert.match(replies.at(-1)[1], /#1 running/);
+  labRt.stop();
+  updateConfig({ labBridge: { enabled: false } });
 });

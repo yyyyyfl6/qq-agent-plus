@@ -3,6 +3,7 @@
 // 故意问一个不存在的路由也 404（先路由后鉴权）→ 那个路由确实不存在；DashScope 的 ASR 是
 // chat/completions + input_audio 这种形态。paraformer-v2 / sensevoice-v1 只有异步文件识别，暂不适配。
 import { asrApiKey, getConfig } from '../core/config.js';
+import { readTextBounded } from '../core/http-body.js';
 
 /** 默认地址与模型（控制台预设用；也允许用户改成别的兼容网关）。 */
 export const DASHSCOPE_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
@@ -43,7 +44,8 @@ export async function dashscopeTranscribe(wavBuffer, {
       }),
       signal: controller.signal
     });
-    const text = await res.text();
+    // 有界读（1MB）：转写结果本应很小，超限视为上游异常并中断（2026-10-09 审查）
+    const text = await readTextBounded(res, 1024 * 1024);
     if (!res.ok) throw new Error(`语音识别服务返回 ${res.status}：${String(text).slice(0, 200)}`);
     let data = null;
     try { data = JSON.parse(text); } catch { /* 有的网关直接回纯文本 */ }

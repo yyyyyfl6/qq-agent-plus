@@ -7,6 +7,7 @@
 import { getConfig, updateConfig } from '../core/config.js';
 import { builtinVisionResults } from './model-vision-docs.js';
 import { withTimeWindow, assertTimeAllowed } from '../core/time-gate.js';
+import { readJsonBounded } from '../core/http-body.js';
 
 // 1×1 像素 PNG（70 字节），足够让视觉模型"看到点什么"，也不会浪费 token。
 const TINY_PNG =
@@ -57,6 +58,17 @@ export function visionEnabled(cfg = getConfig()) {
 }
 
 /**
+ * 表情库的"看图"能力：模型能看图 **且** 表情包功能开着 **且**「消息类型」里没关表情查看。
+ * 工具摘除（orchestrator）与提示词（表情清单 / 策略段）必须用同一个判定 ——
+ * 只判 visionEnabled 时，关掉 stickers 后工具没了、提示词还在教"先 get_sticker_image 看一眼"。
+ */
+export function stickerVisionEnabled(cfg = getConfig()) {
+  return visionEnabled(cfg)
+    && cfg?.sticker?.enabled !== false
+    && cfg?.messageTypes?.stickers !== false;
+}
+
+/**
  * 探测单个模型。返回 { verdict, note, httpStatus, latencyMs }。
  * verdict: 'vision' 接受图片内容；'no-vision' 明确拒绝图片内容；'unknown' 无法判定。
  */
@@ -92,7 +104,10 @@ async function detectModelVisionRequest({ baseUrl, apiKey, model }, timeoutMs, s
     return { ...base, note: error?.name === 'TimeoutError' ? '探测请求超时' : `网络错误：${error?.message ?? error}` };
   }
   const latencyMs = Date.now() - started;
-  const body = await res.json().catch(() => ({}));
+  // 有界读（256KB 足够）：探测响应本应很小，超限/非 JSON 一律按"无细节"处理，
+  // 由下面的判定逻辑落到 unknown（2026-10-09 审查）。
+  let body = {};
+  try { body = await readJsonBounded(res, 256 * 1024); } catch { body = {}; }
   const errText = String(body?.error?.message ?? body?.message ?? body?.detail?.error?.message ?? '');
 
   if (res.ok && Array.isArray(body?.choices) && body.choices.length > 0) {
@@ -146,14 +161,27 @@ export async function scanModelsVision({ providers, emit = null, limit = 3, time
   // + fs.writeFileSync 同步落盘。扫 50 个模型 = 50 次全量序列化 + 50 次阻塞写盘，
   // 扫描期间主线程被 I/O 拖住，中途崩溃还会留下半写状态。
   const pending = new Map();
+  // 定时器回调里的异常没有 worker 的 .catch 兜（runTask 里那次有，:171）——磁盘满/无权限时
+  // updateConfig 的 writeFileSync 裸抛会变成 uncaughtException 直接 process.exit(1)，
+  // systemd 反复重启、进行中会话全断（2026-10-06 复审 P2）。这里自己兜住：失败留 pending
+  // 下轮重试，只记日志。
   const flushPending = () => {
     if (!pending.size) return;
     const patch = {};
     for (const [key, v] of pending) patch[key] = v;
+    try {
+      updateConfig({ modelVision: patch });
+    } catch (error) {
+      emit?.('vision-scan', { error: `结果落盘失败（下轮重试）：${String(error?.message ?? error)}` });
+      return;
+    }
     pending.clear();
-    updateConfig({ modelVision: patch });
   };
-  const flushTimer = setInterval(flushPending, 2000);
+  const flushTimer = setInterval(() => {
+    try {
+      flushPending();
+    } catch { /* flushPending 内部已兜底；这里再兜一层保定时器回调绝不上抛 */ }
+  }, 2000);
 
   const runTask = async (task) => {
     const key = `${task.providerId}|||${task.model}`;

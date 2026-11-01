@@ -15,6 +15,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { toClassicScript } from './helpers/ui-module-source.mjs';
 import http from 'node:http';
+import net from 'node:net';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -23,12 +24,24 @@ process.env.QQ_AGENT_DATA_DIR = dataDir;
 // 隔离端口：app.start() 不接收参数（下面的 PORT 形参从未生效），实际绑定的是
 // config.server.port（默认 3210）。宿主机上跑着生产实例时（服务器上就是常态），
 // 整条 npm test 会被 EADDRINUSE 打断 —— 把隔离端口显式写进临时配置，让本测试
-// 真正自包含，不依赖"宿主机 3210 恰好空闲"。
+// 真正自包含。端口用 listen(0) 现拿（2026-10-10 审查：原来写死 40995，同机两个安装
+// 并发跑更新门禁、或恰好有进程占用它时，整条门禁被 EADDRINUSE 拦死——
+// strictPort 不会回退端口）。它本测试自占一次后立刻释放，竞态窗口可忽略。
 // 种子配置用应用自己的 DEFAULT_CONFIG **整份**写盘（2026-10-01 审查）：原来只写 server 一节，
 // 剩下全靠"缺省合并"兜住 —— 那样测不到真实配置形态下的读取路径（少一个键就少一段覆盖）。
+const freeListenPort = () => new Promise((resolve, reject) => {
+  const srv = net.createServer();
+  srv.unref();
+  srv.on('error', reject);
+  srv.listen(0, '127.0.0.1', () => {
+    const { port } = srv.address();
+    srv.close(() => resolve(port));
+  });
+});
 const { DEFAULT_CONFIG } = await import('../src/core/config.js');
 const seededConfig = structuredClone(DEFAULT_CONFIG);
-seededConfig.server = { ...seededConfig.server, port: 40995, host: '127.0.0.1' };
+const PORT = await freeListenPort();
+seededConfig.server = { ...seededConfig.server, port: PORT, host: '127.0.0.1' };
 fs.writeFileSync(path.join(dataDir, 'config.json'), JSON.stringify(seededConfig));
 process.on('exit', () => { try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch { /* Windows 上可能被句柄占着 */ } });
 const { createApp } = await import('../src/console/app.js');
@@ -38,7 +51,6 @@ const check = (n, c, e = '') => { if (c) { pass++; console.log('  OK   ' + n); }
 
 // ── 起真服务 ──
 const app = createApp({ log: () => {} });
-const PORT = 40995;
 const port = await app.start(PORT);
 console.log('=== 真实服务已启动 :' + port + '（接口全部真实，无 mock）===\n');
 
@@ -55,7 +67,11 @@ function makeEl(id = '') {
     querySelector(sel) { el._q[sel] ||= makeEl(); return el._q[sel]; },
     querySelectorAll: () => [],
     appendChild(c) { el.children.push(c); return c; },
+    // 侧栏（ui/core/side-nav.js）会读 data-side-* 开关、往列表首位插滑块；
+    // 桩缺这两个方法时整页渲染会抛（2026-10-08 踩到）
+    insertBefore(c) { el.children.unshift(c); return c; },
     remove() {}, closest: () => null, setAttribute() {}, getAttribute: () => null,
+    hasAttribute: () => false, removeAttribute() {},
     focus() {}, scrollIntoView() {}
   };
   el.classList = {
@@ -168,6 +184,10 @@ console.log('\n=== 数值填充（真实数据）===');
 // 所以显式再调一次 updateUsagePage，确保读到的是刚填入的值。
 const freshStats = await realFetch('/api/usage/stats?range=7').then((r) => r.json());
 const freshSt = await realFetch('/api/status').then((r) => r.json());
+// 「全部」档（2026-10-12 审查）：此前 Number('all')||7 → 标签与数据都变成"最近 7 天"
+const allStats = await realFetch('/api/usage/stats?range=all').then((r) => r.json());
+check('「全部」档真的给全部（label/mode）', allStats.rangeLabel === '全部' && allStats.mode === 'all',
+  `label=${allStats.rangeLabel} mode=${allStats.mode}`);
 ctx.updateUsagePage(freshStats, freshSt, priceData || {});
 const f = (n) => String(usageBox.querySelector(`[data-field="${n}"]`)?.textContent || '');
 const cost = f('cost'), runs = f('runs'), search = f('search'), prompt = f('prompt');
@@ -302,4 +322,6 @@ check('控制页不是错误提示', !controlHtml.includes('服务状态读取�
 
 await app.stop();
 console.log('\n' + (fail ? 'FAILED ' + fail : 'ALL PASSED ' + pass));
-process.exit(fail ? 1 : 0);
+// 不用 process.exit：app.stop() 之后还有句柄在异步关闭。Windows 上强制退出会撞
+// libuv 的 UV_HANDLE_CLOSING 断言——用例全过却以 127 结束（test-suite 重定向 TMP 后必现）。
+process.exitCode = fail ? 1 : 0;

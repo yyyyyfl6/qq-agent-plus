@@ -1,0 +1,31 @@
+{
+  "id": "gh-activity",
+  "apiVersion": 1,
+  "name": "GitHub 仓库动态",
+  "version": "1.0.0",
+  "description": "查一个 GitHub 仓库最近怎么样：star/issue 数、最近几次提交、最新 issue 标题、最后推送时间（公开 API，不需要 Key）",
+  "entry": "index.mjs",
+  "capabilities": [
+    "tools",
+    "http",
+    "config"
+  ],
+  "tools": [
+    {
+      "name": "repo_activity",
+      "description": "查一个 GitHub 仓库的当前状态与最近动态：star / fork / 未关闭 issue 与 PR 数、最近几次提交（含时间）、最新几个 issue 标题、最后推送时间、是否已归档。参数 repo 写 owner/repo，例如 torvalds/linux（也接受完整仓库 URL）。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "repo": {
+            "type": "string",
+            "description": "仓库，形如 owner/repo（例如 microsoft/vscode）"
+          }
+        },
+        "required": [
+          "repo"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,121 @@
+# 一键全栈：协议端（SnowLuma）+ QQ Agent。
+#
+#   docker compose up -d
+#
+# 只更新应用（协议端在别处）：
+#   QQ_AGENT_ONEBOT_WS_URL=ws://<主机>:3001 QQ_AGENT_ONEBOT_HTTP_URL=http://<主机>:3000 \
+#     docker compose up -d agent
+#
+# 控制台与协议端 WebUI 默认只绑宿主机 127.0.0.1：远程访问请用 SSH 隧道或带 TLS 的反代，
+# 不要把 3210/5099 直接暴露到公网。
+name: qq-agent
+
+services:
+  snowluma:
+    # 国内网络：Docker Hub 不可直连，默认走镜像站。要用官方镜像设：
+    #   SNOWLUMA_IMAGE=motricseven7/snowluma:v1.14.22
+    image: ${SNOWLUMA_IMAGE:-docker.m.daocloud.io/motricseven7/snowluma:v1.14.22}
+    container_name: ${SNOWLUMA_CONTAINER:-qq-agent-snowluma}
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    shm_size: 1gb
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 1048576
+    # SnowLuma 的 Chromium 需要 ptrace；这两项是它自己文档要求，不是给 Agent 的。
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      # 留空＝SnowLuma 随机生成并打印在首次启动日志；不要用公开默认密码。
+      VNC_PASSWD: ${VNC_PASSWD:-}
+      SNOWLUMA_ONEBOT_HOST: 0.0.0.0
+      SNOWLUMA_UID: ${SNOWLUMA_UID:-1000}
+      SNOWLUMA_GID: ${SNOWLUMA_GID:-1000}
+      SNOWLUMA_WEBUI_HOST: 0.0.0.0
+      SNOWLUMA_WEBUI_PORT: "5099"
+      SNOWLUMA_WEBUI_BOOTSTRAP_PASSWORD: ${SNOWLUMA_WEBUI_BOOTSTRAP_PASSWORD:-}
+      SNOWLUMA_LOG_LEVEL: ${SNOWLUMA_LOG_LEVEL:-info}
+      SNOWLUMA_SCREEN: ${SNOWLUMA_SCREEN:-1920x1080x24}
+      SNOWLUMA_HOOK_AUTOLOAD: "1"
+      SNOWLUMA_QQ_FLAGS: --disable-gpu --disable-software-rasterizer --disable-gpu-compositing
+      SNOWLUMA_TELEMETRY: "0"
+    ports:
+      - "127.0.0.1:${SNOWLUMA_WEBUI_HOST_PORT:-5099}:5099"
+      - "127.0.0.1:${NOVNC_PORT:-6081}:6081"
+    volumes:
+      # 与 Agent 的 ./data 分开，避免两个服务抢同一个目录
+      - ./snowluma-data:/app/data
+      - ./snowluma-client-config:/app/.config
+      - ./snowluma-client-data:/app/.local/share
+
+  agent:
+    # 默认用阿里云 ACR 的公开镜像（国内可直连）；海外/其他仓库设：
+    #   QQ_AGENT_IMAGE=ghcr.io/sakurawwwxh/qq-agent-plus:0.9.12
+    # 不要默认 latest：首次发布前 latest 不存在，docker compose 会拉取失败。
+    image: ${QQ_AGENT_IMAGE:-crpi-xejkraqtqkngfp11.cn-guangzhou.personal.cr.aliyuncs.com/wangxinhong/qq-agent-plus:0.9.12}
+    container_name: ${QQ_AGENT_CONTAINER:-qq-agent}
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    init: true
+    # 应用自己的退出兜底是 25 秒；Docker 默认 10 秒就会 SIGKILL，可能打断 SQLite 收尾。
+    stop_grace_period: 30s
+    # 应用进程本身以 node 运行；容器根文件系统只读，可写面只剩 /data 与 /tmp。
+    read_only: true
+    tmpfs:
+      # 媒体临时文件上限：图片/视频 96MB、音频 200MB；64MB 会 ENOSPC。
+      - /tmp:size=1g
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "127.0.0.1:${QQ_AGENT_PORT:-3210}:3210"
+    volumes:
+      - ./data:/data
+      # 只读挂载 SnowLuma 的 OneBot 配置：启动时自动同步 accessToken，
+      # 避免两边令牌不一致导致 401（SnowLuma 不读 ONEBOT_TOKEN 环境变量）。
+      - ./snowluma-data/config:/snowluma-config:ro
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      QQ_AGENT_DATA_DIR: /data
+      QQ_AGENT_RUNTIME: docker
+      # 仅影响全新配置的首次运行模式；已有配置里用户选的模式不会被覆盖。
+      QQ_AGENT_RUNTIME_MODE: ${QQ_AGENT_RUNTIME_MODE:-active}
+      # 容器内必须绑 0.0.0.0，否则宿主机端口映射进不来；宿主侧仍只发布到 127.0.0.1。
+      QQ_AGENT_SERVER_HOST: 0.0.0.0
+      QQ_AGENT_SERVER_PORT: "3210"
+      QQ_AGENT_ONEBOT_WS_URL: ${QQ_AGENT_ONEBOT_WS_URL:-ws://snowluma:3001}
+      QQ_AGENT_ONEBOT_HTTP_URL: ${QQ_AGENT_ONEBOT_HTTP_URL:-http://snowluma:3000}
+      # 可选：显式覆盖 OneBot 令牌（外部协议端时用）；full stack 默认留空，
+      # bootstrap 会从 /snowluma-config/onebot*.json 自动读取 SnowLuma 的令牌。
+      QQ_AGENT_ONEBOT_ACCESS_TOKEN: ${QQ_AGENT_ONEBOT_ACCESS_TOKEN:-}
+      QQ_AGENT_ONEBOT_HTTP_TOKEN: ${QQ_AGENT_ONEBOT_HTTP_TOKEN:-}
+      QQ_AGENT_SNOWLUMA_CONFIG_DIR: /snowluma-config
+      # 只跑 agent（外部协议端）时设 0，避免等 SnowLuma 配置的 120 秒空转
+      QQ_AGENT_SNOWLUMA_CONFIG_WAIT_MS: ${QQ_AGENT_SNOWLUMA_CONFIG_WAIT_MS:-120000}
+      # 留空＝首次启动自动生成并写进 data/config.json；
+      # 访问信息写入 /data/console-access.txt（日志不打印令牌）。
+      QQ_AGENT_CONSOLE_TOKEN: ${QQ_AGENT_CONSOLE_TOKEN:-}
+      # 长期记忆默认关闭；启用后数据写入同一 ./data/living-memory/ 目录。
+      # 配置 OpenAI 兼容 Embedding 后才启用语义检索；密钥不会进入控制台或 config.json。
+      LIVING_MEMORY_EMBEDDING_BASE_URL: ${LIVING_MEMORY_EMBEDDING_BASE_URL:-}
+      LIVING_MEMORY_EMBEDDING_API_KEY: ${LIVING_MEMORY_EMBEDDING_API_KEY:-}
+      LIVING_MEMORY_EMBEDDING_MODEL: ${LIVING_MEMORY_EMBEDDING_MODEL:-}
+      LIVING_MEMORY_EMBEDDING_DIMENSIONS: ${LIVING_MEMORY_EMBEDDING_DIMENSIONS:-0}
+      LIVING_MEMORY_RECALL_VECTOR_TIMEOUT_MS: ${LIVING_MEMORY_RECALL_VECTOR_TIMEOUT_MS:-1200}
+      # 兼容旧配置：服务端探测的回退地址（新部署用 SNOWLUMA_INTERNAL_URL）。
+      # 浏览器里的链接由控制台按当前访问地址拼，不读这个变量。
+      SNOWLUMA_WEBUI_URL: ${SNOWLUMA_WEBUI_URL:-http://127.0.0.1:5099}
+      # 服务端探测/改密钥走 compose 网络；两个变量分开，避免"浏览器能开、控制台报离线"。
+      SNOWLUMA_INTERNAL_URL: ${SNOWLUMA_INTERNAL_URL:-http://snowluma:5099}
+      # noVNC 同样分浏览器/服务端两个地址：默认探测 compose 网络里的 6081。
+      QQ_AGENT_NOVNC_URL: ${QQ_AGENT_NOVNC_URL:-http://snowluma:6081/}

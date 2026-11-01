@@ -1,0 +1,4 @@
+{
+  "note": "Windows 环境只允许显式 skip，不允许 fail。新增失败会红：npm run test:unit:win（内部用 scripts/baseline-diff.mjs）。跨平台可修项已修，POSIX/Linux-only 用例用 test/helpers/platform.mjs 带原因跳过。",
+  "failures": []
+}

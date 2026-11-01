@@ -24,7 +24,7 @@ unit 的自动重启，以及 Release 驱动的自动更新。
 `proxy_buffering`，否则控制台的事件流将停止更新。
 
 **`qqagent` 用户与 root 部署**
-`deploy-all.sh` 开头直接拒绝 root（`((EUID == 0))` 即退出），`docs/LINUX.md` 的 Requirements 亦要求以服务用户身份部署。
+`install.sh` 可以直接用 root 执行，它会先把服务降权到 `qqagent`（或 `SUDO_USER`）；`deploy-all.sh` 本身仍拒绝 root（`((EUID == 0))` 即退出）。
 更常见的运维问题是：以 root 执行 `manage.sh` 时查询的是 root 自身的 user manager，
 因而误报「服务不存在」，而服务实际运行正常。
 
@@ -46,25 +46,28 @@ unit 的自动重启，以及 Release 驱动的自动更新。
 `manage.sh` 硬编码 `systemctl --user` / `journalctl --user`（`scripts/manage.mjs`），
 自动更新由配套的 user timer 承担。改用 PM2 会绕过以下机制：部署前代码快照与失败回滚、
 健康检查、unit 中的 `Restart=on-failure` 与 `NoNewPrivileges`，以及 Release 驱动的自动更新。
-此外，`deploy-all.sh` 开头明确拒绝 root（`((EUID == 0))` 即退出），`docs/LINUX.md` 的 Requirements 亦要求以服务用户身份部署。
+此外，`deploy-all.sh` 开头仍拒绝 root（`((EUID == 0))` 即退出）；`install.sh` 现在可以直接用 root 执行，它会先把服务降权到 `qqagent`（或 `SUDO_USER`）再调用安装器。
 
 ## 部署差异对照
 
 | 项目的假设 | 宝塔面板默认 | 处理方式 |
 | --- | --- | --- |
-| 以非 root 服务用户部署 | 全程以 root 操作 | 创建 `qqagent` 用户，通过 SSH 登录后执行脚本 |
-| `systemctl --user` 可用 | 网页终端通常不是登录会话 | 改用 SSH；或参见文末的 root 方案 |
+| 以非 root 服务用户运行 | 面板默认以 root 操作 | 直接 `sudo bash install.sh`：安装器优先沿用 `SUDO_USER`，没有则创建 `qqagent` 并降权；也可手工建普通用户后执行 |
+| `systemctl --user` 可用 | 网页终端/非登录会话缺 `XDG_RUNTIME_DIR`（用户管理器其实在跑） | 脚本会自动补该变量；`/run/user/<uid>` 不存在时先 `sudo loginctl enable-linger <user>`；SSH 或文末 root 方案同样可行 |
 | 依赖 `rsync`（硬检查）、`xz`（解压 Node） | 精简模板通常缺失 | 先执行 `apt install` |
 | 脚本不改动防火墙，仅绑定 `127.0.0.1` | 面板「安全」页管理 ufw/iptables | 默认使用 SSH 隧道，无需放行端口 |
 | 根目录默认 `/mnt/data/qq-agent` | 该路径通常不存在 | 使用 `--root-dir` 修改，优先选择 `.bat` 可识别的路径 |
-| 缺 Node 时脚本自行下载并校验 22.23.2 | 面板 Node 管理器版本可能偏低 | 不使用面板的 Node 管理器 |
+| 缺 Node 时脚本自行下载并校验 22.23.3 | 面板 Node 管理器版本可能偏低 | 不使用面板的 Node 管理器 |
 
 ## 一、前置检查
 
 ```bash
+# 网页终端 / su 这类非登录会话不设 XDG_RUNTIME_DIR，systemctl --user 会误报"连不上总线"——
+# 用户管理器其实在跑，缺的只是这一个环境变量（deploy.sh / deploy-all.sh 现在会自行补上）。
+[[ -z "${XDG_RUNTIME_DIR:-}" && -d "/run/user/$(id -u)" ]] && export XDG_RUNTIME_DIR="/run/user/$(id -u)"
 systemctl --user show-environment >/dev/null 2>&1 \
   && echo "systemd 用户服务：可用" \
-  || echo "systemd 用户服务：不可用（别在宝塔网页终端跑，改用 SSH 登录）"
+  || echo "systemd 用户服务：不可用（先看上面的 XDG_RUNTIME_DIR；/run/user/<uid> 目录不存在就先 enable-linger，见常见问题）"
 
 for c in rsync curl tar xz sha256sum; do
   command -v "$c" >/dev/null && echo "OK  $c" || echo "缺  $c"
@@ -72,7 +75,9 @@ done
 ```
 
 `deploy.sh` 在执行部署前即要求 `systemctl`、`systemctl --user` 与 `rsync` 三者可用，
-缺少任何一项都会打印具体原因后退出；**本脚本不会安装系统包**。全栈安装额外需要 `realpath`
+缺少任何一项都会打印具体原因后退出；其中 `systemctl --user` 那条会先自动补
+`XDG_RUNTIME_DIR`（`/run/user/<uid>` 存在时），因此网页终端里通常不再需要手工处理。
+**本脚本不会安装系统包**。全栈安装额外需要 `realpath`
 与 `ss`（iproute2）。
 
 端口默认值如下：控制台 `3210`，SnowLuma WebUI `5099`，noVNC `6081`，协议端（OneBot）
@@ -96,7 +101,7 @@ loginctl enable-linger qqagent
 linger 是服务在开机后无需用户登录即可持续运行的前提。预先开启 linger 可避免使用 `sudo`：
 `deploy.sh` 仅在 linger 未开启时才尝试执行 `sudo loginctl enable-linger`（安装收尾处）。
 
-若服务 unit 配置了 `NoNewPrivileges=true`（本指南第九节「以 root 用户部署」中的 `NoNewPrivileges` 说明），服务重启后由 systemd 拉起的进程无法执行 `sudo`——`deploy.sh` 对此做了预检：此时会跳过 `sudo` 并提示手动执行一次 `loginctl enable-linger`，linger 未开只影响下次开机自启，不会让本次部署或手动更新回滚（Issue #15）。
+若服务 unit 配置了 `NoNewPrivileges=true`（本指南第九节「以 root 用户部署」中的 `NoNewPrivileges` 说明），服务重启后由 systemd 拉起的进程无法执行 `sudo`——`deploy.sh` 对此做了预检：此时会跳过 `sudo` 并提示手动执行一次 `loginctl enable-linger`；该步骤失败只警告、不会让本次部署或手动更新回滚，但**没有 linger 时，当前登录会话一断开，systemd 会连同用户管理器一起停掉服务（机器人掉线）**（Issue #15）。
 
 父目录同样需要在此创建。`deploy.sh` 会自行 `mkdir -p` 安装目录与数据目录，但 `/mnt` 属主为
 root，以 `qqagent` 身份执行时无法创建 `data` 这一级目录。`docs/LINUX.md` 要求「先以合适
@@ -136,7 +141,7 @@ bash deploy.sh \
 - **`--host 127.0.0.1` 保持默认**：控制台不对外开放，访问通过下一节的隧道实现。使用同机
   nginx 反向代理时目标亦为 `127.0.0.1`，同样无需对外开放。后续更新若不显式传入
   `--host`/`--port`，脚本会沿用 `config.json` 中记录的现值并打印提示，不会退回默认值。
-- **Node 由脚本准备**：找不到合格的 Node 时，脚本会下载并校验 `22.23.2` 至
+- **Node 由脚本准备**：找不到合格的 Node 时，脚本会下载并校验 `22.23.3` 至
   `INSTALL_DIR/.runtime`。要求为 ≥22.19 且 `node:sqlite` 可用（`package.json` 的 `engines`）。
 - **首次启动模式**：首次安装以 `observe` 模式启动，机器人不会发言；确认后再执行激活。
 - **GitHub 不可达时**：将 Release 源码包上传并解压，在解压出的目录中执行同一条 `deploy.sh`。
@@ -147,10 +152,12 @@ bash deploy.sh \
 与裸机部署一致，推荐入口为 SSH 隧道；[AGENTS.md](../AGENTS.md) 的口径是不要求服务器开放
 任何公网端口。
 
-- **Windows**：使用仓库根目录的 `console-tunnel.bat`，双击后输入 `qqagent@服务器地址`；
-  或使用命令行 `console-tunnel.bat qqagent@服务器地址`（写入 `.console-tunnel.cfg`，
-  后续可直接双击）。
-- **macOS / Linux / 本机有 Node**：`SSHHOST=qqagent@服务器地址 node src/ops.js console --open`。
+- **Windows**：只下载一个 `console-tunnel.bat`（不用克隆仓库），双击后输入 `qqagent@服务器地址`；
+  或使用命令行 `console-tunnel.bat qqagent@服务器地址`（记住地址，后续可直接双击）。
+  下载命令：`scp qqagent@服务器地址:<安装根目录>/app/console-tunnel.bat .`
+- **macOS / Linux**：下载 `console-tunnel.sh`，运行 `bash console-tunnel.sh qqagent@服务器地址`；
+  下载命令：`scp qqagent@服务器地址:<安装根目录>/app/console-tunnel.sh .`
+- **本机有 Node**：`SSHHOST=qqagent@服务器地址 node src/ops.js console --open`。
 - **手工方式**：
 
   ```bash
@@ -159,7 +166,7 @@ bash deploy.sh \
 
   随后访问 `http://127.0.0.1:3210`。扫码登录 QQ 使用 `6081`，**不得**将 noVNC 暴露到公网。
 
-**目录变更的影响**：`console-tunnel.bat` 仅在
+**目录变更的影响**：`console-tunnel.bat` / `console-tunnel.sh` 仅在
 `/mnt/data/qq-agent/data/console-access.txt` 与 `/data/qq-agent/data/console-access.txt`
 两处查找令牌。安装到其它路径时隧道仍可使用，但不支持免登录，需手动获取令牌：
 
@@ -168,7 +175,8 @@ cat /安装根目录/data/console-access.txt      # 查看 Token 那一行
 bash /安装根目录/app/manage.sh token         # 等价
 ```
 
-或在客户端设置 `QQ_AGENT_CONSOLE_TOKEN=<令牌>`。`.bat` 使用密钥登录（`BatchMode=yes`），
+或在客户端设置 `QQ_AGENT_CONSOLE_TOKEN=<令牌>`。`.bat` / `.sh` 都优先用密钥；没有密钥时
+退回普通 SSH，密码登录可能提示两次。
 读取令牌的账号须能读取 `data/`（权限 `0600`，属主 `qqagent`），因此隧道账号使用 `qqagent`
 或 root 最为简便。
 
@@ -194,7 +202,7 @@ proxy_send_timeout 3600s;
 
 ## 六、全栈部署（SnowLuma / OneBot / Docker）
 
-`deploy-all.sh` 拒绝 root 身份，需按以下顺序操作：
+最简单的做法是以 root 执行 `install.sh`，它会复用 `SUDO_USER`（没有则创建 `qqagent`）并降权，不需要手工切用户。如果要手工控制服务用户，按以下顺序操作：
 
 1. 先在宝塔「Docker」管理器中安装 Docker 与 Compose v2，避免脚本再通过 apt 安装第二套；
 2. 执行 `usermod -aG docker qqagent`，然后**重新登录** `qqagent`（组变更需在新会话中生效）；
@@ -245,8 +253,8 @@ bash manage.sh backup /path/to/backup-dir
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
-| `Failed to connect to bus` / 提到 `XDG_RUNTIME_DIR` | 在非登录会话（宝塔网页终端）中调用 `systemctl --user` | 改用 SSH 登录；或采用文末的 root 方案 |
-| `deploy.sh` 刚开始即退出 | `deploy.sh` 开头的 `systemctl` / `systemctl --user` / `rsync` 检查未通过（脚本会打印缺哪一项） | 按提示安装 `rsync`，或改用 SSH 登录会话 |
+| `Failed to connect to bus` / 提到 `XDG_RUNTIME_DIR` | 在非登录会话（宝塔网页终端）中调用 `systemctl --user`：缺环境变量，**不是**用户管理器不可用 | `export XDG_RUNTIME_DIR=/run/user/$(id -u)` 后重跑（脚本现已自动补）；`/run/user/<uid>` 不存在则先 `sudo loginctl enable-linger <user>`；SSH 或文末 root 方案亦可 |
+| `deploy.sh` 刚开始即退出 | `deploy.sh` 开头的 `systemctl` / `systemctl --user` / `rsync` 检查未通过（脚本会打印缺哪一项） | 按提示安装 `rsync`；若是 `systemctl --user` 那条，先按上一行处理（多半只是缺 `XDG_RUNTIME_DIR`） |
 | `Deployed Node.js runtime is unavailable` | 在源码目录而非安装目录执行了 `manage.sh`（该目录下没有 `.deployment-node`） | 切到安装目录执行；**不要**因此重跑 `deploy.sh` |
 | `Run as the service user, not root` | `deploy-all.sh` 的身份预检 | 执行 `su - qqagent` 后重新运行 |
 | 解压 Node 失败、提示 `xz` | 缺少 `xz-utils` | 执行 `apt install -y xz-utils` |
@@ -273,5 +281,6 @@ bash deploy.sh \
 ```
 
 代价如下：机器人以 root 身份常驻（unit 中的 `NoNewPrivileges`、`UMask=0077` 仍然生效，
-但进程身份为 root）；`deploy-all.sh` 依然拒绝 root，因此**全栈模式不支持该方案**，只能以
-非 root 用户安装。存在独立服务用户时，应采用第四节所述方式。
+但进程身份为 root）。`deploy-all.sh` 依然拒绝 root；全栈安装请用 root 执行 `install.sh`，
+它会先把服务降权到 `qqagent`（或 `SUDO_USER`）再调用安装器，不会让机器人以 root 运行。
+存在独立服务用户时，应采用第四节所述方式。

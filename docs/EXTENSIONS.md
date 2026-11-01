@@ -1,33 +1,21 @@
 # 扩展功能（src/extensions/）
 
-参考 AstrBot 插件市场里常用的几类插件，按本项目的规矩（默认关、各自独立、关闭不删数据、外部写入不自动重试）
+参考 AstrBot 插件市场里常用的几类插件（2026-11 合并上游 0.9.12 / hajimi-and-fatfish 后的版本），按本项目的规矩（默认关、各自独立、关闭不删数据、外部写入不自动重试）
 重新实现的一组功能。每个功能都有**自己的配置段、自己的持久化文件、自己的控制台页面与 `/api/ext/*` 接口**，
 核心代码只在几个挂点上接入（见文末「接入点」）。
 
 | 功能 | 配置段 | 控制台页面 | 模型工具 | 数据 |
 | --- | --- | --- | --- | --- |
-| 长期记忆 | `longMemory` | 记忆 → 长期记忆 | `long_memory_save` / `long_memory_search` / `long_memory_forget` | `data/long-memory.sqlite`（0600，首次启用才创建） |
-| 群聊总结 | `chatSummary` | 扩展 → 群聊总结 | `summarize_chat` | 无（最近 20 次总结只在内存里） |
-| 大肥鱼桥 | `labBridge` | 扩展 → 大肥鱼桥 | `lab_harness` | `data/lab-bridge/tasks.json`（0600，最近 200 个任务） |
-| 趣味功能 | `funTools` | 扩展 → 趣味功能 | `daily_fun` | 无（结果由代码确定性算出） |
+| 群聊总结 | `chatSummary` | 侧栏 → 群聊总结 | `summarize_chat` + 指令 `/总结` | 无（最近 20 次总结只在内存里） |
+| 大肥鱼桥 | `labBridge` | 侧栏 → 大肥鱼桥 | `lab_harness` + 指令 `/lab` | `data/lab-bridge/tasks.json`（0600，最近 200 个任务） |
+| 趣味功能 | `funTools` | 侧栏 → 趣味功能 | `daily_fun` | 无（结果由代码确定性算出） |
 
 全部默认 `enabled: false`。没开的功能：工具不进模型工具表、提示词不多一个字、不建库、不起定时器。
 
 ## 长期记忆
 
-参考：AstrBot 的 Mnemosyne / LivingMemory 一类长期记忆插件。
-
-- **和「人物记忆」的分工**：人物记忆（`src/memory/`）按 QQ 号记"他是个什么样的人"；长期记忆记"发生过什么、说好了什么"——
-  约定、群友的近况与计划、群里的大事、长期的梗。
-- **写入**：模型调 `long_memory_save`；与同会话里高度相似（切词 Jaccard ≥ 0.72）的旧条目合并更新，不重复记。
-  可选「自动提炼」：后台每 N 分钟扫一遍，攒够新消息（按消息 id 水位增量读）的会话就让模型挑出值得长期记住的事；
-  有每小时次数上限。
-- **召回**：每轮按触发消息检索，最相关的几条（≥ 相关度门槛）作为【长期记忆·可能相关】放进**用户提示词**
-  （不放系统提示，不破坏前缀缓存）。检索是中文二元组 + 英文词的 BM25；开了向量检索（OpenAI 兼容 `/embeddings`）
-  就按 0.65 向量 + 0.35 词法混合，再叠加重要度与新近度。向量服务挂了自动退回词法，不影响聊天。
-- **可见范围**：`scope=chat`（默认）只在记下它的群/私聊里想起；`scope=global` 跨会话，但群聊里不召回私聊来源。
-- **Key 归属**：与生图、语音同一条规矩——向量服务地址不是聊天模型那一家时，不会把聊天模型的 Key 发过去。
-- **淘汰**：超过 `maxEntries` 时按"重要度低 + 很久没被想起"淘汰。
+由上游的 **livingMemory**（`src/living-memory/`，侧栏「长期记忆」）提供：语义检索、知识图谱，并且按人格分仓。
+本目录早先自带的一份长期记忆实现在合并上游 0.9.12 时移除，避免两套记忆同时往提示词里塞内容。
 
 ## 群聊总结
 
@@ -78,6 +66,24 @@ ssh -N -R 8790:127.0.0.1:8790 user@your-server
 
 Windows 上执行 `.cmd/.bat` 时加 `LAB_BRIDGE_SHELL=1`。接收端默认只监听 `127.0.0.1`，不要改成 `0.0.0.0` 暴露到公网。
 
+
+## 专属指令（与「切鱼 / 切猫」同一形态）
+
+在 OneBot 消息入库后、唤醒模型**之前**消费（`src/extensions/commands.js`，挂在 `skins.consumeCommand` 后面）：
+命中的消息不进模型、不花聊天 token，结果由代码直接回复；同一条协议消息重复投递不会执行第二次
+（大肥鱼桥另按任务记录里的来源消息 id 做持久去重，服务重启后的重放也挡得住）。
+启用双人格时，读历史与回复都走当前人格的分仓。
+
+| 指令（默认，可在各自页面改） | 谁能用 | 作用 |
+| --- | --- | --- |
+| `/总结`、`总结一下` | 所有人（可改成仅管理员），受每小时额度约束 | 按默认条数总结并直接发到当前会话 |
+| `/总结 200` / `/总结 3h` / `/总结 周末聚餐` | 同上 | 最近 200 条 / 最近 3 小时 / 侧重某件事 |
+| `/lab <任务>`、`/大肥鱼 <任务>` | 只有管理员本人；默认只在私聊 | 派给实验室电脑，回"已交给…（#N）"，跑完自动回报 |
+| `/lab` · `/lab 结果 N` · `/lab 取消 N` · `/lab ping` | 同上 | 最近任务 / 看输出 / 取消 / 测连通 |
+
+非管理员发 `/lab …` 会被当成普通消息（不暴露指令存在），与人格切换指令的处理一致。
+指令词完整匹配：`/总结x` 不算，`/总结 x` 才算。清空指令栏即关闭指令（模型仍可在聊天里按需调用工具）。
+
 ## 趣味功能
 
 参考：AstrBot 插件市场里的 jrrp（今日人品）、今日运势、塔罗牌。
@@ -87,18 +93,15 @@ Windows 上执行 `.cmd/.bat` 时加 `LAB_BRIDGE_SHELL=1`。接收端默认只�
 - `tarot`：22 张大阿卡纳，单张指引或过去/现在/未来三张，正逆位随机。
 - 结果由代码决定，模型只负责用自己的口吻说出来——不会同一个人一会儿 90 一会儿 12。
 
-## 生图增强
-
-`generate_image` 新增 `send: true`：画完直接发到当前聊天（与 `send_sticker` 同一条发送链路），省一轮工具调用；
-可带 `replyToMessageId` 引用点图的人。发送失败时图已在表情库里，返回 id 让模型改用 `send_sticker` 重发（不重画、不退额度）。
-
 ## 人格界面
 
-- 侧栏「人格」直达 设置 → 人设。
-- 卡库搜索；分节大纲（点一下跳到那一节并展开）；字数与 token 粗估。
-- **试聊**：用草稿里的卡（没保存也行）跟它聊几句，看口吻对不对；不发到 QQ、不进记忆（`POST /api/persona/preview`）。
-- **AI 起草**：一句话设定 → 按内置卡的分节格式写一张新卡，可填入草稿或另存为自定义卡（`POST /api/persona/generate`）。
-- 导入 / 导出 `.md`；把改过的草稿覆盖保存回当前自定义卡（`PUT /api/persona-templates/custom_N`，以前只能新建/删除）。
+- 侧栏「人格」打开**双人格页** `/skins.html`（蓝色大肥鱼 / 哈基米…，见 [DUAL_SKINS.md](DUAL_SKINS.md)）：
+  每个会话绑定一套人格卡 + 模型，管理员发「切鱼」「切猫」等专属指令切换。
+- 设置 → 人设（人格卡本身的编辑）另有一层工作台增强：
+  - 卡库搜索；分节大纲（点一下跳到那一节并展开）；字数与 token 粗估。
+  - **试聊**：用草稿里的卡（没保存也行）跟它聊几句，看口吻对不对；不发到 QQ、不进记忆（`POST /api/persona/preview`）。
+  - **AI 起草**：一句话设定 → 按内置卡的分节格式写一张新卡，可填入草稿或另存为自定义卡（`POST /api/persona/generate`）。
+  - 导入 / 导出 `.md`；把改过的草稿覆盖保存回当前自定义卡（`PUT /api/persona-templates/custom_N`，以前只能新建/删除）。
 
 另有全局 **Ctrl / ⌘ + K 命令面板**：输入几个字直达任意页面或设置分区。
 
@@ -107,21 +110,16 @@ Windows 上执行 `.cmd/.bat` 时加 `LAB_BRIDGE_SHELL=1`。接收端默认只�
 | 位置 | 改动 |
 | --- | --- |
 | `src/tools/tools.js` | `buildToolDefs()` 末尾追加 `extensionToolDefs()` |
-| `src/core/orchestrator.js` | 工具过滤加 `extensionToolAvailable()`；运行前算 `extensionPromptContext()`；`ctx.triggerSenderIds` |
-| `src/llm/prompt.js` | 【记忆】段之后插入扩展段落 |
-| `src/console/app.js` | `initExtensions` / `registerExtensionRoutes` / `startExtensions` / `stopExtensions`；`registerPersonaRoutes` |
-| `src/core/config-legacy.js` | 四个配置段的默认值（全部关闭） |
-| `src/tools/tools-core.js` | `generate_image` 的 `send` / `replyToMessageId` 参数 |
+| `src/core/orchestrator.js` | 工具过滤加 `extensionToolAvailable()`（权限判断复用上游已有的 `ctx.triggerEntries`） |
+| `src/console/app.js` | `initExtensions`（读写包一层 `skins.scope`）/ `ExtensionCommands.consume`（紧跟人格切换指令）/ 路由 / 启停；`registerPersonaRoutes` |
+| `src/core/config-legacy.js` | 三个配置段与谷歌 / Edge 搜索的默认值（全部关闭） |
 
-回滚：把四个配置段的 `enabled` 关掉即恢复原行为；数据文件保留，删掉 `data/long-memory.sqlite` 与 `data/lab-bridge/` 即彻底清除。
+回滚：把三个配置段的 `enabled` 关掉即恢复原行为；数据文件保留，删掉 `data/lab-bridge/` 即彻底清除。
 
-## 界面：配色方案与图标（2026-11 第二轮）
+## 界面
 
-- **配色方案**：设置 → 系统 → 界面，「主题」下面一行色卡：石墨紫（默认）/ 深海蓝（原版）/ 薄荷 / 樱花 / 琥珀 / 极夜（OLED 纯黑）。
-  与明暗主题正交，每套都有暗色、亮色两版。选择存 `localStorage` + 后端 `config.ui.palette`，首屏由 `index.html`
-  的预置脚本应用（不闪）。实现：`ui/palette.js`；配色变量在 `ui/style.css` 的「配色方案」段，新增一套只需加两行变量。
-- **SVG 图标**：侧栏导航、扩展页页头、主题选择、空状态都换成一套线条 SVG（CSS mask 绘制，跟随 `currentColor`）。
-- **无边框**：卡片、输入框、按钮、徽标去掉 1px 方框，改用底色明暗 + 柔和阴影 + 大圆角分层。
+配色、明暗、材质、字体、圆角等外观全部由上游的外观系统（设置 → 外观，`ui/core/appearance.js`）负责；
+图标统一用上游的线条 SVG 图标库（`ui/core/icons.js`，本次补了 `fish` / `mask` / `dice` / `summary`）。
 
 ## 搜索：谷歌与 Edge
 

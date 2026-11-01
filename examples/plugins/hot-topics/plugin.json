@@ -1,0 +1,22 @@
+{
+  "id": "hot-topics",
+  "apiVersion": 1,
+  "name": "热点",
+  "version": "1.0.0",
+  "description": "抓 V2EX 或 Hacker News 的热帖榜，整理成标题+链接+热度几行，两个源都不需要 Key",
+  "entry": "index.mjs",
+  "capabilities": ["tools", "http", "config"],
+  "tools": [
+    {
+      "name": "list",
+      "description": "列出当前的科技圈热帖。群友说“今天 v2ex 有啥热帖”“看看 HN 头条”“最近技术上有什么热闹”时用它。参数 source 选 v2ex（默认，中文技术社区）或 hn（Hacker News，英文）；limit 是条数，默认 5。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "source": { "type": "string", "description": "来源：v2ex（默认）或 hn" },
+          "limit": { "type": "integer", "description": "要几条，默认 5，最多 20" }
+        }
+      }
+    }
+  ]
+}

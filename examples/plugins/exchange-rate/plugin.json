@@ -1,0 +1,41 @@
+{
+  "id": "exchange-rate",
+  "apiVersion": 1,
+  "name": "汇率",
+  "version": "1.0.0",
+  "description": "按最新公布的汇率换算两种货币（例如 100 美元是多少人民币），走 Frankfurter / open.er-api 公开接口，不需要 Key",
+  "entry": "index.mjs",
+  "capabilities": [
+    "tools",
+    "http",
+    "config"
+  ],
+  "tools": [
+    {
+      "name": "convert",
+      "description": "把一笔金额从一种货币换算成另一种。群友问“100 美元等于多少人民币”“这 50 欧元是多少日元”时用它。参数 amount 是金额（数字），from 是原货币代码（如 USD），to 是目标货币代码（如 CNY）。货币代码用 ISO 三字母，例如 CNY/USD/EUR/JPY/GBP/HKD/KRW。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "amount": {
+            "type": "number",
+            "description": "要换算的金额，例如 100"
+          },
+          "from": {
+            "type": "string",
+            "description": "原货币三字母代码，例如 USD"
+          },
+          "to": {
+            "type": "string",
+            "description": "目标货币三字母代码，例如 CNY"
+          }
+        },
+        "required": [
+          "amount",
+          "from",
+          "to"
+        ]
+      }
+    }
+  ]
+}

@@ -4,9 +4,6 @@ import { DATA_DIR, getConfig } from '../core/config.js';
 import { backupPersonBeforeConsolidation } from './memory-consolidation-backup.js';
 
 const MEMORY_DIR = path.join(DATA_DIR, 'memory');
-const PEOPLE_DIR = path.join(MEMORY_DIR, 'people');
-const MIGRATION_MARKER = path.join(MEMORY_DIR, '_global_people_v1.json');
-const MIGRATION_BACKUP_DIR = path.join(MEMORY_DIR, 'backups', 'global-people-v1');
 
 const clean = (v, n = 300) => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, n);
 const validChat = (v) => /^(group|private):\d+$/.test(String(v || ''));
@@ -21,7 +18,7 @@ const memberFileName = (userId, name = '') => {
   return `_n_${safe || 'unknown'}.json`;
 };
 const memberKey = (userId, name = '') => String(userId || '').trim() || `_n_${memberFileName('', name)}`;
-const globalMemberFile = (userId, name = '') => path.join(PEOPLE_DIR, memberFileName(userId, name));
+const globalMemberFile = (userId, name = '', memoryDir = MEMORY_DIR) => path.join(memoryDir, 'people', memberFileName(userId, name));
 
 function readJson(file, fallback = null) {
   try {
@@ -29,7 +26,16 @@ function readJson(file, fallback = null) {
     if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
     const value = JSON.parse(text);
     return value && typeof value === 'object' ? value : fallback;
-  } catch { return fallback; }
+  } catch (error) {
+    // 文件在但读不了（坏 JSON 等）：静默返回 fallback 的话，随后同路径的写入会把它直接
+    // 覆盖掉，用户再也查不出人物印象为什么没了。留档成 .broken-<时间戳>（与 reminders /
+    // group-game 同口径；2026-10-12 审查）。ENOENT（首次运行没有文件）是正常的。
+    if (error?.code !== 'ENOENT') {
+      console.error(`[memory-global] 读取 ${file} 失败，本次跳过，原文件已备份为 .broken-<时间戳>：`, error?.message ?? error);
+      try { fs.renameSync(file, `${file}.broken-${Date.now()}`); } catch { /* 备份失败就留在原处，至少不覆盖 */ }
+    }
+    return fallback;
+  }
 }
 function writeJson(file, value) {
   // 人物印象是隐私正文：目录 0700 / 文件 0600（与 consolidation-backup、identity 库同一口径）。
@@ -54,8 +60,27 @@ function sourceKeys(value, fallback = '') {
   add(fallback);
   return out;
 }
+function emptyRelationship() {
+  return { interactions: 0, warmth: 0, lastInteractionAt: 0 };
+}
+function normalizeRelationship(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return emptyRelationship();
+  return {
+    interactions: Math.max(0, Number(raw.interactions) || 0),
+    warmth: Math.min(100, Math.max(-100, Number(raw.warmth) || 0)),
+    lastInteractionAt: Math.max(0, Number(raw.lastInteractionAt) || 0)
+  };
+}
+/** 关系只按"实际互动次数"分档，避免用温度数值制造看不懂的差异。 */
+export function relationshipLabel(interactions) {
+  const n = Math.max(0, Number(interactions) || 0);
+  if (n >= 50) return '很熟';
+  if (n >= 20) return '熟';
+  if (n >= 5) return '有点熟';
+  return '刚认识';
+}
 function emptyMember(userId = '', name = '') {
-  return { version: 2, userId: String(userId || ''), name: String(name || ''), impressions: [], sourceChatKeys: [], updatedAt: 0, lastConsolidatedAt: 0 };
+  return { version: 2, userId: String(userId || ''), name: String(name || ''), impressions: [], sourceChatKeys: [], updatedAt: 0, lastConsolidatedAt: 0, relationship: emptyRelationship() };
 }
 // origin：这条印象是怎么来的 —— 'model'（机器人自己 memory_append 记的）、
 // 'consolidated'（记忆整理/提炼改写的）、'manual'（控制台手动编辑的）；
@@ -94,6 +119,7 @@ function normalizeMember(raw = {}, userId = '', name = '', fallbackChatKey = '')
   member.updatedAt = Number(raw.updatedAt) || 0;
   member.lastConsolidatedAt = Number(raw.lastConsolidatedAt) || 0;
   member.sourceChatKeys = sourceKeys(raw.sourceChatKeys, fallbackChatKey);
+  member.relationship = normalizeRelationship(raw.relationship);
   for (const item of Array.isArray(raw.impressions) ? raw.impressions : []) {
     const entry = normalizeEntry(item, fallbackChatKey);
     if (entry) mergeEntry(member, entry);
@@ -107,35 +133,76 @@ function mergeMember(target, incoming) {
   if (incoming.name && (!target.name || incoming.updatedAt >= target.updatedAt)) target.name = incoming.name;
   for (const entry of incoming.impressions) mergeEntry(target, entry);
   target.sourceChatKeys = sourceKeys([...target.sourceChatKeys, ...incoming.sourceChatKeys]);
+  const a = normalizeRelationship(target.relationship);
+  const b = normalizeRelationship(incoming.relationship);
+  const newer = b.lastInteractionAt >= a.lastInteractionAt ? b : a;
+  target.relationship = {
+    interactions: Math.max(a.interactions, b.interactions),
+    warmth: newer.warmth,
+    lastInteractionAt: Math.max(a.lastInteractionAt, b.lastInteractionAt)
+  };
   target.updatedAt = Math.max(target.updatedAt || 0, incoming.updatedAt || 0);
   target.lastConsolidatedAt = Math.max(target.lastConsolidatedAt || 0, incoming.lastConsolidatedAt || 0);
 }
-function archive(src, rel) {
+function archive(src, rel, memoryDir = MEMORY_DIR) {
   try {
     if (!fs.existsSync(src)) return;
-    const dst = path.join(MIGRATION_BACKUP_DIR, rel);
+    const dst = path.join(memoryDir, 'backups', 'global-people-v1', rel);
     fs.mkdirSync(path.dirname(dst), { recursive: true });
     if (fs.existsSync(dst)) fs.rmSync(dst, { force: true });
     fs.renameSync(src, dst);
   } catch (error) { console.warn('[memory] 归档旧人物记忆失败:', error?.message ?? error); }
 }
 
+const DEFAULT_MAX_IMPRESSIONS = 50;
+const DEFAULT_RETENTION_DAYS = 0;
+
+export function memoryLimits() {
+  const cfg = getConfig().memory || {};
+  const max = Math.max(5, Math.min(200, Math.round(Number(cfg.maxImpressionsPerPerson) || DEFAULT_MAX_IMPRESSIONS)));
+  const days = Math.max(0, Math.min(3650, Math.round(Number(cfg.impressionRetentionDays ?? DEFAULT_RETENTION_DAYS) || 0)));
+  return { max, days };
+}
+
+function trimMember(member, now = Date.now(), limits = memoryLimits()) {
+  const before = member.impressions?.length || 0;
+  const retentionMs = limits.days > 0 ? limits.days * 86400000 : 0;
+  const keep = (member.impressions || []).filter((entry) => {
+    if (normalizeOrigin(entry.origin) === 'manual') return true;
+    const observed = Number(entry.lastObservedAt) || Number(entry.createdAt) || 0;
+    return !(retentionMs > 0 && observed > 0 && now - observed > retentionMs);
+  });
+  if (keep.length > limits.max) {
+    const manual = keep.filter((entry) => normalizeOrigin(entry.origin) === 'manual');
+    const auto = keep
+      .filter((entry) => normalizeOrigin(entry.origin) !== 'manual')
+      .sort((a, b) => (Number(b.lastObservedAt || b.createdAt) || 0) - (Number(a.lastObservedAt || a.createdAt) || 0));
+    member.impressions = [...manual, ...auto.slice(0, Math.max(0, limits.max - manual.length))]
+      .sort((a, b) => (Number(a.createdAt) || 0) - (Number(b.createdAt) || 0));
+  } else {
+    member.impressions = keep;
+  }
+  if (member.impressions.length !== before) member.updatedAt = now;
+  return member.impressions.length !== before;
+}
+
 export class GlobalPersonMemoryStore {
-  constructor({ onLegacyState = null } = {}) {
+  constructor({ onLegacyState = null, memoryDir = MEMORY_DIR } = {}) {
+    this.memoryDir = memoryDir;
     this.people = null;
     this.onLegacyState = typeof onLegacyState === 'function' ? onLegacyState : null;
   }
   #persist(member) {
     member.version = 2;
     member.sourceChatKeys = sourceKeys([...member.sourceChatKeys, ...member.impressions.flatMap((x) => x.sourceChatKeys || [])]);
-    writeJson(globalMemberFile(member.userId, member.name), member);
+    writeJson(globalMemberFile(member.userId, member.name, this.memoryDir), member);
   }
   #load() {
     const map = new Map();
     try {
-      for (const file of fs.readdirSync(PEOPLE_DIR)) {
+      for (const file of fs.readdirSync(path.join(this.memoryDir, 'people'))) {
         if (!file.endsWith('.json')) continue;
-        const raw = readJson(path.join(PEOPLE_DIR, file));
+        const raw = readJson(path.join(path.join(this.memoryDir, 'people'), file));
         if (!raw) continue;
         const member = normalizeMember(raw, raw.userId, raw.name);
         map.set(memberKey(member.userId, member.name), member);
@@ -169,13 +236,13 @@ export class GlobalPersonMemoryStore {
   #ensure() {
     if (this.people) return this.people;
     const map = this.#load();
-    const marker = readJson(MIGRATION_MARKER);
+    const marker = readJson(path.join(this.memoryDir, '_global_people_v1.json'));
     if (!marker?.completed) {
       const archives = [];
       let names = [];
-      try { names = fs.readdirSync(MEMORY_DIR); } catch { names = []; }
+      try { names = fs.readdirSync(this.memoryDir); } catch { names = []; }
       for (const name of names) {
-        const full = path.join(MEMORY_DIR, name);
+        const full = path.join(this.memoryDir, name);
         let stat; try { stat = fs.statSync(full); } catch { continue; }
         if (stat.isFile()) {
           const m = /^(group|private)_(\d+)\.json$/.exec(name);
@@ -199,12 +266,28 @@ export class GlobalPersonMemoryStore {
         }
       }
       for (const member of map.values()) this.#persist(member);
-      writeJson(MIGRATION_MARKER, { version: 1, completed: true, migratedAt: Date.now(), people: map.size });
-      for (const [src, rel] of archives) archive(src, rel);
+      writeJson(path.join(this.memoryDir, '_global_people_v1.json'), { version: 1, completed: true, migratedAt: Date.now(), people: map.size });
+      for (const [src, rel] of archives) archive(src, rel, this.memoryDir);
     }
     this.people = map;
     return map;
   }
+  /** 清理过期/超量的自动印象；manual 永远保留。返回实际删除条数。 */
+  pruneExpired({ now = Date.now() } = {}) {
+    const map = this.#ensure();
+    const limits = memoryLimits();
+    let removed = 0;
+    let touched = 0;
+    for (const member of map.values()) {
+      const before = member.impressions?.length || 0;
+      if (!trimMember(member, now, limits)) continue;
+      removed += Math.max(0, before - member.impressions.length);
+      touched += 1;
+      this.#persist(member);
+    }
+    return { removed, touched, limits };
+  }
+
   listSourceChats() {
     const out = new Set();
     for (const member of this.#ensure().values()) for (const key of member.sourceChatKeys) out.add(key);
@@ -217,9 +300,51 @@ export class GlobalPersonMemoryStore {
       .map((m) => structuredClone(m))
       .sort((a, b) => b.updatedAt - a.updatedAt);
   }
+
+  stats() {
+    const limits = memoryLimits();
+    let entries = 0;
+    let manual = 0;
+    let oldest = 0;
+    let newest = 0;
+    let bytes = 0;
+    let people = 0;
+    for (const member of this.#ensure().values()) {
+      if (!member.impressions?.length) continue;
+      people += 1;
+      bytes += Buffer.byteLength(JSON.stringify(member));
+      for (const entry of member.impressions) {
+        entries += 1;
+        if (normalizeOrigin(entry.origin) === 'manual') manual += 1;
+        const at = Number(entry.createdAt) || 0;
+        if (at > 0 && (!oldest || at < oldest)) oldest = at;
+        if (at > newest) newest = at;
+      }
+    }
+    return { people, entries, manual, oldestAt: oldest, newestAt: newest, bytes, limits };
+  }
   get(userId) {
     const uid = String(userId || '').trim();
     return structuredClone(this.#ensure().get(uid) || emptyMember(uid));
+  }
+  /**
+   * 记一次互动（只更新已经有印象的人，不为陌生人建档案）。
+   * 关系温度只影响提示词里的一行标签，不参与检索/排序。
+   */
+  noteInteraction(userId, { at = Date.now(), delta = 0.5 } = {}) {
+    const uid = String(userId || '').trim();
+    if (!uid) return null;
+    const map = this.#ensure();
+    const member = map.get(uid);
+    if (!member || !member.impressions?.length) return null;
+    const rel = normalizeRelationship(member.relationship);
+    rel.interactions += 1;
+    rel.lastInteractionAt = Math.max(rel.lastInteractionAt, Number(at) || Date.now());
+    rel.warmth = Math.min(100, Math.max(-100, rel.warmth + (Number(delta) || 0)));
+    member.relationship = rel;
+    member.updatedAt = Date.now();
+    this.#persist(member);
+    return structuredClone(rel);
   }
   append(chatKey, userId, name, content, createdAt = Date.now(), origin = 'model', lastObservedAt = 0) {
     const map = this.#ensure();
@@ -238,6 +363,7 @@ export class GlobalPersonMemoryStore {
     member.name = String(name || member.name || member.userId || '');
     member.sourceChatKeys = sourceKeys([...member.sourceChatKeys, chatKey]);
     member.updatedAt = now;
+    trimMember(member, now);
     this.#persist(member); map.set(memberKey(member.userId, member.name), member);
     return structuredClone(entry);
   }
@@ -268,7 +394,7 @@ export class GlobalPersonMemoryStore {
     const finalName = clean(name, 60) || old.name || uid;
     const now = Date.now();
     const incoming = (Array.isArray(contents) ? contents : [contents])
-      .map((x) => clean(x)).filter(Boolean).slice(0, 20);
+      .map((x) => clean(x)).filter(Boolean).slice(0, memoryLimits().max);
     const hadSource = old.sourceChatKeys.includes(String(chatKey || '').trim());
     let member;
     if (old.impressions.length && !hadSource) {
@@ -298,6 +424,8 @@ export class GlobalPersonMemoryStore {
       member = {
         version: 2, userId: uid, name: finalName, sourceChatKeys: sources,
         updatedAt: now, lastConsolidatedAt: old.lastConsolidatedAt || 0,
+        // 关系是独立于"印象正文"的计数：整理只改写印象，不该把聊过多少次清零。
+        relationship: normalizeRelationship(old.relationship),
         impressions: incoming.map((content) => {
           const prev = previous.get(String(content));
           const createdAt = Number(prev?.createdAt) || now;
@@ -337,10 +465,11 @@ export class GlobalPersonMemoryStore {
       // 先把合并结果落盘、删旧文件前再拍一份快照：原来 rm 在前、#persist 在循环外，
       // 落盘一旦失败（磁盘满/权限），已删掉的旧印象就静默消失且无快照可回滚。
       this.#persist(member);
-      try { backupPersonBeforeConsolidation(candidate, { sourceChatKey: '', at: Date.now(), reason: 'merge-absorb' }); } catch { /* 备份失败不阻断 */ }
-      try { fs.rmSync(globalMemberFile(candidate.userId, candidate.name), { force: true }); } catch { /* 有意忽略：删残留文件失败仅造成文件残留，数据已先留快照可回滚 */ }
+      try { backupPersonBeforeConsolidation(candidate, { memoryDir: this.memoryDir, sourceChatKey: '', at: Date.now(), reason: 'merge-absorb' }); } catch { /* 备份失败不阻断 */ }
+      try { fs.rmSync(globalMemberFile(candidate.userId, candidate.name, this.memoryDir), { force: true }); } catch { /* 有意忽略：删残留文件失败仅造成文件残留，数据已先留快照可回滚 */ }
       map.delete(key);
     }
+    trimMember(member, now);
     this.#persist(member); map.set(uid, member);
     return structuredClone(member);
   }
@@ -349,8 +478,8 @@ export class GlobalPersonMemoryStore {
     const map = this.#ensure(); const member = map.get(uid);
     if (!member) return false;
     // 破坏性删除前留一份快照（与整理前快照同一套目录，可回滚）
-    try { backupPersonBeforeConsolidation(member, { sourceChatKey: '', at: Date.now(), reason: 'manual-delete' }); } catch { /* 备份失败不阻断 */ }
-    map.delete(uid); try { fs.rmSync(globalMemberFile(member.userId, member.name), { force: true }); } catch { /* 有意忽略：删残留文件失败仅造成文件残留，数据已先留快照可回滚 */ }
+    try { backupPersonBeforeConsolidation(member, { memoryDir: this.memoryDir, sourceChatKey: '', at: Date.now(), reason: 'manual-delete' }); } catch { /* 备份失败不阻断 */ }
+    map.delete(uid); try { fs.rmSync(globalMemberFile(member.userId, member.name, this.memoryDir), { force: true }); } catch { /* 有意忽略：删残留文件失败仅造成文件残留，数据已先留快照可回滚 */ }
     return true;
   }
   remove({ userId = '', target = '', content = '', sourceChatKey = '' } = {}) {
@@ -378,13 +507,22 @@ export class GlobalPersonMemoryStore {
         member.impressions = member.impressions.filter((x) =>
           x.content !== content || (scope && !sourceKeys(x.sourceChatKeys).includes(scope)));
         removed ||= member.impressions.length !== n;
+      } else if (scope) {
+        // 按 userId/target 删但带了会话范围：只摘这个会话来源的条目，别把私聊/别的群一起清空
+        const n = member.impressions.length;
+        member.impressions = member.impressions.filter((x) =>
+          !sourceKeys(x.sourceChatKeys).includes(scope));
+        removed ||= member.impressions.length !== n;
       } else { member.impressions = []; removed = true; }
+      // 摘掉印象后要重算成员级来源：否则这个人还会声称"来自 A 群"，而他在 A 群已经没有印象了
+      //（members(chatKey) / consolidationState 会把他算进 A 群；2026-10-13 全项目审查 P3）。
+      member.sourceChatKeys = sourceKeys(member.impressions.flatMap((x) => x.sourceChatKeys || []));
       // 只要真删掉了东西就留快照，不限于"整条被删空"：这个人还有别的来源时，
       // 被摘掉的那几条同样再也回不来 —— 而控制台文案承诺的是"服务端会留可回滚快照"。
       // before 是动手前的克隆；它本来就是空列表时，备份函数自己会返回 null 不落盘。
-      if (removed) { try { backupPersonBeforeConsolidation(before, { sourceChatKey: scope, at: Date.now(), reason: 'manual-delete' }); } catch { /* 备份失败不阻断 */ } }
+      if (removed) { try { backupPersonBeforeConsolidation(before, { memoryDir: this.memoryDir, sourceChatKey: scope, at: Date.now(), reason: 'manual-delete' }); } catch { /* 备份失败不阻断 */ } }
       if (!member.impressions.length) {
-        map.delete(key); try { fs.rmSync(globalMemberFile(member.userId, member.name), { force: true }); } catch { /* 有意忽略：删残留文件失败仅造成文件残留，数据已先留快照可回滚 */ }
+        map.delete(key); try { fs.rmSync(globalMemberFile(member.userId, member.name, this.memoryDir), { force: true }); } catch { /* 有意忽略：删残留文件失败仅造成文件残留，数据已先留快照可回滚 */ }
       } else { member.updatedAt = Date.now(); this.#persist(member); }
       if (uid || name) break;
     }
@@ -407,9 +545,9 @@ export class GlobalPersonMemoryStore {
       member.sourceChatKeys = sourceKeys(member.impressions.flatMap((x) => x.sourceChatKeys));
       member.updatedAt = Date.now();
       // 同上：这个人还有别的来源时也要留快照 —— 被摘掉的那几条一样回不来
-      if (touched) { try { backupPersonBeforeConsolidation(before, { sourceChatKey: source, at: Date.now(), reason: 'manual-delete' }); } catch { /* 备份失败不阻断 */ } }
+      if (touched) { try { backupPersonBeforeConsolidation(before, { memoryDir: this.memoryDir, sourceChatKey: source, at: Date.now(), reason: 'manual-delete' }); } catch { /* 备份失败不阻断 */ } }
       if (!member.impressions.length) {
-        map.delete(key); try { fs.rmSync(globalMemberFile(member.userId, member.name), { force: true }); } catch { /* 有意忽略：删残留文件失败仅造成文件残留，数据已先留快照可回滚 */ }
+        map.delete(key); try { fs.rmSync(globalMemberFile(member.userId, member.name, this.memoryDir), { force: true }); } catch { /* 有意忽略：删残留文件失败仅造成文件残留，数据已先留快照可回滚 */ }
       } else this.#persist(member);
     }
   }
@@ -432,10 +570,10 @@ export class GlobalPersonMemoryStore {
     member.sourceChatKeys = sourceKeys(member.impressions.flatMap((x) => x.sourceChatKeys));
     member.updatedAt = Date.now();
     // 有东西被摘掉就留快照（不只是整条删空）：这个人还有别的来源时，删掉的同样回不来
-    if (touched) { try { backupPersonBeforeConsolidation(before, { sourceChatKey: source, at: Date.now(), reason: 'manual-delete' }); } catch { /* 备份失败不阻断 */ } }
+    if (touched) { try { backupPersonBeforeConsolidation(before, { memoryDir: this.memoryDir, sourceChatKey: source, at: Date.now(), reason: 'manual-delete' }); } catch { /* 备份失败不阻断 */ } }
     if (!member.impressions.length) {
       map.delete(uid);
-      try { fs.rmSync(globalMemberFile(member.userId, member.name), { force: true }); } catch { /* 有意忽略：删残留文件失败仅造成文件残留，数据已先留快照可回滚 */ }
+      try { fs.rmSync(globalMemberFile(member.userId, member.name, this.memoryDir), { force: true }); } catch { /* 有意忽略：删残留文件失败仅造成文件残留，数据已先留快照可回滚 */ }
     } else this.#persist(member);
     return touched;
   }

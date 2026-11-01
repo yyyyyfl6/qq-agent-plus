@@ -18,6 +18,7 @@ import {
   normalizeAsrMax, normalizeStickerCollectMax, normalizeStickerMax, onebotIssueText, onebotStatusLineHtml, uiServiceOfUrl
 } from './format.js';
 import { QARegistry } from './registry.js';
+import { scheduleSideNav } from './side-nav.js';
 import { loadingLogs, loadingStatus, pendingSessionDetail, state } from './state.js';
 import { appendChatMessageRows, loadChats, updateChatMessagesBody } from '../pages/chat.js';
 import { renderSessionDetail, renderSessionList } from '../pages/sessions.js';
@@ -33,7 +34,8 @@ function graduatedFeatureState(c = state.config || {}) {
     // 「好友管理」页承载入站好友申请的审批（该功能不受退役影响），导航入口
     // 不随 friendProposal 的退役隐藏——只隐藏会把入站审批一起藏掉。
     slang: c.slangPilot?.graduated === true,
-    incidents: c.incidentPilot?.graduated === true
+    incidents: c.incidentPilot?.graduated === true,
+    'living-memory': c.livingMemory?.graduated === true
   };
 }
 
@@ -43,6 +45,35 @@ function syncGraduatedFeatureNavigation(c = state.config || {}) {
     const tab = $(`[data-feature-nav="${feature}"]`);
     if (tab) tab.classList.toggle('hidden', !visible);
   }
+  // 显隐会改导航的行高/项数 → 侧栏那个"会滑动的选中块"必须重新对位，
+  // 否则高亮会停在错的那一行上（首屏这里就会跑一次：被门控的页签在 init 之后才收起）。
+  scheduleSideNav(document);
+}
+
+/**
+ * 关对话框：先挂 `.closing` 播一段退场动画（150ms：整层淡出 + 卡片微收 + 糊一下），
+ * 动画结束再调用原生 close()。
+ * 为什么需要它：原生 `dialog.close()` 是瞬间生效的 —— 元素立即变成 display:none，
+ * 退场动画根本没有机会播。所以"关"这件事必须由 JS 分两步做。
+ * 兜底计时器：万一动画没跑（用户开了"关闭全部动效"、或者 `animationend` 因为节点被别处
+ * 移除而没触发），200ms 后无条件 close() —— 一个关不掉的对话框比没有动画严重得多。
+ */
+function closeDialog(dialog) {
+  if (!dialog || typeof dialog.close !== 'function') return;
+  if (!dialog.open) return;
+  if (dialog.dataset.closing === '1') return;
+  dialog.dataset.closing = '1';
+  dialog.classList.add('closing');
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    dialog.classList.remove('closing');
+    delete dialog.dataset.closing;
+    if (dialog.open) dialog.close();
+  };
+  dialog.addEventListener('animationend', (e) => { if (e.target === dialog) finish(); });
+  setTimeout(finish, 200);
 }
 
 function askForConfirmation(message) {
@@ -128,7 +159,26 @@ async function pollUntilReady() {
 //   · key 相同且 HTML 相同 → 复用原节点（什么都不做）
 //   · key 相同但 HTML 变了 → 只替换这一行
 //   · key 不存在 → 插入新节点；多余的 key → 删除
-function patchKeyedList(container, entries, keyAttr = 'data-key') {
+/**
+ * 列表行退场动画的等待时长（ms）—— 必须与 ui/style.css 里 `@keyframes rowOut` 那条
+ * `var(--dur-slow)`（260ms）一致：这里等的就是那条动画。改一处必须改两处。
+ */
+const LEAVE_MS = 260;
+
+/** 取消一行的退场（它在新一轮列表里又出现了，不能让它到点被删掉）。 */
+function cancelLeave(node) {
+  const view = node.ownerDocument?.defaultView;
+  if (node.__leaveTimer) {
+    (view?.clearTimeout || clearTimeout).call(view, node.__leaveTimer);
+    node.__leaveTimer = null;
+  }
+  node.__leaving = false;
+  node.classList.remove('leaving');
+  node.style.removeProperty('--leave-h');
+  node.style.removeProperty('height');
+}
+
+function patchKeyedList(container, entries, keyAttr = 'data-key', { exit = false } = {}) {
   if (!container) return;
   // 比较用的规范化：把"由本地 ticker 维护"的倒计时文本抹掉，
   // 否则每次刷新都判定成"行变了"，整行重建（倒计时还会闪回旧值）。
@@ -156,6 +206,9 @@ function patchKeyedList(container, entries, keyAttr = 'data-key') {
     if (seen.has(key)) continue;
     seen.add(key);
     let node = existing.get(key) || null;
+    // 上一轮正在退场的行又回来了（列表抖动 / 过滤来回切）：取消退场、原地留下这一行。
+    // 不取消的话，那个 setTimeout 到点会把刚回来的行删掉 —— 列表少一行，而且没人补。
+    if (node?.__leaving) cancelLeave(node);
     const cmp = norm(entry.html);
     if (node && node.__cmp !== cmp) {
       const fresh = makeNode(entry.html, key);
@@ -168,19 +221,144 @@ function patchKeyedList(container, entries, keyAttr = 'data-key') {
     if (node !== wantNext) container.insertBefore(node, prev ? prev.nextSibling : container.firstChild);
     prev = node;
   }
+  const leaving = [];
   for (const [key, node] of existing) {
-    if (!seen.has(key)) node.remove();
+    if (seen.has(key) || node.__leaving) continue;
+    leaving.push(node);
+  }
+  if (leaving.length) {
+    // 退场（可选，由调用方开）：先塔缩再移除，否则下面的行会”喍”地跳上来。
+    // 只有两个前提都满足才值得等：
+    //   ① 这个节点真的被渲染过（offsetHeight > 0）—— 没有布局盒就没有高度可塔；
+    //      happy-dom 这类无布局环境也走这条，于是行为与改动前逐字一致（不延后删除）；
+    //   ② 用户没关动效（data-motion 有值即算关，见下）。
+    // 不具备时直接 remove()，语义与原来一模一样。
+    //
+    // 2026-10-09 审查两处修正：
+    //   · 判据从”=== 'off'”放宽到”有值即关”：style.css 对 reduced 也是 animation:none
+    //     （html[data-motion='reduced'] * 规则），只认 off 会让 reduced 下这一行先静止
+    //     260ms 再消失 —— 正是”减少动效”想消掉的那一跳。
+    //   · 先把该量的高度量完、再统一写：原来”逐行读 offsetHeight → 立即 remove”是读写交替，
+    //     删 N 行触发 N 次强制重排（列表上百行时可感知）。
+    const motionOff = Boolean(container.ownerDocument?.documentElement?.getAttribute('data-motion'));
+    const heights = motionOff ? [] : leaving.map((node) => node.offsetHeight || 0);
+    for (const [index, node] of leaving.entries()) {
+      const height = motionOff ? 0 : heights[index];
+      if (!exit || height <= 0) {
+        node.remove();
+        continue;
+      }
+      // 高度只能由 JS 量好——CSS 里没法从 auto 插值到 0（interpolate-size 也帮不上，
+      // 因为这里要的是“从当前实际高度出发”而不是“从 auto 出发”）。
+      const view = container.ownerDocument?.defaultView;
+      node.__leaving = true;
+      node.style.setProperty('--leave-h', `${height}px`);
+      node.classList.add('leaving');
+      node.__leaveTimer = (view?.setTimeout ? view.setTimeout.bind(view) : setTimeout)(
+        () => { node.__leaving = false; node.remove(); }, LEAVE_MS);
+    }
   }
 }
 
 // 只在内容真的变化时替换 DOM。
 // 背景：控制页/异常页等会在每次状态刷新（15 秒一次 + 推送）时重建整块 HTML，
 // 数据没变也照重建 —— 页面就"整页闪一下"。用这个函数收口：HTML 相同直接跳过。
-function setHtmlIfChanged(el, html) {
+/**
+ * 取出容器内输入控件的当前值（按 id 存）：重画后要还回去，
+ * 否则"用户在整块重画那一刻还没保存的输入"会被服务端上一次的值覆盖
+ * （好友管理页二十多个数字框、异常处理设置、人物印象搜索框都踩过这一类）。
+ * 只保留有 id 的控件 —— 没 id 的本来也只能靠位置猜，猜错反而更糟。
+ */
+function captureEditableValues(root) {
+  const values = new Map();
+  if (!root?.querySelectorAll) return values;
+  const seen = new Map();     // id → 已出现几次：同容器内重复 id 时按出现序号配对，不串
+  for (const node of root.querySelectorAll('input[id], select[id], textarea[id]')) {
+    const box = node.type === 'checkbox' || node.type === 'radio';
+    // __renderedValue = 上一轮**渲染出来**的值；与它不同才说明用户动过这个控件
+    const current = box ? node.checked === true : String(node.value ?? '');
+    const nth = seen.get(node.id) || 0;
+    seen.set(node.id, nth + 1);
+    values.set(`${node.id}|${nth}`, { box, current, rendered: node.__renderedValue });
+  }
+  return values;
+}
+
+/** 还回用户改过、还没保存的那一份：
+ *  · **只还原"用户真的动过"的控件**（当前值 ≠ 上一轮渲染值）——没动过的控件要跟着服务端新值走，
+ *    否则服务端纠正过的值（越界被夹、别名改名…）会被永久挡在界面外（2026-10-03 复审指出）。
+ *  · **服务端这一轮也改了同一个值时不还原**（2026-10-04 复审 P2）：两个条件必须同时成立。
+ *    只判"用户动过"的话，一次保存后的回填会把服务端刚夹好的值又盖回用户输的那个 ——
+ *    好友管理页把 99999 输进 max=365 的框，服务端存 365，界面却显示 99999（存的不是显示的）。
+ *  · 下拉只在**该选项还在**时还原（选项没了不强塞非法值）；控件换了类型（同名 checkbox↔text）不还原。
+ *  · 遍历**新**节点而不是按 id 反查：省掉选择器转义，控件被删/改名时自然跳过。 */
+function restoreEditableValues(root, values) {
+  // 不用 values.size 提前返回：**每个新控件都要记下这一轮渲染出来的值**（首轮容器是空的，
+  // values 为空，但记录渲染值仍要做，否则第二次重画时无从判断"用户动过没有"）。
+  if (!root?.querySelectorAll) return;
+  const seen = new Map();
+  for (const node of root.querySelectorAll('input[id], select[id], textarea[id]')) {
+    const nth = seen.get(node.id) || 0;
+    seen.set(node.id, nth + 1);
+    const saved = values.get(`${node.id}|${nth}`);
+    const box = node.type === 'checkbox' || node.type === 'radio';
+    const renderedNow = box ? node.checked === true : String(node.value ?? '');
+    // 服务端这一轮有没有动这个值：动了就以服务端为准，不回填用户那份
+    const serverChanged = saved && saved.rendered !== undefined
+      && String(renderedNow) !== String(saved.rendered);
+    if (saved && saved.box === box && saved.rendered !== undefined
+      && saved.current !== saved.rendered && !serverChanged) {
+      if (box) node.checked = saved.current;
+      else if (node.tagName !== 'SELECT' || [...node.options].some((option) => option.value === saved.current)) {
+        node.value = saved.current;
+      }
+    }
+    // ⚠️ 必须记 **renderedNow（这一轮 HTML 渲染出来的值）**，不能记还原后的 node.value
+    //（2026-10-04 复审 P1）。记成还原后的值等于把基线污染成"用户输入"：下一轮捕获时
+    // current === rendered，看起来用户没动过；而服务端这一轮又确实改了值（renderedNow ≠
+    // 基线）→ serverChanged 成立 → 不还原 → **未保存的输入在第二轮就被冲掉**。
+    // 也就是说"保留未保存输入"只保得住一轮。实测：render1=1 → 用户改 42 → render2 保住 42
+    // 但基线被写成 42 → render3 直接回到 1。
+    node.__renderedValue = renderedNow;
+  }
+}
+
+/**
+ * 写一块 HTML，数据没变就跳过（去重靠 el.__renderedHtml）。
+ * options.force：**用户自己触发的刷新**要设 true（筛选下拉、按回车搜索…）。
+ *   背景：焦点守卫会拦下"焦点在输入类控件上"的整块重写，可它分不清"后台轮询要重画"和
+ *   "刚刚那个控件自己要重画"。异常处理页的状态/等级筛选选完不动（表格还是上一档）、
+ *   人物印象页搜索框按回车没反应，都是被自己触发的刷新被守卫挡了（2026-10-04 复审 P1）。
+ *   兜底的 1.5 秒状态轮询会在焦点移开后补上，但那让用户看到的是"筛选时灵时不灵"，
+ *   而异常日志页此刻正把没筛选的那批行当成筛选结果看。
+ *   force 时顺带把焦点还给同一个 id 的控件（重画会换掉节点，不还就得重按一次）。
+ */
+function setHtmlIfChanged(el, html, options = {}) {
   if (!el) return false;
   if (el.__renderedHtml === html) return false;
+  const values = captureEditableValues(el);
+  const active = typeof document !== 'undefined' ? document.activeElement : null;
+  // 用户正在这块区域里打字时，这一轮重拉先别写：整块 innerHTML 会把输入框连同内容一起换掉
+  //（焦点丢失、正在敲的字符消失）—— 与 2026-10-02「屏蔽名单搜索框只能输一个字」同族。
+  // 只拦焦点在输入类控件上：按钮上的焦点不拦（保存后的「已保存」提示要能画出来），
+  // 焦点离开后下一轮自动补上，不会卡住页面。
+  const focusedInput = active && active !== el && el.contains?.(active)
+    && /^(input|textarea|select)$/i.test(active.tagName || '');
+  if (focusedInput && options.force !== true) return false;
+  const refocusId = focusedInput && options.force === true ? active.id : '';
   el.__renderedHtml = html;
   el.innerHTML = html;
+  restoreEditableValues(el, values);
+  if (refocusId) {
+    const again = el.querySelector(`#${CSS?.escape ? CSS.escape(refocusId) : refocusId}`);
+    if (again && typeof again.focus === 'function') {
+      again.focus();
+      // 光标停在末尾：用户接着敲的是新内容，不是去改中间（搜索框场景最常见）
+      if (typeof again.setSelectionRange === 'function') {
+        try { again.setSelectionRange(again.value.length, again.value.length); } catch { /* number 类型不支持，忽略 */ }
+      }
+    }
+  }
   return true;
 }
 
@@ -321,10 +499,16 @@ function initSessionScrollLoader() {
  *   表现为"滑到临界线继续向下滚动反应迟钝"。
  */
 function initChatScrollLoader() {
-  attachScrollLoader('chat-detail', () => {
-    const total = (state.chatMessages || []).length;
+  attachScrollLoader('chat-detail', async () => {
+    let total = (state.chatMessages || []).length;
     const prev = Math.max(CHAT_MSG_PAGE, Number(state.chatMsgLimit) || CHAT_MSG_PAGE);
-    if (prev >= total) return;                     // 已经全显示了
+    if (prev >= total) {
+      // 已加载的都显示了：向服务端要更早的一页（游标分页），成功后再继续增量追加。
+      if (typeof state.chatLoadOlder !== 'function') return;
+      const added = await state.chatLoadOlder();
+      total = (state.chatMessages || []).length;
+      if (!added || prev >= total) return;
+    }
     state.chatMsgLimit = Math.min(total, prev + CHAT_MSG_MORE);
     // 行数账本对不上（结构刚被轮询重建过等异常）→ 全量兜底；正常走追加
     if ((state.chatMsgRendered || 0) !== Math.min(prev, total)) {
@@ -446,6 +630,16 @@ function experimentalFeatureLaunchPatch(c, feature, ownerUin = '') {
       }
     };
   }
+  if (feature === 'living-memory') {
+    return {
+      livingMemory: {
+        ...(c.livingMemory || {}),
+        enabled: true,
+        graduated: true,
+        mode: 'shadow'
+      }
+    };
+  }
   throw new Error(`未知实验功能：${feature}`);
 }
 
@@ -518,7 +712,7 @@ function splitThinkingRowsHtml(c) {
 function splitRowsHtml(c) {
   const { rows, note } = splitThinkingRowsHtml(c);
   return {
-    inner: rows.map((r) => `<div style="display:flex;align-items:center;gap:8px;margin-top:4px"><span class="muted" style="font-size:12px;white-space:nowrap;min-width:64px">${esc(r.label)}</span><div style="flex:1;min-width:0" id="thinking-seg-slot-${r.key}">${r.html}</div></div>`).join(''),
+    inner: rows.map((r) => `<div style="display:flex;align-items:center;gap:8px;margin-top:4px"><span class="muted" style="font-size: var(--fs-sm);white-space:nowrap;min-width:64px">${esc(r.label)}</span><div style="flex:1;min-width:0" id="thinking-seg-slot-${r.key}">${r.html}</div></div>`).join(''),
     note
   };
 }
@@ -532,20 +726,24 @@ function extraBodyText(obj) {
  * 保存成功后把"服务端实际存下来的值"回填到控件上。
  * 以前只有省 Token 页保存后会重画，别的页不回填：控件里留着旧输入，看着像保存成功了、
  * 其实存的是另一个值（夹上限、换算档位这类字段都会这样）。先从清单条数这一个做起。
+ *
+ * ⚠️ 滑条要补发一次 input 事件（2026-10-04 复审 P2）：程序化写 .value **不触发** input，
+ *    而滑条的读数（#cfg-sticker-max-now）和填充色（--pos）只在那一个监听里更新 ——
+ *    直接写值的话，滑块停在 10.4、服务端存 10，"已保存 ✓"出来了读数还显示着旧的。
  */
 function syncClampedInputs() {
-  const stickerMax = $('#cfg-sticker-max');
-  if (stickerMax) {
-    stickerMax.value = String(normalizeStickerMax(state.config?.sticker?.promptMaxStickers));
-  }
-  const stickerCollectMax = $('#cfg-sticker-collect-max');
-  if (stickerCollectMax) {
-    stickerCollectMax.value = String(normalizeStickerCollectMax(state.config?.sticker?.maxCollectPerHour));
-  }
-  const asrMax = $('#cfg-asr-max');
-  if (asrMax) {
-    asrMax.value = String(normalizeAsrMax(state.config?.asr?.maxPerHour));
-  }
+  const fill = (node, value) => {
+    if (!node) return;
+    const next = String(value);
+    if (node.value !== next) node.value = next;
+    // 滑条的联动全靠 input 事件（读数 + 填充色）；这里补发，让回填和用户拖动走同一条路
+    if (typeof node.dispatchEvent === 'function') {
+      try { node.dispatchEvent(new Event('input', { bubbles: true })); } catch { /* 老环境没有 Event，忽略 */ }
+    }
+  };
+  fill($('#cfg-sticker-max'), normalizeStickerMax(state.config?.sticker?.promptMaxStickers));
+  fill($('#cfg-sticker-collect-max'), normalizeStickerCollectMax(state.config?.sticker?.maxCollectPerHour));
+  fill($('#cfg-asr-max'), normalizeAsrMax(state.config?.asr?.maxPerHour));
 }
 
 
@@ -580,5 +778,6 @@ export {
   identityPilotSettingsPatch, impressionMetaLabel, initChatScrollLoader, initSessionScrollLoader,
   patchKeyedList, pollUntilReady, readAssetImage, requestExperimentOwnerUin, revealLoadingIfSlow,
   scheduleChatsRefresh, scheduleSessionRender, setBoxError, setHtmlIfChanged, setLoadingStatus,
-  setStatusLabel, splitRowsHtml, syncClampedInputs, syncGraduatedFeatureNavigation, updateOnebotStatusLine
+  closeDialog, setStatusLabel, splitRowsHtml, syncClampedInputs, syncGraduatedFeatureNavigation,
+  updateOnebotStatusLine
 };

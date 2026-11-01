@@ -3,11 +3,23 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import { rmDirBestEffort } from './helpers/cleanup.mjs';
 
 const {
   IncidentPilotManager,
-  incidentDatabasePath
+  incidentDatabasePath,
+  formatIncidentNotification
 } = await import('../src/pilots/incident-pilot.js');
+
+test('incident QQ notice omits attachment bytes, truncates long errors and keeps the incident ID', () => {
+  const notice = formatIncidentNotification({ severity: 'error', source: 'orchestrator', chatKey: 'group:10001', count: 1, id: 'inc_test', message: '模型 API HTTP 500：GIF不支持 url: data:image/gif;base64,' + 'R0lGODlh'.repeat(300) + ' 后续说明'.repeat(100) });
+  assert.ok(notice.length < 550);
+  assert.doesNotMatch(notice, /R0lGODlh|data:image/);
+  assert.match(notice, /附件内容已省略/);
+  assert.match(notice, /已截断/);
+  assert.match(notice, /编号：inc_test/);
+  assert.match(notice, /处理入口：控制台 → 异常/);
+});
 
 function fixture(t, patch = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-incident-pilot-'));
@@ -37,7 +49,7 @@ function fixture(t, patch = {}) {
   });
   t.after(async () => {
     await manager.stop();
-    fs.rmSync(dataDir, { recursive: true, force: true });
+    rmDirBestEffort(dataDir);
   });
   return {
     dataDir,
@@ -141,7 +153,7 @@ test('pending notifications resume once while unknown notification results never
   });
   t.after(async () => {
     await manager.stop();
-    fs.rmSync(dataDir, { recursive: true, force: true });
+    rmDirBestEffort(dataDir);
   });
   manager.start();
   const unknown = manager.capture(new Error('critical write'), {

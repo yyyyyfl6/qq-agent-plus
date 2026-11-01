@@ -1,0 +1,39 @@
+{
+  "id": "translate",
+  "apiVersion": 1,
+  "name": "翻译",
+  "version": "1.0.0",
+  "description": "把一句话或一小段文本翻成另一种语言（中/英/日/韩互译），走 MyMemory 公开接口，不需要 Key",
+  "entry": "index.mjs",
+  "capabilities": [
+    "tools",
+    "http",
+    "config"
+  ],
+  "tools": [
+    {
+      "name": "text",
+      "description": "翻译一段文本。群友问“这句英文什么意思”“帮我翻成日语”“这句韩语怎么讲”时用它。参数 text 是要翻译的原文；to 是目标语言，默认 zh-CN；from 是源语言，不传就按原文自动判断（含假名判日语、含谚文判韩语、含汉字判中文，否则英文）。语言可用代码或中文名，目前主要支持中(zh-CN)、英(en)、日(ja)、韩(ko)互译。 一次最多 500 字节（约 166 个汉字），超过请分段。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "要翻译的原文（一次最多 500 字节，约 166 个汉字）"
+          },
+          "to": {
+            "type": "string",
+            "description": "目标语言，默认 zh-CN；可写 zh-CN / en / ja / ko 或“日语”“韩语”等"
+          },
+          "from": {
+            "type": "string",
+            "description": "源语言，可选；不填就自动判断"
+          }
+        },
+        "required": [
+          "text"
+        ]
+      }
+    }
+  ]
+}

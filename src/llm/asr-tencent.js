@@ -9,6 +9,7 @@
 // AuthFailure.SignatureFailure / InvalidParameter 之类的明确错误，会原文透给用户，便于一轮定位。
 import crypto from 'node:crypto';
 import { asrSecretId, asrSecretKey, getConfig } from '../core/config.js';
+import { readTextBounded } from '../core/http-body.js';
 
 export const TENCENT_ASR_HOST = 'asr.tencentcloudapi.com';
 export const TENCENT_ASR_SERVICE = 'asr';
@@ -94,7 +95,8 @@ export async function tencentTranscribe(wavBuffer, {
       body: payload,
       signal: controller.signal
     });
-    const body = await res.text();
+    // 有界读（1MB）：转写结果本应很小，超限视为上游异常并中断（2026-10-09 审查）
+    const body = await readTextBounded(res, 1024 * 1024);
     let data = null;
     try { data = JSON.parse(body); } catch { /* 下面统一报错 */ }
     const err = data?.Response?.Error;

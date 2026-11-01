@@ -19,8 +19,18 @@ export const CHAT_SUMMARY_DEFAULTS = Object.freeze({
   maxInputChars: 16000,     // 喂给模型的聊天样本上限
   maxPerHourPerChat: 3,
   maxPerHour: 12,
-  style: 'structured'       // structured = 分话题要点；casual = 群友口吻三五句
+  style: 'structured',      // structured = 分话题要点；casual = 群友口吻三五句
+  // 专属指令（唤醒前消费，结果直接发出；见 extensions/commands.js）
+  commands: ['/总结', '总结一下'],
+  commandAccess: 'everyone' // everyone（受每小时额度约束）| owner
 });
+
+/** 指令列表：去空白、去重、限长；不允许换行。 */
+function normalizeCommands(value, fallback) {
+  const list = Array.isArray(value) ? value : fallback;
+  return [...new Set(list.map((c) => String(c ?? '').trim()).filter((c) => c && c.length <= 20 && !/[\r\n]/.test(c)))].slice(0, 6);
+}
+
 
 export function chatSummaryConfig(cfg = getConfig()) {
   const raw = isPlainObject(cfg?.chatSummary) ? cfg.chatSummary : {};
@@ -31,7 +41,9 @@ export function chatSummaryConfig(cfg = getConfig()) {
     maxInputChars: clampInt(raw.maxInputChars, 2000, 60000, CHAT_SUMMARY_DEFAULTS.maxInputChars),
     maxPerHourPerChat: clampInt(raw.maxPerHourPerChat, 1, 60, CHAT_SUMMARY_DEFAULTS.maxPerHourPerChat),
     maxPerHour: clampInt(raw.maxPerHour, 1, 200, CHAT_SUMMARY_DEFAULTS.maxPerHour),
-    style: raw.style === 'casual' ? 'casual' : 'structured'
+    style: raw.style === 'casual' ? 'casual' : 'structured',
+    commands: normalizeCommands(raw.commands, CHAT_SUMMARY_DEFAULTS.commands),
+    commandAccess: raw.commandAccess === 'owner' ? 'owner' : 'everyone'
   };
 }
 

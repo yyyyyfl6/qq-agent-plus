@@ -380,3 +380,66 @@ test('切换语音服务预设：凭据按服务记忆（存过取回 / 没存�
   assert.equal(String(diskAsr2.secretKeyProvider || ''), '', '归属未知的 secretKey 不许被这次保存认领');
   assert.equal(diskAsr2.secretKey, 'UNBOUND-SK', '值仍在（当前这家还能用）');
 });
+
+// 2026-10-03 全量审查：配置写入口的两条凭据/令牌防线
+//  ① 自定义搜索服务列表（providers，**密钥数组**）不许被"设置页回传的脱敏副本"冲掉 Key
+//  ② 整节替换（__replace__）不许把 server.token 写进配置（写了下次 start() 直接抛、起不来）
+test('设置页回传：自定义搜索服务的 Key 不被清空；整节替换带不进令牌', async (t) => {
+  const port = await freePort();
+  const cfg = structuredClone(DEFAULT_CONFIG);
+  cfg.server = { ...cfg.server, host: '127.0.0.1', port, token: '' };
+  cfg.runtime.mode = 'observe';
+  cfg.onebot.wsUrl = 'ws://127.0.0.1:1';
+  cfg.onebot.httpUrl = 'ws://127.0.0.1:1';
+  cfg.webSearch = {
+    ...cfg.webSearch,
+    providers: [{ id: 'custom-a', name: '自建 A', baseUrl: 'https://a.example.com/v1', apiKey: 'sk-custom-a' }],
+    deepseek: { baseUrl: 'https://api.deepseek.com/v1', apiKey: 'sk-deepseek' }
+  };
+  updateConfig(cfg);
+  const app = createApp({ log: () => {} });
+  t.after(async () => { await app.stop(); fs.rmSync(root, { recursive: true, force: true }); });
+  await app.start();
+  const request = async (route, { method = 'GET', body } = {}) => {
+    const response = await fetch(`http://127.0.0.1:${port}${route}`, {
+      method, headers: { 'content-type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body)
+    });
+    return { status: response.status, body: await response.json() };
+  };
+  const disk = () => JSON.parse(fs.readFileSync(path.join(root, 'config.json'), 'utf8'));
+
+  // ① 界面保存时的形状：GET 的脱敏视图整份展开回传（apiKey 被删、hasApiKey 被加）
+  const view = (await request('/api/config')).body.webSearch;
+  assert.equal('apiKey' in view.providers[0], false, '前提：视图里没有明文 Key');
+  assert.equal(view.providers[0].hasApiKey, true, '前提：视图里有派生标记');
+  let res = await request('/api/config', {
+    method: 'POST',
+    body: { webSearch: { ...view, enabled: true, provider: 'bing', searchUrl: view.searchUrl } }
+  });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  let onDisk = disk();
+  assert.equal(onDisk.webSearch.providers[0].apiKey, 'sk-custom-a', '保存设置页不许把自定义搜索服务的 Key 清空');
+  assert.equal('hasApiKey' in onDisk.webSearch.providers[0], false, '派生标记不落盘');
+  assert.equal('hasApiKey' in onDisk.webSearch, false, '顶层派生位也不落盘');
+
+  // 换了新 Key 的要能写进去（守卫不能变成"永远不让改"）
+  res = await request('/api/config', {
+    method: 'POST',
+    body: { webSearch: { providers: [{ id: 'custom-a', name: '自建 A', baseUrl: 'https://a.example.com/v1', apiKey: 'sk-custom-a-2' }] } }
+  });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(disk().webSearch.providers[0].apiKey, 'sk-custom-a-2', '客户端带新值时要能替换');
+  // 内置那七家的单槽（对象合并）本来就安全，顺带钉住
+  assert.equal(disk().webSearch.deepseek.apiKey, 'sk-deepseek', '内置搜索服务的 Key 不受影响');
+
+  // ② 整节替换带令牌：必须被剥掉
+  res = await request('/api/config', {
+    method: 'POST',
+    body: { server: { __replace__: { host: '127.0.0.1', port, token: 'stolen-token', hasToken: true } } }
+  });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  onDisk = disk();
+  assert.equal(String(onDisk.server.token || ''), '', '替换体里的 token 不许落盘（下次 start() 会直接抛、起不来）');
+  assert.equal(onDisk.server.port, port, '替换体里的其它字段照常生效（这条守卫只管凭据）');
+});

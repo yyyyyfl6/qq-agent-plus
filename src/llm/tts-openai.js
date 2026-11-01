@@ -2,10 +2,14 @@
 // 与 ASR 侧的多供应商结构对称：这里先只做兼容端点（硅基流动 / OpenAI / 自建网关），
 // 原生厂商（火山/讯飞）等有需求再加适配器。
 import { watchTimeWindow } from '../core/time-gate.js';
+import { readBytesBounded, readTextBounded } from '../core/http-body.js';
 
 export function ttsConfigured(cfg) {
   const t = cfg?.tts || {};
-  return t.enabled === true && String(t.baseUrl || '').trim() !== '';
+  // MiMo 有内置官方地址：只填 provider/Key 也能用，不强制再抄一遍地址。
+  const hasBase = String(t.baseUrl || '').trim() !== ''
+    || String(t.provider || '').trim().toLowerCase() === 'mimo';
+  return t.enabled === true && hasBase;
 }
 
 /**
@@ -55,12 +59,18 @@ export async function synthesizeSpeech({
     });
     if (!res.ok) {
       let detail = '';
-      try { detail = String(await res.text()).slice(0, 200); } catch { /* 忽略 */ }
+      try { detail = String(await readTextBounded(res, 4096)).slice(0, 200); } catch { /* 忽略 */ }
       throw new Error(`语音合成失败 HTTP ${res.status}${detail ? `：${detail}` : ''}`);
     }
-    const buffer = Buffer.from(await res.arrayBuffer());
+    // 有界读取：上游返回超大/畸形响应时中途取消，而不是先整包读入再判长度（2026-10-09 审查）
+    let buffer;
+    try {
+      buffer = await readBytesBounded(res, 4 * 1024 * 1024);
+    } catch (error) {
+      if (error?.code === 'BODY_TOO_LARGE') throw new Error('语音合成结果过大（>4MB）');
+      throw error;
+    }
     if (!buffer.length) throw new Error('语音合成返回了空音频');
-    if (buffer.length > 4 * 1024 * 1024) throw new Error('语音合成结果过大（>4MB）');
     return { buffer, format };
   } finally {
     clearTimeout(timer);

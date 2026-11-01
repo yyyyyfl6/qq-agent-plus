@@ -1,0 +1,8 @@
+{
+  "id": "video-digest",
+  "name": "视频读懂",
+  "version": "1.1.0",
+  "description": "优先用 B 站插件读懂视频；非 B 站链接才退回公开页面。",
+  "allowedTools": ["bilibili__search", "bilibili__video", "bilibili__read", "web_fetch", "send_message"],
+  "triggers": ["这个视频讲了什么", "帮我看看这个视频", "视频总结"]
+}

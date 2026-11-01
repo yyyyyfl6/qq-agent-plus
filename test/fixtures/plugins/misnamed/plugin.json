@@ -1,0 +1,11 @@
+{
+  "id": "not-the-dir-name",
+  "apiVersion": 1,
+  "name": "身份不一致夹具",
+  "version": "1.0.0",
+  "description": "manifest 的 id 与目录名不一致：必须被拒载（否则 enabledIds / 工具前缀 / 状态目录会各认一个身份）",
+  "capabilities": ["tools"],
+  "tools": [
+    { "name": "whatever", "description": "不该有机会被调用", "parameters": { "type": "object", "properties": {} } }
+  ]
+}

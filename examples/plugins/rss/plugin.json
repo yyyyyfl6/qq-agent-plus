@@ -1,0 +1,34 @@
+{
+  "id": "rss",
+  "apiVersion": 1,
+  "name": "RSS 订阅",
+  "version": "1.0.0",
+  "description": "抓一个 RSS/Atom 订阅源的最新几篇，整理成标题+链接+时间（订阅地址你给，插件不自带源）",
+  "entry": "index.mjs",
+  "capabilities": [
+    "tools",
+    "http"
+  ],
+  "tools": [
+    {
+      "name": "latest",
+      "description": "抓一个 RSS 或 Atom 订阅源的最新条目。群友丢来一个博客/新闻/播客的订阅地址，问“这个源最近更新了啥”时用它。参数 url 是订阅地址（http/https 的 .xml 或 feed 链接）；limit 是要几条，默认 5。返回每条条目的标题、链接与发布时间。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "RSS/Atom 订阅源地址，例如 https://example.com/feed.xml"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "要几条，默认 5，最多 20"
+          }
+        },
+        "required": [
+          "url"
+        ]
+      }
+    }
+  ]
+}

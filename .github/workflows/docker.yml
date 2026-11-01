@@ -1,0 +1,266 @@
+name: Docker
+
+# tag push 发布版本 tag；稳定版才移动 latest。手动 workflow_dispatch 默认只推 sha-...，
+# 填新的版本号且该 tag 不存在时才推版本 tag，避免覆盖已发布版本。
+# 发布前先跑单元测试与 lint：镜像会被用户直接拉取运行，不能绕过发布闸门。
+# 容器相关文件的 PR 只做构建+冒烟，不登录、不推送。
+on:
+  push:
+    tags:
+      - 'v*'
+  # 只改容器相关文件的 PR 也跑构建+冒烟（不推送），否则 Dockerfile 坏到发版才发现。
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - docker-compose.yml
+      - docker/**
+      - scripts/docker-*.sh
+      - scripts/docker-*.mjs
+      - package.json
+      - package-lock.json
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '要构建的版本 tag；留空只推 sha-...。已存在的版本会被拒绝覆盖'
+        required: false
+        default: ''
+      push_cn:
+        description: '同时复制到国内镜像（需要 CN_* 变量与密钥）'
+        type: boolean
+        default: true
+      overwrite:
+        description: '允许覆盖已存在的版本 tag（慎用）'
+        type: boolean
+        default: false
+      cn_only:
+        description: '只把 GHCR 上已存在的版本复制到国内镜像，不重新构建（补发国内 tag 用）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # 所有 tag 构建共用一个组：避免两个稳定 tag 并发时旧版本最后完成、把 latest 覆盖回去。
+  group: docker-${{ github.ref_type == 'tag' && 'tags' || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+      - name: Tag 与版本号一致
+        if: github.ref_type == 'tag'
+        run: |
+          set -e
+          # 与 release.yml 同一口径：tag 与 package.json 不一致时不许发镜像，
+          # 否则 GHCR/ACR 会推出一个自报版本与 tag 对不上的镜像。
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME 与 package.json 版本 $PKG_VERSION 不一致"
+            exit 1
+          fi
+          echo "版本号一致：$TAG_VERSION"
+      - name: 手动发布版本与 package.json 一致
+        if: github.event_name == 'workflow_dispatch' && inputs.version != ''
+        run: |
+          set -e
+          VERSION="${{ inputs.version }}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::手动发布版本 $VERSION 与 package.json 版本 $PKG_VERSION 不一致"
+            exit 1
+          fi
+          echo "版本号一致：$VERSION"
+      - name: 版本发布只能从 main 分支
+        if: inputs.version != '' && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::正式版本只能从 main 发布（当前 ref: ${{ github.ref }}）"
+          exit 1
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run test:unit
+
+  smoke:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: qq-agent-plus:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - run: sh scripts/docker-smoke.sh qq-agent-plus:test
+
+  build:
+    needs: [verify, smoke]
+    if: github.event_name != 'pull_request' && inputs.cn_only != true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Refuse to overwrite an existing version tag
+        if: inputs.version != '' && inputs.overwrite != true
+        run: |
+          if docker buildx imagetools inspect "ghcr.io/${{ github.repository }}:${{ inputs.version }}" >/dev/null 2>&1; then
+            echo "::error::tag ${{ inputs.version }} already exists; delete it explicitly or use a new version"
+            exit 1
+          fi
+      - name: Refuse to overwrite an existing release tag (tag push)
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if docker buildx imagetools inspect "ghcr.io/${{ github.repository }}:${VERSION}" >/dev/null 2>&1; then
+            echo "::error::tag ${VERSION} already exists; published image tags are immutable"
+            exit 1
+          fi
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}},enable=${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+            type=sha,prefix=sha-
+            type=raw,value=${{ inputs.version }},enable=${{ inputs.version != '' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'push' && github.ref_type == 'tag' && !contains(github.ref_name, '-') }}
+          labels: |
+            org.opencontainers.image.title=QQ Agent Plus
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=MIT
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 阿里云 ACR 个人版不接受 BuildKit 的 attestation manifest
+          # （application/vnd.oci.empty.v1+json，复制时会 403）。关掉 provenance/SBOM，
+          # 输出标准 OCI image index，GHCR 与 ACR 都能用。
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # 可选的国内镜像：GHCR 在国内经常拉不动。配置下面三个变量与两个 secret 后，
+  # 本 job 会把 GHCR 上已经构建好的多架构 manifest 原样复制到国内仓库（不重新构建）。
+  #   vars:    CN_REGISTRY / CN_NAMESPACE / CN_IMAGE_NAME（默认 qq-agent-plus）
+  #   secrets: CN_REGISTRY_USERNAME / CN_REGISTRY_PASSWORD
+  # 推荐阿里云 ACR 个人版（免费、可公开拉取）或腾讯云 TCR。
+  publish-cn:
+    needs: build
+    # cn_only 时 build 被跳过，这里仍要执行（复制 GHCR 上已有的清单，不重建）
+    if: always() && vars.CN_REGISTRY != '' && (github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.push_cn == true && inputs.version != '')) && (needs.build.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.cn_only == true))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Check CN credentials
+        id: cn
+        env:
+          USERNAME: ${{ secrets.CN_REGISTRY_USERNAME }}
+          PASSWORD: ${{ secrets.CN_REGISTRY_PASSWORD }}
+        run: |
+          if [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
+            echo "::error::CN_REGISTRY is configured but CN_REGISTRY_USERNAME / CN_REGISTRY_PASSWORD are missing"
+            exit 1
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+      - if: steps.cn.outputs.enabled == 'true'
+        name: Install skopeo
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq skopeo
+      - if: steps.cn.outputs.enabled == 'true'
+        name: Copy multi-arch image to CN registry (HTTP/1.1, retries)
+        env:
+          CN_REGISTRY: ${{ vars.CN_REGISTRY }}
+          CN_NAMESPACE: ${{ vars.CN_NAMESPACE }}
+          CN_IMAGE_NAME: ${{ vars.CN_IMAGE_NAME }}
+          CN_REGISTRY_USERNAME: ${{ secrets.CN_REGISTRY_USERNAME }}
+          CN_REGISTRY_PASSWORD: ${{ secrets.CN_REGISTRY_PASSWORD }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION_INPUT: ${{ inputs.version }}
+          OVERWRITE_INPUT: ${{ inputs.overwrite }}
+          CN_ONLY_INPUT: ${{ inputs.cn_only }}
+        run: |
+          set -eu
+          SRC="ghcr.io/${{ github.repository }}"
+          DST="${CN_REGISTRY}/${CN_NAMESPACE}/${CN_IMAGE_NAME:-qq-agent-plus}"
+          VERSION="${VERSION_INPUT:-${GITHUB_REF_NAME#v}}"
+          MAJOR_MINOR="$(printf '%s' "$VERSION" | awk -F. '{print $1"."$2}')"
+          # 手动构建只推 VERSION；正式稳定 tag 才带 0.9 与 latest（预发布不带）。
+          # cn_only 补发是把已发布的同一个版本补齐国内 tag，同样要带 0.9 与 latest。
+          TAGS="${VERSION}"
+          STABLE=false
+          [ "${VERSION#*-}" = "$VERSION" ] && STABLE=true
+          if { [ "${{ github.ref_type }}" = "tag" ] || [ "${CN_ONLY_INPUT:-false}" = "true" ]; } && [ "$STABLE" = true ]; then
+            TAGS="${TAGS} ${MAJOR_MINOR} latest"
+          fi
+
+          printf '%s' "$GHCR_TOKEN" | skopeo login ghcr.io --username "$GHCR_USER" --password-stdin
+          printf '%s' "$CN_REGISTRY_PASSWORD" | skopeo login "$CN_REGISTRY" --username "$CN_REGISTRY_USERNAME" --password-stdin
+
+          for tag in $TAGS; do
+            SRC_DIGEST="$(skopeo inspect --format '{{.Digest}}' "docker://${SRC}:${tag}" 2>/dev/null || true)"
+            DST_DIGEST="$(skopeo inspect --format '{{.Digest}}' "docker://${DST}:${tag}" 2>/dev/null || true)"
+            # 精确版本 tag 不可覆盖；0.9 / latest 是跟随最新稳定版的移动 tag，每次发版本来就要改
+            TAG_IS_MOVING=false
+            if [ "$tag" = "$MAJOR_MINOR" ] || [ "$tag" = "latest" ]; then TAG_IS_MOVING=true; fi
+            if [ -n "$DST_DIGEST" ] && [ "$DST_DIGEST" != "$SRC_DIGEST" ] \
+              && [ "$TAG_IS_MOVING" != true ] && [ "${OVERWRITE_INPUT:-false}" != "true" ]; then
+              echo "::error::${DST}:${tag} 已存在且 digest 不同（${DST_DIGEST} != ${SRC_DIGEST}）；已发布 tag 不可覆盖"
+              exit 1
+            fi
+            attempt=0
+            ok=false
+            while [ "$attempt" -lt 5 ]; do
+              attempt=$((attempt + 1))
+              # ACR 对 BuildKit 的 HTTP/2 上传会随机 PROTOCOL_ERROR；强制 HTTP/1.1，
+              # 并在 shell 层重试（失败的层不会重传已完成的部分）。
+              if GODEBUG=http2client=0 skopeo copy --all --preserve-digests \
+                "docker://${SRC}:${tag}" "docker://${DST}:${tag}"; then
+                ok=true
+                break
+              fi
+              echo "copy ${tag} failed (attempt ${attempt}/5), retrying..."
+              sleep 10
+            done
+            [ "$ok" = true ] || { echo "copy ${tag} failed after 5 attempts" >&2; exit 1; }
+            COPIED_DIGEST="$(skopeo inspect --format '{{.Digest}}' "docker://${DST}:${tag}" 2>/dev/null || true)"
+            if [ -n "$SRC_DIGEST" ] && [ "$COPIED_DIGEST" != "$SRC_DIGEST" ]; then
+              echo "::error::${DST}:${tag} 复制后 digest 不一致（${COPIED_DIGEST} != ${SRC_DIGEST}）"
+              exit 1
+            fi
+            echo "docker pull ${DST}:${tag}" >> "$GITHUB_STEP_SUMMARY"
+          done

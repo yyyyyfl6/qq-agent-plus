@@ -1,7 +1,7 @@
 'use strict';
 
 // 人格工作台（2026-11 完善人格界面）：挂在「设置 → 人设」上的一层增强，不改 pages/persona.js 的既有实现。
-//   · 侧栏「人格」入口：一键直达人设页（原来要 设置 → 往下找 → 人设）
+//   · （侧栏「人格」现在打开双人格页 /skins.html；这里只增强 设置 → 人设 这一页）
 //   · 卡库搜索、分节大纲（点一下跳到那一节并展开）、字数与 token 粗估
 //   · 试聊：用**草稿里的**卡（没保存也行）跟它聊几句，看口吻对不对 —— 不发到 QQ、不进记忆
 //   · AI 起草：一句话设定 → 按内置卡的分节格式写一张新卡，可填入草稿或另存为自定义卡
@@ -11,6 +11,7 @@
 import { closeModelModal, loadSettings, modelModalShell } from './app.js';
 import { api } from './core/api.js';
 import { $, esc } from './core/dom.js';
+import { iconSvg } from './core/icons.js';
 import { QARegistry } from './core/registry.js';
 import { state } from './core/state.js';
 import { applyPersonaDraft, parsePersonaCard } from './pages/persona.js';
@@ -27,29 +28,6 @@ import { applyPersonaDraft, parsePersonaCard } from './pages/persona.js';
       botName: $('#cfg-botname')?.value || ''
     };
   }
-
-  // ── 侧栏「人格」入口 ───────────────────────────────────────────
-  function syncNavHighlight() {
-    const onPersona = state.tab === 'settings' && state.settingsSection === 'persona';
-    document.querySelectorAll('.tab[data-settings-jump="persona"]').forEach((b) => b.classList.toggle('active', onPersona));
-    document.querySelectorAll('.tab[data-tab="settings"]:not([data-settings-jump])').forEach((b) => {
-      b.classList.toggle('active', state.tab === 'settings' && !onPersona);
-    });
-  }
-
-  document.querySelectorAll('.tab[data-settings-jump]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      // app.js 的 switchTab('settings') 先跑（它的监听先注册），loadSettings 是异步的：
-      // 这里同步改分区，等它真正渲染时读到的就是人设页
-      state.settingsSection = btn.dataset.settingsJump;
-      syncNavHighlight();
-    });
-  });
-  document.querySelectorAll('.tab[data-tab="settings"]:not([data-settings-jump])').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      if (state.settingsSection === 'persona') state.settingsSection = 'api';
-    });
-  });
 
   // ── 大纲 / 统计 ───────────────────────────────────────────────
   function outlineHtml() {
@@ -265,7 +243,6 @@ import { applyPersonaDraft, parsePersonaCard } from './pages/persona.js';
 
   // ── 装配 ──────────────────────────────────────────────────────
   function mount() {
-    syncNavHighlight();
     if (state.settingsSection !== 'persona') return;
     const lib = document.querySelector('#settings-form .persona-lib');
     const detail = document.querySelector('#settings-form .persona-detail');
@@ -277,10 +254,10 @@ import { applyPersonaDraft, parsePersonaCard } from './pages/persona.js';
     bar.innerHTML = `
       <div class="ps-bar-row">
         <input type="search" id="ps-search" placeholder="搜索卡库…" value="${esc(studio.query)}" />
-        <button type="button" class="btn btn-small" id="ps-generate"><span data-ico="ext-fun" aria-hidden="true"></span>AI 起草</button>
-        <button type="button" class="btn btn-small" id="ps-import"><span data-ico="import" aria-hidden="true"></span>导入 .md</button>
-        <button type="button" class="btn btn-small" id="ps-export"><span data-ico="export" aria-hidden="true"></span>导出当前卡</button>
-        <button type="button" class="btn btn-small btn-primary hidden" id="ps-save-custom"><span data-ico="save" aria-hidden="true"></span><span class="ps-save-label">覆盖保存</span></button>
+        <button type="button" class="btn btn-small" id="ps-generate">${iconSvg('sparkles', { size: 15 })}AI 起草</button>
+        <button type="button" class="btn btn-small" id="ps-import">${iconSvg('download', { size: 15 })}导入 .md</button>
+        <button type="button" class="btn btn-small" id="ps-export">${iconSvg('upload', { size: 15 })}导出当前卡</button>
+        <button type="button" class="btn btn-small btn-primary hidden" id="ps-save-custom">${iconSvg('check', { size: 15 })}<span class="ps-save-label">覆盖保存</span></button>
         <input type="file" id="ps-import-file" accept=".md,.txt,text/markdown,text/plain" hidden />
         <span class="ext-flash" id="ps-flash"></span>
       </div>
