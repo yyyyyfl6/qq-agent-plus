@@ -681,7 +681,15 @@ export function createApp({
     // 插件声明 send 能力后，发言走机器人自己那条发送队列（禁言/限频/白名单/记账全在里面）
     getSender: () => sender,
     // 插件 v3 的主动唤醒：走编排器同一条 proactive 唤醒（白名单 / 作息 / 预算守卫都在里面）
-    getAgent: () => ({ wake: (chatKey, options) => orchestrator.wake(chatKey, options) })
+    getAgent: () => ({
+      wake: (chatKey, options) => orchestrator.wake(chatKey, options),
+      // 插件 v3 的 cap.context.persona：这个会话当前在跑的人格（与主对话同一套解析：多人格分仓 + 按群人设）
+      persona: (chatKey) => skins.scope(chatKey, () => {
+        const persona = resolvePersona(getConfig(), chatKey);
+        const skin = skins.enabled ? skins.current(chatKey) : null;
+        return { skinId: skin?.id || '', label: skin?.label || '', botName: persona.botName || '', roleText: persona.roleText || '' };
+      })
+    })
   });
   // 插件 v3 的入站 HTTP（/plugin-hooks/<id>/…）：手机等外部设备推数据给插件。不走控制台令牌，
   // 鉴权由插件做；宿主在 src/plugins/inbound.js 里限体积 / 频率、只转发白名单请求头。

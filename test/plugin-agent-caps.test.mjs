@@ -85,3 +85,16 @@ test('wake：交给主链路 proactive 唤醒，有会话间隔与每日上限',
   const none = createAgentCapabilities({ pluginId: 'wk2', manifest: {}, dataDir, getSettings: () => ({}) });
   await assert.rejects(none.methods['cap.wake.request']({ chatKey: 'private:1001' }), /主链路不可用/);
 });
+
+test('context.persona：读会话当前人格（由宿主解析），参数校验', async () => {
+  const caps = createAgentCapabilities({
+    pluginId: 'pp', manifest: { name: 'x' }, dataDir, getSettings: () => ({}),
+    getAgent: () => ({ persona: (k) => ({ skinId: k === 'private:10001' ? 'cat' : 'fish', label: '哈基米', botName: '哈基米', roleText: 'x'.repeat(5000) }) })
+  });
+  const p = await caps.methods['cap.context.persona']({ chatKey: 'private:10001' });
+  assert.equal(p.skinId, 'cat');
+  assert.equal(p.roleText.length, 3000);
+  assert.throws(() => caps.methods['cap.context.persona']({ chatKey: 'x' }), /chatKey/);
+  const none = createAgentCapabilities({ pluginId: 'pp2', manifest: {}, dataDir, getSettings: () => ({}) });
+  assert.throws(() => none.methods['cap.context.persona']({ chatKey: 'private:10001' }), /主链路不可用/);
+});

@@ -53,6 +53,7 @@ export const CAP_METHODS = Object.freeze({
   // ── apiVersion 3：接进连续对话工作流（src/plugins/agent-caps.js） ──
   llmComplete: `${CAP_PREFIX}llm.complete`,
   contextSet: `${CAP_PREFIX}context.set`,
+  contextPersona: `${CAP_PREFIX}context.persona`,
   wakeRequest: `${CAP_PREFIX}wake.request`
 });
 
@@ -78,6 +79,7 @@ export const CAP_REQUIREMENT = Object.freeze({
   [CAP_METHODS.sendFile]: 'send',
   [CAP_METHODS.llmComplete]: 'llm',
   [CAP_METHODS.contextSet]: 'context',
+  [CAP_METHODS.contextPersona]: 'context',
   [CAP_METHODS.wakeRequest]: 'wake'
 });
 

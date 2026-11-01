@@ -4,6 +4,8 @@
 //                     Key 只在宿主里解析，插件拿不到）。每插件每天有次数上限。
 //   cap.context.set   给某个会话挂一段"背景"（长任务的当前状态：此刻在做什么、心情、想说的事…）。
 //                     主模型每轮把它放进 user 内容（不动 system 前缀，不破坏前缀缓存）；有过期时间。
+//   cap.context.persona  读某个会话**当前正在运行的人格**（多人格切换后也跟着变）：插件的后台任务
+//                     （如陪伴插件的生活长任务）据此跟主对话用同一个角色，不另起一套设定。只读。
 //   cap.wake.request  请主模型对某个会话来一次主动唤醒（和冷场开话题同一条路：发不发、说什么由主模型决定）。
 //                     每会话最小间隔 + 每插件每天上限。
 //
@@ -138,6 +140,21 @@ export function createAgentCapabilities({ pluginId, manifest, dataDir, getSettin
       setPluginContext(pluginId, name, key, body, nowFn() + ttl * 60_000);
       stats.contextSets += 1;
       return { ok: true, chars: body.length, expiresAt: nowFn() + ttl * 60_000 };
+    },
+
+    'cap.context.persona': ({ chatKey } = {}) => {
+      const key = String(chatKey ?? '');
+      if (!CHAT_KEY_RE.test(key)) throw fail('E_ARGS', 'chatKey 必须是 private:<QQ> / group:<群号>');
+      const agent = agentOf?.();
+      if (!agent?.persona) throw fail('E_UNAVAILABLE', '主链路不可用');
+      const p = agent.persona(key) || {};
+      return {
+        skinId: String(p.skinId || ''),
+        label: String(p.label || '').slice(0, 40),
+        botName: String(p.botName || '').slice(0, 40),
+        // 角色卡正文截到 3000 字：够后台任务把握人设，不把整张长卡每次都搬进插件进程
+        roleText: String(p.roleText || '').slice(0, 3000)
+      };
     },
 
     'cap.wake.request': async ({ chatKey, note } = {}) => {
