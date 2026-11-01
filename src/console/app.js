@@ -62,7 +62,7 @@ import { resolveOfficialPrice, listOfficialPrices, listModelAliases, isPeakHour,
 import { initPriceFeed, refreshPriceFeed, priceFeedStatus } from '../pricing/price-feed.js';
 import { probeChannelPrices, capPrices } from '../pricing/price-probe.js';
 import { initChannelPrices, refreshChannelFeed, removeChannelFeed, channelPriceStatus, maybeAutoProbeChannel } from '../pricing/channel-prices.js';
-import { currentProviders, setProviderKey, testAllProviders, testOneProvider, testModelChat, probeThinking, fetchModelsFrom, upsertProvider, addModelsToProvider, removeModelFromProvider } from '../core/providers.js';
+import { currentProviders, setProviderKey, testAllProviders, testOneProvider, testModelChat, probeThinking, fetchModelsFrom, upsertProvider, addModelsToProvider, removeModelFromProvider, removeProvider, renameProvider } from '../core/providers.js';
 import { personaStateSnapshot } from '../core/persona-state.js';
 import { resolvePersona } from '../personas.js';
 import { scanModelsVision, visionResults } from '../llm/vision-scan.js';
@@ -4426,7 +4426,8 @@ export function createApp({
         apiKey: String(body.apiKey ?? ''),
         models: body.models || [],
         preset: String(body.preset ?? ''),
-        activate: body.activate !== false
+        activate: body.activate !== false,
+        displayName: String(body.displayName ?? '')
       });
       auditWrite('providers.upsert', String(r.provider?.id ?? ''), { req, after: sanitizeProvider(r.provider) });
       return json(res, 200, { ok: true, ...r, provider: sanitizeProvider(r.provider) });
@@ -4456,6 +4457,28 @@ export function createApp({
       return json(res, 200, { ok: true, provider: sanitizeProvider(p) });
     } catch (error) {
       auditWrite('providers.models.remove', '', { req, ok: false, error: String(error?.message ?? error) });
+      return json(res, 400, { ok: false, error: String(error?.message ?? error) });
+    }
+  });
+  router.add('POST', '/api/providers/rename', async (req, res) => {
+    try {
+      const body = await readBody(req);
+      const p = renameProvider(String(body.providerId ?? ''), String(body.displayName ?? ''));
+      if (!p) return json(res, 404, { ok: false, error: '提供商不存在' });
+      auditWrite('providers.rename', String(body.providerId ?? ''), { req, after: { displayName: p.displayName } });
+      return json(res, 200, { ok: true, provider: sanitizeProvider(p) });
+    } catch (error) { return json(res, 400, { ok: false, error: String(error?.message ?? error) }); }
+  });
+  router.add('DELETE', '/api/providers', async (req, res) => {
+    try {
+      const body = await readBody(req);
+      if (body?.confirm !== true) return json(res, 409, { ok: false, error: '删除供应商需要显式确认' });
+      const removed = removeProvider(String(body.providerId ?? ''));
+      if (!removed) return json(res, 404, { ok: false, error: '提供商不存在' });
+      auditWrite('providers.remove', String(body.providerId ?? ''), { req });
+      return json(res, 200, { ok: true });
+    } catch (error) {
+      auditWrite('providers.remove', String(error?.providerId ?? ''), { req, ok: false, error: String(error?.message ?? error) });
       return json(res, 400, { ok: false, error: String(error?.message ?? error) });
     }
   });

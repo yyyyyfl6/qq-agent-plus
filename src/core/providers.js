@@ -345,7 +345,7 @@ export async function testOneProvider({ providerId = '', baseUrl = '', apiKey = 
 /** 新建提供商；若同 baseURL 已存在则合并模型。返回 { provider, created }。
  *  preset = 渠道预设 id（provider-presets.js），用于把"关思考"翻译成该渠道认识的参数形状；
  *  留空时运行期按 baseURL 主机名自动推断。 */
-export function upsertProvider({ baseUrl, apiKey, models = [], preset = '', activate = true }) {
+export function upsertProvider({ baseUrl, apiKey, models = [], preset = '', activate = true, displayName = '' }) {
   const base = normalizeBaseUrl(baseUrl);
   if (!base) throw new Error('Base URL 不能为空');
   const presetId = String(preset || '').trim().toLowerCase();
@@ -382,7 +382,7 @@ export function upsertProvider({ baseUrl, apiKey, models = [], preset = '', acti
   for (const m of entries) modelNames[m.id] = m.name;
   const provider = {
     id,
-    displayName: hostDisplayName(base),
+    displayName: String(displayName || '').trim().slice(0, 40) || hostDisplayName(base),
     api: 'openai',
     anthropicOrigin: false,
     baseURL: base,
@@ -406,6 +406,37 @@ export function upsertProvider({ baseUrl, apiKey, models = [], preset = '', acti
     ...(activate ? { api: { provider: id, model: entries[0]?.id || '', baseUrl: base } } : {})
   });
   return { provider: withResolvedKey(provider), created: true };
+}
+
+/** 改供应商的显示名（控制台「模型供应商」卡片上的名字）。 */
+export function renameProvider(providerId, displayName) {
+  const name = String(displayName || '').trim().slice(0, 40);
+  if (!name) throw new Error('名称不能为空');
+  const providers = currentProviders().map((p) => ({ ...p }));
+  const p = providers.find((x) => x.id === providerId);
+  if (!p) return null;
+  p.displayName = name;
+  archiveInlineProviderKeys(providers);
+  updateConfig({ providers: providers.map((x) => { const { apiKey, ...rest } = x; return rest; }) });
+  return p;
+}
+
+/**
+ * 删除一个供应商（连同它存的 Key）。正在使用的那家不让删 —— 先切到别家再删，
+ * 否则聊天会立刻没有可用的模型。
+ */
+export function removeProvider(providerId) {
+  const cfg = getConfig();
+  if (String(cfg.api?.provider || '') === String(providerId)) throw new Error('这家正在使用中：先把当前模型切到别的供应商，再删除它');
+  const providers = currentProviders();
+  if (!providers.some((x) => x.id === providerId)) return false;
+  archiveInlineProviderKeys(providers);
+  const rest = providers.filter((x) => x.id !== providerId).map((x) => { const { apiKey, ...r } = x; return r; });
+  const keys = { ...(getConfig().providerKeys || {}) };
+  delete keys[providerId];
+  // providerKeys 走 __replace__：普通深合并删不掉已有键（同 setProviderKey）
+  updateConfig({ providers: rest, providerKeys: { __replace__: keys } });
+  return true;
 }
 
 /** 给指定提供商追加模型（合并 modelNames）。 */
