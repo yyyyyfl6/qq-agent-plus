@@ -48,7 +48,7 @@ import { extChatOptions, extFlash, extFmtTime, extHead, extLoadChats, extOnTab, 
     const ownerChat = (view.chats || []).filter((x) => String(x.key).startsWith('private:'));
     box.innerHTML = `
       ${extHead({
-        icon: '🐟', title: '大肥鱼桥', toggleId: 'lab-enabled', enabled: c.enabled,
+        icon: 'ext-lab', title: '大肥鱼桥', toggleId: 'lab-enabled', enabled: c.enabled,
         sub: '让机器人把管理员在 QQ 里交代的活派给<strong>实验室电脑上的 DeepSeek Harness</strong>，跑完把结果发回来。'
           + '只认管理员本人的指令；派发结果不确定时<strong>不会自动重试</strong>（免得同一件事在实验室电脑上执行两遍）。'
       })}

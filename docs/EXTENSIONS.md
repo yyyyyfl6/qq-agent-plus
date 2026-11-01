@@ -114,3 +114,21 @@ Windows 上执行 `.cmd/.bat` 时加 `LAB_BRIDGE_SHELL=1`。接收端默认只�
 | `src/tools/tools-core.js` | `generate_image` 的 `send` / `replyToMessageId` 参数 |
 
 回滚：把四个配置段的 `enabled` 关掉即恢复原行为；数据文件保留，删掉 `data/long-memory.sqlite` 与 `data/lab-bridge/` 即彻底清除。
+
+## 界面：配色方案与图标（2026-11 第二轮）
+
+- **配色方案**：设置 → 系统 → 界面，「主题」下面一行色卡：石墨紫（默认）/ 深海蓝（原版）/ 薄荷 / 樱花 / 琥珀 / 极夜（OLED 纯黑）。
+  与明暗主题正交，每套都有暗色、亮色两版。选择存 `localStorage` + 后端 `config.ui.palette`，首屏由 `index.html`
+  的预置脚本应用（不闪）。实现：`ui/palette.js`；配色变量在 `ui/style.css` 的「配色方案」段，新增一套只需加两行变量。
+- **SVG 图标**：侧栏导航、扩展页页头、主题选择、空状态都换成一套线条 SVG（CSS mask 绘制，跟随 `currentColor`）。
+- **无边框**：卡片、输入框、按钮、徽标去掉 1px 方框，改用底色明暗 + 柔和阴影 + 大圆角分层。
+
+## 搜索：谷歌与 Edge
+
+设置 → 搜索服务 → 搜索提供方新增两项（聚合搜索的源名也可用 `google` / `edge`）：
+
+- **谷歌 Google**：官方 Custom Search JSON API，国际域名 `https://www.googleapis.com/customsearch/v1`。
+  需要 API Key（Google Cloud 控制台启用 Custom Search API）与搜索引擎 ID `cx`（programmablesearchengine.google.com
+  新建"搜索整个网络"的引擎）；也可用环境变量 `GOOGLE_SEARCH_API_KEY` / `GOOGLE_SEARCH_CX`。界面语言留空由谷歌自动判断。
+- **Edge（必应国际版）**：Edge 浏览器默认引擎 `https://www.bing.com/search`，免 Key；`market` 留空由必应自动判断地区，
+  也可填 `en-US`、`ja-JP` 等。原有的「必应国内版 cn.bing.com」保留不变。

@@ -33,13 +33,13 @@ import { state } from './core/state.js';
     document.querySelectorAll('#tabs .tab').forEach((btn) => {
       if (btn.classList.contains('hidden') || btn.hidden || btn.style.display === 'none') return;
       const label = btn.textContent.trim();
-      list.push({ label, hint: '页面', icon: btn.dataset.icon || '•', keys: `${label} ${btn.dataset.tab}`, run: () => btn.click() });
+      list.push({ label, hint: '页面', ico: btn.dataset.settingsJump ? 'persona' : btn.dataset.tab, keys: `${label} ${btn.dataset.tab}`, run: () => btn.click() });
     });
     for (const [id, label, keys] of SETTINGS) {
       list.push({
         label: `设置 › ${label}`,
         hint: '设置',
-        icon: '⚙️',
+        ico: 'settings',
         keys: `${label} ${keys} ${id} 设置 settings`,
         run: () => {
           state.settingsSection = id;
@@ -48,7 +48,7 @@ import { state } from './core/state.js';
         }
       });
     }
-    list.push({ label: '切换主题（暗 / 亮 / 跟随系统）', hint: '操作', icon: '🌓', keys: 'theme 主题 暗色 亮色', run: () => document.querySelector('#theme-btn')?.click() });
+    list.push({ label: '切换主题（暗 / 亮 / 跟随系统）', hint: '操作', ico: 'persona', keys: 'theme 主题 暗色 亮色', run: () => document.querySelector('#theme-btn')?.click() });
     return list;
   }
 
@@ -76,7 +76,7 @@ import { state } from './core/state.js';
     const list = overlay.querySelector('.cp-list');
     list.innerHTML = items.length
       ? items.map((e, i) => `<button type="button" class="cp-item ${i === active ? 'active' : ''}" data-idx="${i}">
-          <span class="cp-icon">${esc(e.icon)}</span><span class="cp-label">${esc(e.label)}</span><span class="cp-hint">${esc(e.hint)}</span></button>`).join('')
+          <span class="cp-icon" data-ico="${esc(e.ico || '')}" aria-hidden="true"></span><span class="cp-label">${esc(e.label)}</span><span class="cp-hint">${esc(e.hint)}</span></button>`).join('')
       : '<div class="cp-empty">没有匹配的页面</div>';
   }
 

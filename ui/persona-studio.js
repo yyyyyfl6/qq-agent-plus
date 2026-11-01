@@ -88,7 +88,8 @@ import { applyPersonaDraft, parsePersonaCard } from './pages/persona.js';
     const d = draft();
     const dirty = tpl && (tpl.text !== d.roleText || (tpl.customRules || '') !== d.customRules || (tpl.behaviorProfile || 'legacy') !== d.behaviorProfile);
     btn.classList.toggle('hidden', !dirty);
-    if (tpl) btn.textContent = `💾 覆盖保存「${tpl.name}」`;
+    const label = btn.querySelector('.ps-save-label');
+    if (tpl && label) label.textContent = `覆盖保存「${tpl.name}」`;
   }
 
   // ── 试聊 ──────────────────────────────────────────────────────
@@ -144,7 +145,7 @@ import { applyPersonaDraft, parsePersonaCard } from './pages/persona.js';
   // ── AI 起草 ───────────────────────────────────────────────────
   function openGenerateModal() {
     const overlay = modelModalShell({
-      head: '✨ AI 起草一张人设卡',
+      head: 'AI 起草一张人设卡',
       body: `
         <div class="field"><label>名字</label><input type="text" id="ps-gen-name" maxlength="40" placeholder="例如：社恐学妹" /></div>
         <div class="field"><label>一句话设定（越具体越好：性格、口癖、爱好、和群友的关系）</label>
@@ -276,10 +277,10 @@ import { applyPersonaDraft, parsePersonaCard } from './pages/persona.js';
     bar.innerHTML = `
       <div class="ps-bar-row">
         <input type="search" id="ps-search" placeholder="搜索卡库…" value="${esc(studio.query)}" />
-        <button type="button" class="btn btn-small" id="ps-generate">✨ AI 起草</button>
-        <button type="button" class="btn btn-small" id="ps-import">📥 导入 .md</button>
-        <button type="button" class="btn btn-small" id="ps-export">📤 导出当前卡</button>
-        <button type="button" class="btn btn-small btn-primary hidden" id="ps-save-custom">💾 覆盖保存</button>
+        <button type="button" class="btn btn-small" id="ps-generate"><span data-ico="ext-fun" aria-hidden="true"></span>AI 起草</button>
+        <button type="button" class="btn btn-small" id="ps-import"><span data-ico="import" aria-hidden="true"></span>导入 .md</button>
+        <button type="button" class="btn btn-small" id="ps-export"><span data-ico="export" aria-hidden="true"></span>导出当前卡</button>
+        <button type="button" class="btn btn-small btn-primary hidden" id="ps-save-custom"><span data-ico="save" aria-hidden="true"></span><span class="ps-save-label">覆盖保存</span></button>
         <input type="file" id="ps-import-file" accept=".md,.txt,text/markdown,text/plain" hidden />
         <span class="ext-flash" id="ps-flash"></span>
       </div>
@@ -291,7 +292,7 @@ import { applyPersonaDraft, parsePersonaCard } from './pages/persona.js';
     chat.className = 'ps-chat';
     chat.innerHTML = `
       <div class="ps-chat-head">
-        <strong>💬 试聊</strong><span class="muted">用草稿里的卡回复（不发到 QQ）</span>
+        <strong>试聊</strong><span class="muted">用草稿里的卡回复（不发到 QQ）</span>
         <span class="spacer"></span>
         <button type="button" class="btn btn-small" id="ps-chat-clear">清空</button>
       </div>

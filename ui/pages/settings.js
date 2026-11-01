@@ -347,7 +347,9 @@ function renderSearchSection(c) {
       <label for="cfg-websearch">联网搜索：启用 web_search / web_fetch 工具</label></div>
     <div class="field"><label>搜索提供方</label>
       <select id="cfg-searchprovider">
-        <option value="bing" ${prov === 'bing' ? 'selected' : ''}>Bing 网页解析</option>
+        <option value="google" ${prov === 'google' ? 'selected' : ''}>谷歌 Google（官方 API）</option>
+        <option value="edge" ${prov === 'edge' ? 'selected' : ''}>Edge · 必应国际版（免 Key）</option>
+        <option value="bing" ${prov === 'bing' ? 'selected' : ''}>必应国内版 cn.bing.com（免 Key）</option>
         <option value="deepseek" ${prov === 'deepseek' ? 'selected' : ''}>DeepSeek 原生搜索</option>
         <option value="zhipu" ${prov === 'zhipu' ? 'selected' : ''}>智谱 Web Search</option>
         <option value="bocha" ${prov === 'bocha' ? 'selected' : ''}>博查 AI Search</option>
@@ -418,8 +420,25 @@ function renderSearchSection(c) {
         <input type="password" id="cfg-tavily-key" value="${esc(c.webSearch?.tavily?.hasApiKey ? '******' : '')}" placeholder="输入新 Key 可替换；留空保持不变" autocomplete="new-password" style="flex:1" />
         <button class="btn btn-small" id="cfg-tavily-key-toggle" type="button">显示</button>
       </div></div>
+    <div id="google-search-fields" style="${prov === 'google' ? '' : 'display:none'}">
+      <div class="field-row">
+        <div class="field"><label>Google API Key（Cloud 控制台启用 Custom Search API；留空用环境变量 GOOGLE_SEARCH_API_KEY）</label>
+          <div style="display:flex;gap:8px">
+            <input type="password" id="cfg-google-key" value="${esc(c.webSearch?.google?.hasApiKey ? '******' : '')}" placeholder="输入新 Key 可替换；留空保持不变" autocomplete="new-password" style="flex:1" />
+            <button class="btn btn-small" id="cfg-google-key-toggle" type="button">显示</button>
+          </div></div>
+        <div class="field"><label>搜索引擎 ID（cx）</label><input type="text" id="cfg-google-cx" value="${esc(c.webSearch?.google?.cx || '')}" placeholder="在 programmablesearchengine.google.com 新建后复制" /></div>
+        <div class="field"><label>界面语言</label><input type="text" id="cfg-google-lang" value="${esc(c.webSearch?.google?.language || '')}" placeholder="留空 = 自动（如 en、ja、zh-CN）" style="max-width:200px" /></div>
+      </div>
+      <div class="hint">走官方国际域名 www.googleapis.com/customsearch/v1。免费额度每天 100 次。</div>
+    </div>
+    <div class="field" id="edge-search-fields" style="${prov === 'edge' ? '' : 'display:none'}">
+      <label>结果地区 / 语言（market，留空 = 自动；如 en-US、ja-JP、zh-CN）</label>
+      <input type="text" id="cfg-edge-market" value="${esc(c.webSearch?.edge?.market || '')}" placeholder="留空 = 自动" style="max-width:160px" />
+      <div class="hint">Edge 浏览器默认用的必应国际版（www.bing.com），不需要 Key。</div>
+    </div>
     <div class="field" id="aggregate-search-fields" style="${prov === 'aggregate' ? '' : 'display:none'}">
-      <label>聚合源列表（逗号分隔，按优先级排序；可选 tavily / doubao / bing / baidu / zhipu / bocha / metaso，选中的源需已配好 Key）</label>
+      <label>聚合源列表（逗号分隔，按优先级排序；可选 google / edge / tavily / doubao / bing / baidu / zhipu / bocha / metaso，选中的源需已配好 Key）</label>
       <input type="text" id="cfg-aggregate-sources" value="${esc((c.webSearch?.aggregate?.sources || ['tavily', 'doubao', 'bing']).join(','))}" placeholder="tavily,doubao,bing" style="flex:1" />
       <label>每源结果条数（2~6）</label>
       <input type="number" id="cfg-aggregate-count" min="2" max="6" value="${esc(c.webSearch?.aggregate?.count || 4)}" style="width:100px" />

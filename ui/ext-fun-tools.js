@@ -30,7 +30,7 @@ import { extFlash, extHead, extOnTab } from './ext-kit.js';
     ];
     $('#ext-fun-page').innerHTML = `
       ${extHead({
-        icon: '🎉', title: '趣味功能', toggleId: 'fun-enabled', enabled: c.enabled,
+        icon: 'ext-fun', title: '趣味功能', toggleId: 'fun-enabled', enabled: c.enabled,
         sub: '群里常见的小玩法。结果由系统按规则算出来（离线、零花费），机器人只负责用自己的口吻说——不会同一个人一会儿 90 一会儿 12。'
       })}
       <div class="fun-grid">

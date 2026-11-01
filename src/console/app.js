@@ -1632,7 +1632,7 @@ export function createApp({
     const field = String(url.searchParams.get('field') || '');
     // 自定义搜索服务的 Key 不走这里（它们存在 webSearch.providers 数组里，
     // 由 /api/search-providers 管理，且添加时是一次性输入，不提供明文回读）。
-    const allowed = ['deepseek', 'zhipu', 'bocha', 'baidu', 'metaso', 'doubao', 'tavily'];
+    const allowed = ['deepseek', 'zhipu', 'bocha', 'baidu', 'metaso', 'doubao', 'tavily', 'google'];
     if (!allowed.includes(field)) {
       return json(res, 400, { error: `未知搜索服务：${field}` });
     }

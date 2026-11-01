@@ -758,6 +758,8 @@ function bindSettingsListsAndGroups(c) {
     const v = searchProviderSel.value;
     const fields = {
       bing: '#bing-search-fields',
+      google: '#google-search-fields',
+      edge: '#edge-search-fields',
       deepseek: '#deepseek-search-fields',
       zhipu: '#zhipu-search-fields',
       bocha: '#bocha-search-fields',

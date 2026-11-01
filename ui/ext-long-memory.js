@@ -38,7 +38,7 @@ import { extChatOptions, extFlash, extFmtTime, extHead, extLoadChats, extOnTab, 
     const pickerChats = view.chats.length ? view.chats : chatsWithMemory.map((key) => ({ key }));
     box.innerHTML = `
       ${extHead({
-        icon: '📚', title: '长期记忆', toggleId: 'lm-enabled', enabled: c.enabled,
+        icon: 'ext-memory', title: '长期记忆', toggleId: 'lm-enabled', enabled: c.enabled,
         sub: '记住"发生过什么、说好了什么"：约定、群友的近况与计划、群里的大事。聊天时按相关度自动想起来。'
           + '与「人物记忆」（对人的印象）互补。关闭只停止召回与提炼，<strong>不会删除</strong>已有记忆。'
       })}

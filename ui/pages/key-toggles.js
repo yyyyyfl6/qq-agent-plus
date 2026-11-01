@@ -22,7 +22,8 @@ const SEARCH_KEY_FIELDS = {
   'cfg-baidu-key': 'baidu',
   'cfg-metaso-key': 'metaso',
   'cfg-doubao-key': 'doubao',
-  'cfg-tavily-key': 'tavily'
+  'cfg-tavily-key': 'tavily',
+  'cfg-google-key': 'google'
 };
 
 /**
@@ -95,6 +96,7 @@ const KEY_TOGGLES = [
   { btn: 'cfg-metaso-key-toggle', input: 'cfg-metaso-key' },
   { btn: 'cfg-doubao-key-toggle', input: 'cfg-doubao-key' },
   { btn: 'cfg-tavily-key-toggle', input: 'cfg-tavily-key' },
+  { btn: 'cfg-google-key-toggle', input: 'cfg-google-key' },
   { btn: 'cfg-asr-key-toggle', input: 'cfg-asr-key' },
   { btn: 'cfg-asr-secretid-toggle', input: 'cfg-asr-secretid' },
   { btn: 'cfg-asr-secretkey-toggle', input: 'cfg-asr-secretkey' },

@@ -34,8 +34,13 @@
           : (saved === 'system' ? sys : (saved || sys));
         if (theme !== 'light' && theme !== 'dark') theme = 'dark';
         document.documentElement.setAttribute('data-theme', theme);
+        // 配色方案（与明暗正交）：本机选择 > 上次从后端同步到的值 > 默认石墨紫
+        var palette = localStorage.getItem('qqa-palette') || localStorage.getItem('qqa-palette-server') || 'graphite';
+        if (!/^(graphite|ocean|mint|sakura|amber|midnight)$/.test(palette)) palette = 'graphite';
+        document.documentElement.setAttribute('data-palette', palette);
       } catch (e) {
         document.documentElement.setAttribute('data-theme', 'dark');
+        document.documentElement.setAttribute('data-palette', 'graphite');
       }
     })();
   </script>
@@ -333,5 +338,6 @@
   <script type="module" src="/ext-fun-tools.js"></script>
   <script type="module" src="/persona-studio.js"></script>
   <script type="module" src="/command-palette.js"></script>
+  <script type="module" src="/palette.js"></script>
 </body>
 </html>

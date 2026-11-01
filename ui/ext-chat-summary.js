@@ -33,7 +33,7 @@ import { extChatOptions, extFlash, extFmtTime, extHead, extLoadChats, extOnTab }
     const draft = view.draft;
     box.innerHTML = `
       ${extHead({
-        icon: '📝', title: '群聊总结', toggleId: 'cs-enabled', enabled: c.enabled,
+        icon: 'ext-summary', title: '群聊总结', toggleId: 'cs-enabled', enabled: c.enabled,
         sub: '群友问"刚才聊了啥 / 我错过了什么"时，机器人会读最近的聊天、按话题整理后用自己的口吻发出来。'
           + '每次总结是一次长输入的模型调用，有每会话、全局两道每小时上限。'
       })}

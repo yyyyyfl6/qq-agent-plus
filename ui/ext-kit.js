@@ -61,7 +61,7 @@ function extHead({ icon, title, sub, enabled, toggleId }) {
   return `
     <div class="ext-head">
       <div class="ext-head-copy">
-        <h2><span class="ext-icon">${icon}</span>${esc(title)}</h2>
+        <h2><span class="ext-icon" data-ico="${esc(icon)}" aria-hidden="true"></span>${esc(title)}</h2>
         <p class="muted">${sub}</p>
       </div>
       <label class="ext-switch" title="启用 / 停用">

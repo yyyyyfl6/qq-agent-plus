@@ -40,7 +40,7 @@ export async function aggregateSearch(query) {
     .map(String).slice(0, 4);
   const perSource = Math.max(2, Math.min(6, Number(cfg.count) || 4));
   const settled = await Promise.allSettled(sources.map(async (name) => {
-    const fn = { doubao: doubaoSearch, bing: bingSearch, baidu: baiduSearch, zhipu: zhipuSearch, bocha: bochaSearch, metaso: metasoSearch, tavily: tavilySearch }[name];
+    const fn = { doubao: doubaoSearch, bing: bingSearch, edge: edgeSearch, google: googleSearch, baidu: baiduSearch, zhipu: zhipuSearch, bocha: bochaSearch, metaso: metasoSearch, tavily: tavilySearch }[name];
     if (!fn) throw new Error(`未知搜索源: ${name}`);
     const r = await fn(query);
     return { source: name, results: (r.results || []).slice(0, perSource) };
@@ -114,6 +114,8 @@ export async function webSearch(query) {
   if (provider === 'baidu') return baiduSearch(clean);
   if (provider === 'metaso') return metasoSearch(clean);
   if (provider === 'doubao') return doubaoSearch(clean);
+  if (provider === 'google') return googleSearch(clean);
+  if (provider === 'edge') return edgeSearch(clean);
   // 自定义：'custom'（旧单槽位）或 'custom:<id>'（设置页添加的多个之一）
   if (provider === 'custom' || provider.startsWith('custom:')) {
     return customSearch(clean, provider);
@@ -536,5 +538,63 @@ export async function tavilySearch(query) {
       snippet: String(r.content ?? '').trim()
     }));
   if (!results.length) throw new Error('Tavily 没有返回有效结果');
+  return { query, results };
+}
+
+/**
+ * Edge 浏览器默认引擎（必应国际版 www.bing.com），免 Key，解析方式与 Bing 网页解析相同。
+ * 与上面的 bingSearch（默认 cn.bing.com）的区别只是站点：国际版对英文/海外内容更全；
+ * market 控制结果地区与语言（zh-CN / en-US / ja-JP …）。
+ */
+export async function edgeSearch(query) {
+  const cfg = getConfig().webSearch?.edge ?? {};
+  const url = new URL(String(cfg.searchUrl || 'https://www.bing.com/search'));
+  const market = String(cfg.market || '').trim();   // 留空 = 必应自动判断地区
+  if (market) {
+    url.searchParams.set('mkt', market);
+    url.searchParams.set('setlang', market);
+  }
+  try {
+    return await bingSearchWithUrl(query, url.toString());
+  } catch (error) {
+    throw new Error(String(error?.message ?? error).replace('自定义搜索（bing 类型）', 'Edge（必应国际版）'));
+  }
+}
+
+/**
+ * 谷歌搜索：Google Programmable Search（Custom Search JSON API）。
+ * GET https://www.googleapis.com/customsearch/v1?key=&cx=&q=&num=
+ * 需要两样：API Key（Google Cloud 控制台启用 Custom Search API）+ 搜索引擎 ID（cx，在
+ * programmablesearchengine.google.com 新建一个"搜索整个网络"的引擎）。走国际域名 www.googleapis.com。
+ * 响应 items[]: { title, link, snippet }。
+ */
+export async function googleSearch(query) {
+  const cfg = getConfig().webSearch?.google ?? {};
+  const apiKey = String(cfg.apiKey || process.env.GOOGLE_SEARCH_API_KEY || '').trim();
+  const cx = String(cfg.cx || process.env.GOOGLE_SEARCH_CX || '').trim();
+  if (!apiKey || !cx) throw new Error('谷歌搜索未配置：需要 API Key 和搜索引擎 ID（cx）（设置 → 搜索服务）');
+  const url = new URL(String(cfg.baseUrl || 'https://www.googleapis.com/customsearch/v1'));
+  url.searchParams.set('key', apiKey);
+  url.searchParams.set('cx', cx);
+  url.searchParams.set('q', query);
+  url.searchParams.set('num', String(Math.min(10, Math.max(1, Number(cfg.count) || 6))));
+  if (cfg.language) url.searchParams.set('hl', String(cfg.language));
+  const res = await fetch(url, { signal: AbortSignal.timeout(Math.max(5000, Number(cfg.timeoutMs) || 20000)) });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    let msg = text;
+    try { msg = JSON.parse(text)?.error?.message || text; } catch { /* 原文 */ }
+    // 报错里绝不回显带 key 的 URL
+    throw new Error(`谷歌搜索 HTTP ${res.status}：${String(msg).replace(apiKey, '***').slice(0, 300)}`);
+  }
+  const data = await res.json().catch(() => { throw new Error('谷歌搜索返回了无法解析的 JSON'); });
+  const results = (Array.isArray(data?.items) ? data.items : [])
+    .filter((r) => r?.link)
+    .map((r) => ({
+      title: String(r.title ?? '').trim() || '（无标题）',
+      url: String(r.link),
+      snippet: String(r.snippet ?? '').replace(/\s+/g, ' ').trim()
+    }));
+  if (!results.length) throw new Error('谷歌搜索没有返回结果');
   return { query, results };
 }

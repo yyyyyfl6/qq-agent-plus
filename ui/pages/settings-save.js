@@ -500,6 +500,7 @@ async function saveConfig({ quiet = false } = {}) {
     const enteredMetasoKey = val('#cfg-metaso-key', '').trim();
     const enteredDoubaoKey = val('#cfg-doubao-key', '').trim();
     const enteredTavilyKey = val('#cfg-tavily-key', '').trim();
+    const enteredGoogleKey = val('#cfg-google-key', '').trim();
     patch.webSearch = {
       ...c.webSearch,
       enabled: chk('#cfg-websearch', c.webSearch?.enabled !== false),
@@ -534,6 +535,16 @@ async function saveConfig({ quiet = false } = {}) {
       tavily: {
         ...(c.webSearch?.tavily || {}),
         ...(enteredTavilyKey && enteredTavilyKey !== '******' ? { apiKey: enteredTavilyKey } : {})
+      },
+      google: {
+        ...(c.webSearch?.google || {}),
+        ...(enteredGoogleKey && enteredGoogleKey !== '******' ? { apiKey: enteredGoogleKey } : {}),
+        cx: val('#cfg-google-cx', c.webSearch?.google?.cx || '').trim(),
+        language: val('#cfg-google-lang', c.webSearch?.google?.language || '').trim()
+      },
+      edge: {
+        ...(c.webSearch?.edge || {}),
+        market: val('#cfg-edge-market', c.webSearch?.edge?.market || '').trim()
       },
       aggregate: {
         sources: val('#cfg-aggregate-sources', '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean).slice(0, 4),

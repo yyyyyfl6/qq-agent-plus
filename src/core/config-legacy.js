@@ -101,7 +101,7 @@ export const DEFAULT_CONFIG = {
     enabled: true,
     searchUrl: 'https://cn.bing.com/search',
     maxResults: 6,
-    // 可选：'bing' | 'deepseek' | 'zhipu' | 'bocha' | 'baidu' | 'metaso' | 'doubao' | 'tavily' | 'aggregate'
+    // 可选：'bing' | 'edge' | 'google' | 'deepseek' | 'zhipu' | 'bocha' | 'baidu' | 'metaso' | 'doubao' | 'tavily' | 'aggregate'
     provider: 'bing',
     deepseek: {
       apiKey: '',                     // 留空时回退环境变量 DEEPSEEK_API_KEY
@@ -146,6 +146,21 @@ export const DEFAULT_CONFIG = {
       count: 5,
       searchDepth: 'basic',
       timeoutMs: 20000
+    },
+    // 谷歌（Custom Search JSON API，国际域名 www.googleapis.com）：apiKey + cx（搜索引擎 ID）；
+    // 留空回退环境变量 GOOGLE_SEARCH_API_KEY / GOOGLE_SEARCH_CX。language 留空 = 由谷歌自动判断
+    google: {
+      apiKey: '',
+      cx: '',
+      count: 6,
+      language: '',
+      timeoutMs: 20000
+    },
+    // Edge（必应国际版 www.bing.com，免 Key）：market 留空 = 由必应按服务器位置自动判断；
+    // 可填 en-US / ja-JP / zh-CN 等固定结果地区与语言
+    edge: {
+      searchUrl: 'https://www.bing.com/search',
+      market: ''
     },
     // 聚合搜索（provider='aggregate'）：并发跑多个源，URL 去重、结果带 source 标注，
     // 单源失败不影响整体，全部失败才报错。sources 顺序 = 结果优先级。
@@ -620,6 +635,8 @@ export const DEFAULT_CONFIG = {
     // 主题：'dark' | 'light' | 'system'（system = 跟随系统偏好）。
     // 前端以 localStorage 为准做到即时生效，这里只是跨设备/重装后保留用。
     theme: 'dark',
+    // 配色方案（与明暗正交）：graphite | ocean | mint | sakura | amber | midnight
+    palette: 'graphite',
     showVision: true,         // 模型目录显示图片输入能力徽标
     refreshMs: 15000          // 界面轮询间隔
   }
