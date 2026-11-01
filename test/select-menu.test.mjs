@@ -184,8 +184,9 @@ test('原生 dialog 里的 select 也能打开并选中（菜单不能留在 dia
     fire(window, select, 'pointerdown');
     const menu = document.querySelector('.select-menu');
     assert.ok(menu, 'dialog 内也要出现菜单');
-    assert.ok(menu.closest('dialog') === dialog || menu.parentElement === document.body,
-      '菜单要么挂在 dialog 内，要么用 popover 进 top layer');
+    // 必须挂在 dialog 内：挂在 body 上即使进了 top layer，也是 modal dialog 之外的 inert 节点，
+    // 真实浏览器里选项点不中（2026-11 用户实测：人格编辑框里的下拉"无法操纵"）
+    assert.equal(menu.closest('dialog'), dialog, '菜单必须挂在 dialog 内');
     const option = [...menu.querySelectorAll('.select-option')][0];
     fire(window, option, 'click');
     assert.equal(select.value, 'a');

@@ -137,10 +137,14 @@ function open(select) {
   // 原生 <dialog> 的 showModal 在 top layer：追加到 body 的 fixed 菜单会被 dialog 与其
   // ::backdrop 盖住，而且 dialog 外是 inert，选项点不到。优先用 Popover API（同一个
   // top layer）；不支持 Popover 的老浏览器退回"挂进 dialog 内部"。
+  // ⚠️ 弹层必须挂在 dialog **里面**（2026-11 用户实测：人格编辑框里的下拉"点不动"）：
+  // 挂在 body 上时，即使 showPopover 进了 top layer，它仍是 modal dialog 之外的节点 ——
+  // 被 dialog 设成 inert，选项根本收不到点击（elementFromPoint 落到 dialog 上）。
+  // dialog 的后代再 showPopover，才既在 dialog 之上、又不在 inert 范围里。
   const dialog = select.closest('dialog[open]');
   if (typeof box.showPopover === 'function') {
     box.setAttribute('popover', 'manual');
-    document.body.appendChild(box);
+    (dialog || document.body).appendChild(box);
     try { box.showPopover(); } catch {
       box.removeAttribute('popover');
       (dialog || document.body).appendChild(box);
