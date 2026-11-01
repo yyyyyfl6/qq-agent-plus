@@ -93,10 +93,48 @@ Windows 上执行 `.cmd/.bat` 时加 `LAB_BRIDGE_SHELL=1`。接收端默认只�
 - `tarot`：22 张大阿卡纳，单张指引或过去/现在/未来三张，正逆位随机。
 - 结果由代码决定，模型只负责用自己的口吻说出来——不会同一个人一会儿 90 一会儿 12。
 
+## 陪伴（移植自 AstrBot「我会永远陪着你」）
+
+参考：[astrbot_plugin_private_companion](https://github.com/menglimi/astrbot_plugin_private_companion)。按本项目重写，只取核心玩法；
+原插件的心情 / 精力 / 睡眠状态上游已有（`core/persona-state.js`），不重复。代码：`src/extensions/companion.js`，页面：侧栏「陪伴」。
+
+- **私聊日记（按日期）**：每个私聊每天记一篇"那天大体发生了什么"——概括、发生的事、对方状态、待跟进的事。
+  长期记忆因此不只是一张人物画像。后台每 5 分钟巡检：当天消息够数、距上次写超过 `diaryRefreshHours` 就补写（未完稿）；
+  凌晨 3 点后把昨天定稿。最近 `diaryInjectDays` 天自动进私聊的每轮上下文（放 user 内容，不动 system 前缀）；
+  更早的由模型调 `recall_diary`（按日期 `YYYY-MM-DD` / `MM-DD` 或关键词）去翻。数据：`data/companion/diary.json`。
+- **每日日程**：每天按人设排一份 6~9 段的生活日程；陪伴对象私聊时把"此刻在做的事"作为背景。
+- **重要日子**：`MM-DD + 名称（+ 只对某个 QQ）`，当天进背景并触发一次问候。
+- **低频主动问候**：候选按「重要日子 → 起床后早安 → 跟进昨天日记里的待跟进 → 饭点 → 久未联系」挑一条；
+  依次过 免打扰时段 → 每日上限（低频 1 / 适中 3 / 较勤 5）→ 距上次间隔 → **上一条没回 24 小时内不再追**。
+  真正说什么由聊天主链路决定（`orchestrator.wake(chatKey, { proactive, wakeNote })`，和冷场开话题同一条路），
+  模型判断不合适会安静结束。先记账再唤醒，失败不自动补发。
+- 指令（私聊、陪伴对象本人或管理员）：`/陪伴 状态 | 日程 | 日记 [日期或关键词] | 日期`。
+- 陪伴对象留空 = 只陪管理员（`admin.ownerUin`）。日记范围可选"所有私聊 / 只给陪伴对象"。
+
+## 生图参考图（提示词触发）
+
+代码：`src/extensions/image-refs.js`，页面：侧栏「图片生成」（也是生图功能的总入口：状态、试画、直达生图设置）。
+
+- 上传参考图（PNG / JPEG / WebP，≤ 4 MB，最多 12 张），每张配触发词（如「你自己」「你长什么样」「自拍」）和一句给生图模型的说明。
+- 对方本轮原话（可选：也匹配模型写的画面描述）命中触发词时，`generate_image` 把这张图一起交给生图模型，提示词末尾补一句"参考所给图片里的形象"。
+- 传图方式：`auto`（默认：gpt-image / dall-e-2 走 `/images/edits` multipart，其余走请求体）/ `body`（`/images/generations` 的 JSON 里多带 `image: data:URL`，
+  豆包 Seedream 4.x、通义万相与多数网关认这个；字段名可改）/ `edits`。魔搭走 `image_url`；免 Key 的 pollinations 不支持，照常按纯文字画并在工具结果里说明。
+- 文件：`data/image-refs/<id>.<ext>`；关掉后保留。
+
+## 模型供应商（设置 → 模型 API）
+
+参照 AstrBot 的"添加供应商 → 选模型"：左列供应商、右列它的模型，点「使用」即切换当前模型；
+「＋ 添加供应商」按服务预设选类型 → 填地址与 Key（Vertex 粘服务账号 JSON）→ 拉模型列表勾选 → 添加。
+供应商可改名、删除（`DELETE /api/providers` 需 `confirm`，正在使用的那家不让删，Key 一起删）。
+原来那套手动表单（地址 / Key / 模型 id）收进「高级：手动编辑当前连接」，控件与保存逻辑不变。
+
 ## 人格界面
 
-- 侧栏「人格」打开**双人格页** `/skins.html`（蓝色大肥鱼 / 哈基米…，见 [DUAL_SKINS.md](DUAL_SKINS.md)）：
+- 侧栏「人格」在控制台里打开**双人格页**（内容取自 `/skins.html`；蓝色大肥鱼 / 哈基米…，见 [DUAL_SKINS.md](DUAL_SKINS.md)）：
   每个会话绑定一套人格卡 + 模型，管理员发「切鱼」「切猫」等专属指令切换。
+  2026-11 交互重做：总开关拨动即保存且只写 `enabled`（以前走整张表单，任何一格校验不过就"看着开了其实没存"）；
+  卡片上直接「设为默认」并显示被几个会话使用；会话行改了下拉框才亮「切换」，可按群号 / QQ 筛选；
+  交接设置收进折叠区；页内不再用 `#锚点`（嵌在控制台里会改地址栏 hash）；点弹窗外关闭编辑框。
 - 设置 → 人设（人格卡本身的编辑）另有一层工作台增强：
   - 卡库搜索；分节大纲（点一下跳到那一节并展开）；字数与 token 粗估。
   - **试聊**：用草稿里的卡（没保存也行）跟它聊几句，看口吻对不对；不发到 QQ、不进记忆（`POST /api/persona/preview`）。
@@ -110,16 +148,19 @@ Windows 上执行 `.cmd/.bat` 时加 `LAB_BRIDGE_SHELL=1`。接收端默认只�
 | 位置 | 改动 |
 | --- | --- |
 | `src/tools/tools.js` | `buildToolDefs()` 末尾追加 `extensionToolDefs()` |
-| `src/core/orchestrator.js` | 工具过滤加 `extensionToolAvailable()`（权限判断复用上游已有的 `ctx.triggerEntries`） |
-| `src/console/app.js` | `initExtensions`（读写包一层 `skins.scope`）/ `ExtensionCommands.consume`（紧跟人格切换指令）/ 路由 / 启停；`registerPersonaRoutes` |
+| `src/core/orchestrator.js` | 工具过滤加 `extensionToolAvailable()`（权限判断复用上游已有的 `ctx.triggerEntries`）；每轮 user 内容加 `extensionPromptText()`（陪伴的日记 / 日程 / 重要日子） |
+| `src/tools/tools-core.js` | `generate_image` 调用前问一次 `getImageRefs().resolve()`，命中就带参考图 |
+| `src/llm/image-gen.js` | `generateImage({ reference })`：请求体 / `/images/edits` 两种带图形状 |
+| `src/core/providers.js` | `removeProvider` / `renameProvider`，新建可带名称 |
+| `src/console/app.js` | `initExtensions`（读写包一层 `skins.scope`；陪伴拿 `orchestrator.wake`）/ `ExtensionCommands.consume`（紧跟人格切换指令）/ 路由 / 启停；`registerPersonaRoutes` |
 | `src/core/config-legacy.js` | 三个配置段与谷歌 / Edge 搜索的默认值（全部关闭） |
 
-回滚：把三个配置段的 `enabled` 关掉即恢复原行为；数据文件保留，删掉 `data/lab-bridge/` 即彻底清除。
+回滚：把各配置段（chatSummary / labBridge / funTools / companion / imageRefs）的 `enabled` 关掉即恢复原行为；数据文件保留，删掉 `data/lab-bridge/`、`data/companion/`、`data/image-refs/` 即彻底清除。
 
 ## 界面
 
 配色、明暗、材质、字体、圆角等外观全部由上游的外观系统（设置 → 外观，`ui/core/appearance.js`）负责；
-图标统一用上游的线条 SVG 图标库（`ui/core/icons.js`，本次补了 `fish` / `mask` / `dice` / `summary`）。
+图标统一用上游的线条 SVG 图标库（`ui/core/icons.js`，本次补了 `fish` / `mask` / `dice` / `summary` / `heart`）。
 
 ## 搜索：谷歌与 Edge
 

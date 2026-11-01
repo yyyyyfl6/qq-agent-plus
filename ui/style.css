@@ -7238,3 +7238,37 @@ html[data-glass='liquid'] #view-settings .settings-pane {
   .pm-item { flex: 0 0 auto; width: auto; }
   .pm-head { flex-direction: column; }
 }
+
+/* ── 2026-11 观感打磨（"不够好看"反馈）：只动衬底的纱、高光强度与几处留白，不改材质体系 ──
+   ① 壁纸太抢：浅色 / 深色的纱各加厚一点，玻璃仍然有东西可透，但不再是大块青蓝色斑；
+   ② 浅色下镜面高光 .9 的白边在白纱上读成"粗白描边"，降到 .6；
+   ③ 横幅出现时它已经把正文推到顶栏下方，面板不必再让 88px（原来是两段空白叠在一起）。 */
+html[data-glass='liquid'][data-background='none'] body { background-color: rgba(4, 8, 15, .76); }
+[data-theme='light'][data-glass='liquid'][data-background='none'] body { background-color: rgba(248, 250, 253, .72); }
+[data-theme='light'][data-glass='liquid'] {
+  --glass-spec-top: rgba(255, 255, 255, .62);
+  --glass-shadow: 0 6px 24px -6px rgba(15, 23, 42, .10), 0 1px 2px rgba(15, 23, 42, .08);
+}
+@media (min-width: 901px) {
+  html[data-glass='liquid'] #banner:not(.hidden) ~ #layout .overview-pane,
+  html[data-glass='liquid'] #banner:not(.hidden) ~ #layout .control-pane,
+  html[data-glass='liquid'] #banner:not(.hidden) ~ #layout .asset-pane,
+  html[data-glass='liquid'] #banner:not(.hidden) ~ #layout .usage-pane,
+  html[data-glass='liquid'] #banner:not(.hidden) ~ #layout .plugins-pane,
+  html[data-glass='liquid'] #banner:not(.hidden) ~ #layout .detail-pane { padding-top: 18px; }
+}
+/* 页面标题：更紧的字距、更明确的层级（各页 pane-head / 扩展页 ext-head 统一） */
+.pane-head h2, .ext-head h2 { letter-spacing: -.01em; font-weight: 700; }
+.pane-head p, .ext-head p { color: var(--muted); }
+/* 卡片 hover 的反馈统一成轻微抬升，不再只是描边变色 */
+.ext-card, .settings-card { transition: box-shadow .18s ease, border-color .18s ease; }
+@media (hover: hover) {
+  .ext-stat { transition: transform .15s ease; }
+  .ext-stat:hover { transform: translateY(-1px); }
+}
+.ig-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: end; }
+.ig-row .field { margin: 0; }
+.ig-row .btn { margin-bottom: 1px; }
+.ig-row-2 { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); margin-bottom: 8px; }
+.ig-refs > .ext-empty { grid-column: 1 / -1; }
+@media (max-width: 640px) { .ig-row, .ig-row-2 { grid-template-columns: minmax(0, 1fr); } }

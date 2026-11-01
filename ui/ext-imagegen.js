@@ -82,18 +82,18 @@ import { extFlash, extHead, extOnTab, extStat } from './ext-kit.js';
         <div class="ext-card-title">服务与试画<span class="spacer"></span>
           <button class="btn btn-small" id="ig-open-settings" type="button">打开生图设置</button></div>
         <p class="hint" style="margin-top:0">服务预设、地址、Key、模型、尺寸、每小时上限都在 设置 → 语音与生图 的「图片生成」一节。改完保存后可以在这里试画。</p>
-        <div class="field-row">
-          <div class="field" style="flex:3"><label>试画提示词</label><input type="text" id="ig-test-prompt" placeholder="一只橘猫戴着草帽坐在海边，卡通风格" maxlength="200" /></div>
-          <div class="field" style="flex:0 0 auto;align-self:flex-end"><button class="btn btn-primary" id="ig-test" type="button" ${g.enabled ? '' : 'disabled'}>试画一张</button></div>
+        <div class="ig-row">
+          <div class="field"><label for="ig-test-prompt">试画提示词</label><input type="text" id="ig-test-prompt" placeholder="一只橘猫戴着草帽坐在海边，卡通风格" maxlength="200" /></div>
+          <button class="btn btn-primary" id="ig-test" type="button" ${g.enabled ? '' : 'disabled'} title="${g.enabled ? '' : '先在生图设置里开启并保存'}">试画一张</button>
         </div>
         <div id="ig-test-result" class="ig-test-out"></div>
       </section>
       <section class="ext-card">
         <div class="ext-card-title">参考图（提示词触发）<span class="spacer"></span><span class="muted">最多 12 张 · 每张 ≤ 4 MB</span></div>
-        <div class="field-row">
-          <div class="field" style="flex:2"><label>传图方式</label>
+        <div class="ig-row ig-row-2">
+          <div class="field"><label for="ig-mode">传图方式</label>
             <select id="ig-mode">${Object.entries(MODE).map(([k, label]) => `<option value="${k}" ${c.mode === k ? 'selected' : ''}>${esc(label)}</option>`).join('')}</select></div>
-          <div class="field"><label>请求体字段名</label><input type="text" id="ig-field" value="${esc(c.bodyField || 'image')}" maxlength="30" /></div>
+          <div class="field"><label for="ig-field">请求体字段名</label><input type="text" id="ig-field" value="${esc(c.bodyField || 'image')}" maxlength="30" /></div>
         </div>
         <label class="cmp-check"><input type="checkbox" id="ig-match-prompt" ${c.matchPrompt !== false ? 'checked' : ''} /><span>触发词也匹配模型写的画面描述（不只看对方原话）</span></label>
         <p class="hint">「请求体」是在 /images/generations 的 JSON 里多带一个 <code>image</code> 字段（data:URL），豆包 Seedream 4.x、通义万相、多数聚合网关认这个；
