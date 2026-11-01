@@ -7056,11 +7056,46 @@ html[data-side-rail='1'] .tab .pending-badge { top: 3px; right: 4px; min-width: 
 }
 
 
-/* 侧栏上方的「人格」入口（/skins.html）：做成与导航同宽的醒目按钮；收起成图标栏时只留图标 */
-.side-skins-link {
-  display: flex; align-items: center; gap: 8px; justify-content: flex-start;
-  margin: 4px 6px 8px; padding: 8px 12px; border-radius: var(--r-card);
-  background: var(--accent-soft); color: var(--accent); font-weight: 600; text-decoration: none;
+
+/* ══════════════════════════════════════════════════════════════
+   2026-11 布局调整（用户反馈"设置右侧 / 人格页有点违和，左侧菜单要有分类"）
+   ══════════════════════════════════════════════════════════════ */
+
+/* ── 主导航分类标题：对话 / 记忆 / 运行 / 扩展 / 管理 ──
+   标题本身就是分组间距，紧跟其后的 [data-group-start] 不再额外留白。
+   收起成图标栏时标题变成一条短分隔线（文字看不下，但分组仍然看得出）。 */
+#tabs > .nav-group-label {
+  padding: 12px 12px 4px; font-size: var(--fs-2xs); font-weight: 650; letter-spacing: 1px;
+  color: var(--faint); white-space: nowrap; overflow: hidden; user-select: none;
+  flex: 0 0 auto; line-height: 1.4;   /* #tabs 是纵向 flex：不写死不收缩，overflow:hidden 会让它被压成 0 高 */
+  transition: opacity var(--side-dur-fade, .15s) linear;
 }
-.side-skins-link:hover { background: color-mix(in srgb, var(--accent) 22%, transparent); color: var(--accent); }
-.side-skins-link .ico { flex-shrink: 0; }
+#tabs > .nav-group-label:first-of-type { padding-top: 6px; }
+#tabs > .nav-group-label + .tab[data-group-start] { margin-top: 0; }
+@media (min-width: 901px) {
+  html[data-side-rail='1'] #sidebar:not([data-side-open]) #tabs > .nav-group-label {
+    height: 1px; padding: 0; margin: 8px 14px; font-size: 0; background: var(--border); opacity: .8;
+  }
+}
+@media (max-width: 900px) {
+  #tabs > .nav-group-label { display: none; }
+}
+
+/* ── 设置右侧：页头占住原来空着的那一条，正文卡片直接落在页面上 ── */
+#settings-form > .settings-head { margin: 0 0 14px; padding: 2px 2px 0; }
+#settings-form > .settings-head .settings-crumb { font-size: var(--fs-xs); color: var(--faint); letter-spacing: .3px; }
+#settings-form > .settings-head h2 { margin: 4px 0 4px; font-size: var(--fs-xl); color: var(--text); }
+#settings-form > .settings-head p { margin: 0; font-size: var(--fs-sm); color: var(--muted); line-height: 1.6; max-width: 72ch; }
+html[data-glass='liquid'] #view-settings .settings-pane {
+  background-color: transparent; border-color: transparent; box-shadow: none;
+}
+@media (min-width: 901px) {
+  /* 原来整块让出 88px 给浮动顶栏、却什么都不放；页头的标题只占左侧，顶栏浮在右侧，两者不打架 */
+  html[data-glass='liquid'] #view-settings .settings-pane { padding-top: 24px; }
+  html[data-glass='liquid'] #banner:not(.hidden) ~ #layout #view-settings .settings-pane { padding-top: 12px; }
+  html[data-glass='liquid'] #view-settings #settings-form > .settings-head { padding-right: min(46%, 520px); }
+  html[data-glass='liquid'] #view-settings #settings-form > .settings-head p { padding-right: 0; }
+}
+
+/* ── 人格页嵌在控制台里时的外层 ── */
+.skins-pane { overflow-y: auto; }

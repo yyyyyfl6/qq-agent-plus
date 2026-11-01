@@ -1,36 +1,134 @@
-.personas-body { overflow:auto; height:auto; min-height:100vh; }
-#skins-page { width:100%; max-width:1040px; min-width:0; margin:0 auto; padding:32px 24px 64px; overflow-wrap:anywhere; }
-.personas-header h1 { font-size:32px; margin:18px 0 8px; }
-.personas-header p { color:var(--muted); line-height:1.7; }
-.personas-nav { display:flex; flex-wrap:wrap; gap:22px; margin:24px 0 12px; padding-bottom:16px; border-bottom:1px solid var(--border, #444); }
-.personas-status { min-height:28px; line-height:1.6; }
-.personas-section { padding:24px 0; border-bottom:1px solid var(--border, #444); scroll-margin-top:16px; }
-.personas-section h2 { font-size:20px; margin:0 0 16px; }
-.section-title, .personas-actions, .personas-save, .skin-row { display:flex; align-items:center; flex-wrap:wrap; gap:12px; }
-.section-title { justify-content:space-between; }
-.personas-fields { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px 24px; }
-#skins-page label { display:flex; flex-direction:column; min-width:0; gap:7px; margin:12px 0; font-size:14px; }
-#skins-page input:not([type=checkbox]), #skins-page select, #skins-page textarea { width:100%; min-width:0; box-sizing:border-box; padding:10px 12px; font:inherit; color:var(--text); background:var(--bg-2); border:1px solid var(--border); border-radius:6px; }
-#skins-page textarea { resize:vertical; line-height:1.6; }
-#skins-page .check-label { flex-direction:row; align-items:center; gap:10px; }
-#skins-page .muted { font-size:13px; line-height:1.6; }
-.personas-list { margin-top:20px; }
-.persona-card { padding:20px 0; border-top:1px solid var(--border, #444); }
-.persona-card h3 { margin:0; font-size:19px; }
-.persona-card dl { margin:16px 0 0; display:grid; grid-template-columns:1fr 1fr; gap:12px 24px; }
-.persona-card dl div:last-child { grid-column:1/-1; }
-.persona-card dt { color:var(--muted); font-size:13px; margin-bottom:5px; }
-.persona-card dd { margin:0; line-height:1.7; }
-.persona-card code { display:inline-block; margin-right:8px; }
-#persona-dialog { width:min(560px,calc(100vw - 32px)); max-height:calc(100dvh - 32px); margin:auto; padding:24px; overflow:auto; box-sizing:border-box; color:var(--text); background:var(--bg, #17181c); border:1px solid var(--border); border-radius:10px; }
-#persona-dialog::backdrop { background:rgba(0,0,0,.65); }
-#persona-dialog h2 { margin:0 0 18px; }
-#persona-dialog .personas-actions { justify-content:flex-end; margin-top:20px; }
-#persona-error:empty { display:none; }
-.personas-save { position:sticky; bottom:0; padding:16px 0; background:var(--bg, #17181c); border-top:1px solid var(--border, #444); z-index:2; }
-.skin-row { padding:12px 0; border-top:1px solid var(--border, #444); }
-#skins-page .skin-row select { width:auto; min-width:160px; }
-.skin-row strong { min-width:160px; }
-.personas-error { color:var(--danger, #f49d9d); }
-#skins-page details summary { cursor:pointer; font-size:16px; }
-@media(max-width:640px) { #skins-page { padding:20px 16px 40px; } .personas-fields { grid-template-columns:minmax(0,1fr); gap:0; } .personas-nav { gap:14px; } .personas-save { align-items:flex-start; flex-direction:column; } }
+/* 人格页（/skins.html，以及控制台侧栏「人格」页嵌入的同一份 #skins-page）。
+   2026-11 重写：与控制台同一套卡片 / 圆角 / 字号 / 强调色（全部走 style.css 的 --fs-* / --r-* /
+   --accent* token，外观设置里换配色、圆角、材质都会跟着变）。所有选择器限定在 #skins-page 下：
+   嵌进控制台后，设置 → 人设 里也有 .persona-card，不能互相污染。 */
+
+.personas-body { overflow: auto; height: auto; min-height: 100vh; background: var(--bg); }
+#skins-page {
+  width: 100%; max-width: 980px; min-width: 0; margin: 0 auto; padding: 28px 24px 64px;
+  box-sizing: border-box; overflow-wrap: anywhere; color: var(--text);
+}
+/* 嵌在控制台里：外层 .asset-pane 已经给了留白与滚动，这里不再叠一层 */
+#skins-host #skins-page { padding: 0 0 48px; }
+#skins-host .personas-back { display: none; }
+
+/* ── 页头 ── */
+#skins-page .personas-back { color: var(--muted); text-decoration: none; font-size: var(--fs-sm); }
+#skins-page .personas-back:hover { color: var(--accent); }
+#skins-page .personas-hero { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-top: 10px; }
+#skins-page .personas-hero h1 { margin: 0 0 6px; font-size: var(--fs-2xl); letter-spacing: .3px; }
+#skins-page .personas-hero p { margin: 0; color: var(--muted); font-size: var(--fs-md); line-height: 1.65; max-width: 640px; }
+
+/* 总开关：胶囊式，开 = 强调色 */
+#skins-page .personas-master { display: inline-flex; flex-direction: row; margin: 0; align-items: center; gap: 10px; flex-shrink: 0; cursor: pointer; user-select: none; color: var(--text);
+  padding: 8px 14px 8px 10px; border-radius: var(--r-pill); background: var(--bg-2); border: 1px solid var(--border); }
+#skins-page .personas-master input { position: absolute; opacity: 0; pointer-events: none; }
+#skins-page .personas-master-track { position: relative; width: 38px; height: 22px; border-radius: var(--r-pill); background: var(--bg-3); border: 1px solid var(--border); transition: background .18s, border-color .18s; }
+#skins-page .personas-master-thumb { position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: var(--muted); transition: transform .18s, background .18s; }
+#skins-page .personas-master input:checked + .personas-master-track { background: var(--accent); border-color: var(--accent); }
+#skins-page .personas-master input:checked + .personas-master-track .personas-master-thumb { transform: translateX(16px); background: var(--accent-fg, #fff); }
+#skins-page .personas-master input:focus-visible + .personas-master-track { outline: 2px solid var(--accent); outline-offset: 2px; }
+#skins-page .personas-master-label { font-size: var(--fs-sm); font-weight: 600; }
+
+#skins-page .personas-status {
+  margin: 16px 0 0; padding: 9px 14px; border-radius: var(--r-md); font-size: var(--fs-sm); line-height: 1.6;
+  background: var(--bg-2); border: 1px solid var(--border); color: var(--muted);
+}
+#skins-page.is-enabled .personas-status { color: var(--text); border-color: var(--accent-border, var(--border)); background: var(--accent-soft, var(--bg-2)); }
+#skins-page .personas-status.personas-error { color: var(--red); border-color: color-mix(in srgb, var(--red) 40%, var(--border)); background: color-mix(in srgb, var(--red) 8%, var(--bg-2)); }
+
+/* 本页导航：分段胶囊（不再是带下划线的链接） */
+#skins-page .personas-nav { display: inline-flex; flex-wrap: wrap; gap: 4px; margin: 18px 0 6px; padding: 4px; border-radius: var(--r-pill); background: var(--bg-2); border: 1px solid var(--border); }
+#skins-page .personas-nav a { padding: 6px 14px; border-radius: var(--r-pill); color: var(--muted); text-decoration: none; font-size: var(--fs-sm); font-weight: 500; }
+#skins-page .personas-nav a:hover { color: var(--text); background: var(--hover); }
+
+/* ── 版块：卡片 ── */
+#skins-page .personas-card {
+  margin-top: 16px; padding: 20px 22px; border-radius: var(--r-card);
+  background: var(--bg-2); border: 1px solid var(--border); box-shadow: var(--shadow-sm);
+  scroll-margin-top: 16px;
+}
+#skins-page .section-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 14px; }
+#skins-page .section-title h2 { margin: 0 0 4px; font-size: var(--fs-lg); }
+#skins-page .section-title p { margin: 0; }
+#skins-page .muted { color: var(--muted); font-size: var(--fs-sm); line-height: 1.6; }
+#skins-page .personas-divider { height: 1px; margin: 18px 0 6px; background: var(--border); }
+
+/* ── 表单控件 ── */
+#skins-page label { display: flex; flex-direction: column; min-width: 0; gap: 6px; margin: 10px 0; font-size: var(--fs-sm); color: var(--muted); font-weight: 500; }
+#skins-page input:not([type=checkbox]), #skins-page select, #skins-page textarea {
+  width: 100%; min-width: 0; box-sizing: border-box; padding: 9px 12px; font: inherit; font-size: var(--fs-md);
+  color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-input);
+}
+#skins-page input:focus, #skins-page select:focus, #skins-page textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft, transparent); }
+#skins-page textarea { resize: vertical; line-height: 1.6; }
+#skins-page .check-label { flex-direction: row; align-items: center; gap: 10px; color: var(--text); font-size: var(--fs-md); }
+#skins-page .check-label input { accent-color: var(--accent); width: 16px; height: 16px; }
+#skins-page .personas-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 18px; }
+#skins-page details.personas-more { margin: 6px 0 0; }
+#skins-page details.personas-more summary { cursor: pointer; color: var(--muted); font-size: var(--fs-sm); }
+#skins-page code { font-family: var(--mono); font-size: var(--fs-xs); }
+
+/* ── 人格卡片 ── */
+#skins-page .personas-list { display: grid; gap: 12px; }
+#skins-page .persona-card {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 14px; align-items: flex-start;
+  padding: 16px; margin: 0; border-radius: var(--r-card); border: 1px solid var(--border); background: var(--bg);
+  box-shadow: none; cursor: default;
+}
+#skins-page .persona-card:hover { border-color: var(--accent-border, var(--border)); }
+#skins-page .persona-avatar {
+  width: 44px; height: 44px; border-radius: var(--r-lg); display: grid; place-items: center;
+  font-size: var(--fs-lg); font-weight: 700; color: #fff;
+  background: linear-gradient(135deg, hsl(var(--persona-hue, 220) 70% 58%), hsl(calc(var(--persona-hue, 220) + 40) 70% 48%));
+}
+#skins-page .persona-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+#skins-page .persona-title h3 { margin: 0; font-size: var(--fs-lg); }
+#skins-page .persona-badge { padding: 1px 8px; border-radius: var(--r-pill); font-size: var(--fs-2xs); font-weight: 600; color: var(--accent); background: var(--accent-soft, var(--bg-3)); }
+#skins-page .persona-id { font-family: var(--mono); font-size: var(--fs-2xs); color: var(--faint); }
+#skins-page .persona-card dl { margin: 10px 0 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 20px; }
+#skins-page .persona-card dl .persona-cmds { grid-column: 1 / -1; }
+#skins-page .persona-card dt { color: var(--faint); font-size: var(--fs-xs); margin-bottom: 2px; }
+#skins-page .persona-card dd { margin: 0; font-size: var(--fs-md); line-height: 1.5; }
+#skins-page .persona-cmd { display: inline-block; margin: 0 6px 4px 0; padding: 2px 8px; border-radius: var(--r-pill); background: var(--bg-3); color: var(--text); }
+#skins-page .personas-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+#skins-page .btn-ghost-danger { color: var(--muted); }
+#skins-page .btn-ghost-danger:not(:disabled):hover { color: var(--red); border-color: color-mix(in srgb, var(--red) 45%, var(--border)); }
+
+/* ── 保存条：贴在切换与交接卡片下沿 ── */
+#skins-page .personas-save {
+  position: sticky; bottom: 0; z-index: 2; display: flex; align-items: center; justify-content: flex-end; gap: 14px;
+  margin-top: 12px; padding: 10px 14px; border-radius: var(--r-card);
+  background: color-mix(in srgb, var(--bg-2) 92%, transparent); border: 1px solid var(--border);
+  backdrop-filter: blur(8px);
+}
+
+/* ── 会话绑定 ── */
+#skins-page .skin-row { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 10px 4px; border-top: 1px solid var(--border); }
+#skins-page .skin-row:first-child { border-top: 0; }
+#skins-page .skin-row-name { display: flex; flex-direction: column; flex: 1; min-width: 160px; }
+#skins-page .skin-row-name strong { font-size: var(--fs-md); }
+#skins-page .skin-row select { width: auto; min-width: 160px; }
+#skins-page .personas-empty { padding: 12px 0; }
+#skins-page #skin-switch-status:empty { display: none; }
+
+/* ── 编辑弹窗 ── */
+#persona-dialog {
+  width: min(560px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); margin: auto; padding: 24px;
+  overflow: auto; box-sizing: border-box; color: var(--text); background: var(--bg-2);
+  border: 1px solid var(--border); border-radius: var(--r-float); box-shadow: var(--shadow-lg);
+}
+#persona-dialog::backdrop { background: var(--overlay, rgba(0, 0, 0, .55)); }
+#persona-dialog h2 { margin: 0 0 14px; font-size: var(--fs-xl); }
+#persona-dialog .personas-actions { justify-content: flex-end; margin-top: 18px; }
+#persona-error:empty { display: none; }
+#skins-page .personas-error, #persona-dialog .personas-error { color: var(--red); }
+
+@media (max-width: 640px) {
+  #skins-page { padding: 18px 14px 40px; }
+  #skins-page .personas-hero { flex-direction: column; }
+  #skins-page .personas-fields, #skins-page .persona-card dl { grid-template-columns: minmax(0, 1fr); }
+  #skins-page .persona-card { grid-template-columns: auto minmax(0, 1fr); }
+  #skins-page .persona-card .personas-actions { grid-column: 1 / -1; }
+  #skins-page .personas-save { flex-direction: column; align-items: stretch; }
+}

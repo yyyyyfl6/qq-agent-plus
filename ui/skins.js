@@ -1,7 +1,7 @@
 import { api } from './core/api.js';
 import { esc } from './core/dom.js';
 
-export async function initSkinsPage() {
+async function initSkinsPage() {
   if (!document.getElementById('skins-page')) return;
   const el = (id) => document.getElementById(id);
   const status = el('skin-status');
@@ -38,8 +38,16 @@ export async function initSkinsPage() {
   };
   const renderBindings = () => {
     const skins = data.skins;
-    el('skins-chats').innerHTML = bindings.chats.length ? bindings.chats.map((c) => `<div class="skin-row" data-chat="${esc(c.chatKey)}"><strong>${esc(c.chatKey)}</strong>
-      <select aria-label="${esc(c.chatKey)} 的人格">${skins.list.map((s) => option(s.id, s.label, c.skinId)).join('')}</select><button type="button" class="btn btn-small" ${skins.enabled ? '' : 'disabled'}>切换人格</button></div>`).join('') : '<p class="muted">尚无会话。收到消息后会在这里显示。</p>';
+    const chatLabel = (key) => {
+      const m = /^(group|private):(\d+)$/.exec(String(key));
+      return m ? `${m[1] === 'group' ? '群' : '私聊'} ${m[2]}` : String(key);
+    };
+    el('skins-chats').innerHTML = bindings.chats.length ? bindings.chats.map((c) => {
+      const current = skins.list.find((s) => s.id === c.skinId);
+      return `<div class="skin-row" data-chat="${esc(c.chatKey)}">
+      <div class="skin-row-name"><strong>${esc(chatLabel(c.chatKey))}</strong><span class="muted">当前：${esc(current?.label || c.skinId || '默认')}</span></div>
+      <select aria-label="${esc(c.chatKey)} 的人格">${skins.list.map((s) => option(s.id, s.label, c.skinId)).join('')}</select><button type="button" class="btn btn-small" ${skins.enabled ? '' : 'disabled'} title="${skins.enabled ? '' : '先在页面顶部启用多个人格'}">切换人格</button></div>`;
+    }).join('') : '<p class="muted personas-empty">还没有会话。收到消息后会在这里出现。</p>';
     for (const row of el('skins-chats').querySelectorAll('[data-chat]')) row.querySelector('button').onclick = async () => {
       if (!confirm('切换这个会话的人格并结束当前线程？')) return;
       const button = row.querySelector('button'); button.disabled = true;
@@ -52,10 +60,26 @@ export async function initSkinsPage() {
     };
   };
   const renderPersonas = () => {
-    el('skins-list').innerHTML = data.skins.list.map((s) => `<article class="persona-card">
-      <div class="section-title"><h3>${esc(s.label || s.id)}</h3><div class="personas-actions"><button type="button" class="btn" data-edit="${esc(s.id)}">编辑人格</button><button type="button" class="btn btn-small" data-remove="${esc(s.id)}" ${data.skins.list.length === 1 ? 'disabled' : ''}>移除</button></div></div>
-      <dl><div><dt>预设</dt><dd>${esc(data.templates[s.templateId]?.name || s.templateId)}</dd></div><div><dt>模型</dt><dd>${esc(s.model || data.globalApi.model || '全局模型')}</dd></div><div><dt>切换指令</dt><dd>${s.commands?.length ? s.commands.map((c) => `<code>${esc(c)}</code>`).join(' ') : '未设置，点击编辑人格添加'}</dd></div></dl>
-    </article>`).join('');
+    const hue = (text) => [...String(text)].reduce((h, ch) => (h * 31 + ch.codePointAt(0)) % 360, 7);
+    el('skins-list').innerHTML = data.skins.list.map((s) => {
+      const name = s.label || s.id;
+      const isDefault = s.id === data.skins.default;
+      const commands = s.commands?.length
+        ? s.commands.map((c) => `<code class="persona-cmd">${esc(c)}</code>`).join('')
+        : '<span class="muted">还没有专属指令，点「编辑」添加</span>';
+      return `<article class="persona-card" style="--persona-hue:${hue(name)}">
+      <div class="persona-avatar" aria-hidden="true">${esc([...name][0] || '?')}</div>
+      <div class="persona-main">
+        <div class="persona-title"><h3>${esc(name)}</h3>${isDefault ? '<span class="persona-badge">默认</span>' : ''}<span class="persona-id">${esc(s.id)}</span></div>
+        <dl>
+          <div><dt>预设</dt><dd>${esc(data.templates[s.templateId]?.name || s.templateId)}</dd></div>
+          <div><dt>模型</dt><dd>${esc(s.model || data.globalApi.model || '全局模型')}</dd></div>
+          <div class="persona-cmds"><dt>切换指令</dt><dd>${commands}</dd></div>
+        </dl>
+      </div>
+      <div class="personas-actions"><button type="button" class="btn btn-small" data-edit="${esc(s.id)}">编辑</button><button type="button" class="btn btn-small btn-ghost-danger" data-remove="${esc(s.id)}" ${data.skins.list.length === 1 ? 'disabled' : ''}>移除</button></div>
+    </article>`;
+    }).join('');
     for (const button of el('skins-list').querySelectorAll('[data-edit]')) button.onclick = () => openEditor(button.dataset.edit);
     for (const button of el('skins-list').querySelectorAll('[data-remove]')) button.onclick = async () => {
       if (busy || !confirm('移除这个人格的配置？已有存档与记忆会保留。')) return;
@@ -100,7 +124,8 @@ export async function initSkinsPage() {
     el('skins-summary-recent').value = skins.handoffOnSwitch.recentMessages; el('skins-summary-chars').value = skins.handoffOnSwitch.maxChars;
     el('skins-summary-provider').onchange = () => updateModels(el('skins-summary-model'), el('summary-model-options'), el('skins-summary-provider').value);
     updateModels(el('skins-summary-model'), el('summary-model-options'), skins.handoffOnSwitch.provider);
-    renderPersonas(); report(status, skins.enabled ? '已启用多个人格' : '可以新增和编辑人格；启用多个人格后即可切换。');
+    renderPersonas(); report(status, skins.enabled ? `已启用多个人格 · 共 ${skins.list.length} 个 · 默认「${skins.list.find((x) => x.id === skins.default)?.label || skins.default}」` : '多个人格未启用：可以先新增和编辑人格，打开右上角开关并保存后即可切换。');
+    document.getElementById('skins-page')?.classList.toggle('is-enabled', skins.enabled);
     el('skin-add').onclick = () => openEditor();
     el('persona-provider').onchange = () => updateModels(el('persona-model'), el('persona-model-options'), el('persona-provider').value);
     el('persona-cancel').onclick = () => { if (!busy) el('persona-dialog').close(); };
@@ -122,11 +147,16 @@ export async function initSkinsPage() {
       finally { busy = false; el('persona-save').disabled = false; }
     };
     el('skins-save').disabled = false;
+    // 页头的总开关：拨动即保存（走同一个表单提交，保存口径只有一处）
+    el('skins-enabled').onchange = () => {
+      document.getElementById('skins-page')?.classList.toggle('is-enabled', el('skins-enabled').checked);
+      el('skins-form').requestSubmit ? el('skins-form').requestSubmit() : el('skins-form').dispatchEvent(new Event('submit', { cancelable: true }));
+    };
     el('skins-form').onsubmit = async (event) => {
       event.preventDefault(); if (busy) return; busy = true; el('skins-save').disabled = true;
       try {
         await saveSettings({ ...data.skins, enabled: el('skins-enabled').checked, default: el('skins-default').value, ack: el('skins-ack').value, switchCommands: lines(el('skins-prefixes').value), handoffOnSwitch: { enabled: el('skins-handoff').checked, provider: el('skins-summary-provider').value, model: el('skins-summary-model').value.trim() || 'deepseek-flash', maxChars: Number(el('skins-summary-chars').value), recentMessages: Number(el('skins-summary-recent').value) } });
-        report(status, '切换与总结设置已保存。');
+        report(status, `设置已保存 · ${el('skins-enabled').checked ? '多个人格已启用' : '多个人格未启用'}`);
       } catch (error) { report(status, '保存失败：' + error.message, true); }
       finally { busy = false; el('skins-save').disabled = false; }
     };
@@ -136,3 +166,5 @@ export async function initSkinsPage() {
 }
 
 document.addEventListener('DOMContentLoaded', initSkinsPage);
+
+export { initSkinsPage };

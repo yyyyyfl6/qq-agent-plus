@@ -38,8 +38,6 @@ import { state } from './core/state.js';
       const sub = btn.querySelector('.tab-label i')?.textContent || '';
       list.push({ label, hint: '页面', ico: btn.dataset.icon || 'chevron', keys: `${label} ${sub} ${btn.dataset.tab || ''}`, run: () => btn.click() });
     });
-    // 「人格」（双人格页）不是侧栏页签，单独列一条
-    list.push({ label: '人格（切换人格 / 专属指令）', hint: '页面', ico: 'mask', keys: '人格 皮肤 skins 切鱼 切猫 大肥鱼 哈基米 persona', run: () => { window.location.href = '/skins.html'; } });
     for (const [id, label, keys] of SETTINGS) {
       list.push({
         label: `设置 › ${label}`,

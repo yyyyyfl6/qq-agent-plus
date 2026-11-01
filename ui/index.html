@@ -6,6 +6,7 @@
   <title>QQ Agent Linux</title>
   <link rel="icon" type="image/svg+xml" href="/mark.svg" />
   <link rel="stylesheet" href="/style.css" data-page-node-id="x8F6i7W4lVVFQuDLeTBT6x" />
+  <link rel="stylesheet" href="/skins.css" />
   <script>
     /* 启动提示默认静态隐藏（css: html.boot-silent .loading-overlay{opacity:0}）：
        正常进入时它一秒都不会出现，避免"有个框突然出现一下"。
@@ -131,32 +132,35 @@
         </div>
       </div>
 
-      <!-- 人格（双人格皮肤页 /skins.html）：是独立页面而不是侧栏页签 —— #tabs 里的每一项都由 switchTab/滑块接管，
-           放一个会跳走的链接进去会让滑块和视图状态错乱。所以和上游一样挂在导航上方，只是做得醒目一点。 -->
-      <a class="btn btn-small side-skins-link" data-icon="mask" href="/skins.html" title="人格：每个会话切换不同人格卡 / 模型（蓝色大肥鱼、哈基米…），管理员用「切鱼」「切猫」等指令切换"><span>人格</span></a>
       <nav id="tabs" data-page-node-id="E9BCxQoSdlNgyXwJBELj6z">
         <!-- 每一项两行：主名 + 一行说明（对齐参照控制台的一级导航）。分组不用小标题，
              靠 data-group-start 在组间留一道空白 —— 十三项各带一行说明，再加四个分组标题
              就太吵了，而且分组标题的信息量已经被说明那行接住了。 -->
         <button class="tab active" data-icon="gauge" data-tab="overview" data-page-node-id="qoverviewnav"><span class="tab-label"><b>总览</b><i>机器人与协议端</i></span></button>
+        <div class="nav-group-label" aria-hidden="true">对话</div>
         <button class="tab" data-icon="chat" data-tab="sessions" data-group-start data-page-node-id="QA2pcdHYdARJK2APBNKZmC"><span class="tab-label"><b>会话</b><i>逐条对话记录</i></span></button>
         <button class="tab" data-icon="archive" data-tab="chats" data-page-node-id="AdXD0D2NiWH5UBfpPQqzQ2"><span class="tab-label"><b>存档</b><i>分群聊天的长期归档</i></span></button>
         <button class="tab" data-icon="sliders" data-tab="control" data-page-node-id="qcontrolnav"><span class="tab-label"><b>控制</b><i>更新与运行开关</i></span></button>
+        <button class="tab" data-icon="mask" data-tab="skins" title="人格：每个会话切换不同人格卡 / 模型（蓝色大肥鱼、哈基米…）"><span class="tab-label"><b>人格</b><i>切换人格与专属指令</i></span></button>
+        <div class="nav-group-label" aria-hidden="true">记忆</div>
         <button class="tab" data-icon="database" data-tab="memory" data-group-start data-page-node-id="vXS9OY6wG4MkJlzQ2aLADZ"><span class="tab-label"><b>会话记忆</b><i>每条会话记了什么</i></span></button>
         <button class="tab" data-icon="users" data-tab="people-memory" data-page-node-id="qpeoplememorynav"><span class="tab-label"><b>人物记忆</b><i>群友的长期画像</i></span></button>
         <button class="tab hidden" data-icon="brain" data-tab="living-memory" data-feature-nav="living-memory"><span class="tab-label"><b>长期记忆</b><i>语义检索与知识图谱</i></span></button>
         <button class="tab" data-icon="idcard" data-tab="identity" data-feature-nav="identity"><span class="tab-label"><b>人物印象</b><i>印象与关系档案</i></span></button>
         <button class="tab" data-icon="userplus" data-tab="friends" data-feature-nav="auto-friend"><span class="tab-label"><b>好友管理</b><i>好友申请与派发</i></span></button>
+        <div class="nav-group-label" aria-hidden="true">运行</div>
         <button class="tab" data-icon="activity" data-tab="assets" data-group-start data-page-node-id="qassetobserve"><span class="tab-label"><b>观测</b><i>素材与实验状态</i></span></button>
         <button class="tab" data-icon="coins" data-tab="usage" data-page-node-id="hcZzcXuMojNoiE7UcRVYfR"><span class="tab-label"><b>用量</b><i>花费与 token</i></span></button>
         <button class="tab" data-icon="alert" data-tab="incidents" data-feature-nav="incidents"><span class="tab-label"><b>异常处理</b><i>告警与日志</i></span></button>
         <!-- 插件：市场与已装的扩展（2026-10-16 从「设置 → 插件」搬出来）。它本来就不是配置表单：
              动作点了就生效、没有"保存设置"这一步，藏在设置里会被强制加一条保存条，还得用文案解释
              "不用点下面那个按钮" —— 那是布局错了的信号。位置放在「设置」之前（同为"管"的页面）。 -->
+        <div class="nav-group-label" aria-hidden="true">扩展</div>
         <button class="tab" data-icon="summary" data-tab="ext-summary" data-group-start><span class="tab-label"><b>群聊总结</b><i>按需总结 · /总结</i></span></button>
         <button class="tab" data-icon="fish" data-tab="ext-lab"><span class="tab-label"><b>大肥鱼桥</b><i>实验室 Harness · /lab</i></span></button>
         <button class="tab" data-icon="dice" data-tab="ext-fun"><span class="tab-label"><b>趣味功能</b><i>人品 · 运势 · 塔罗</i></span></button>
-        <button class="tab" data-icon="sparkles" data-tab="skills" title="技能 — 按流程做事" aria-label="技能"><span class="tab-label"><b>技能</b><i>按流程做事</i></span></button>
+        <div class="nav-group-label" aria-hidden="true">管理</div>
+        <button class="tab" data-icon="sparkles" data-tab="skills" data-group-start title="技能 — 按流程做事" aria-label="技能"><span class="tab-label"><b>技能</b><i>按流程做事</i></span></button>
         <button class="tab" data-icon="chip" data-tab="plugins"><span class="tab-label"><b>插件</b><i>市场与已装的扩展</i></span><em class="pending-badge" data-pending-badge style="display:none" aria-label="没有插件待批"></em></button>
         <button class="tab" data-icon="gear" data-tab="settings" data-page-node-id="4cXbRBtGmcpcL272eKvHPV"><span class="tab-label"><b>设置</b><i>全部配置</i></span></button>
       </nav>
@@ -313,6 +317,11 @@
 
     <section id="view-incidents" class="view">
       <div id="incident-page" class="asset-pane"></div>
+    </section>
+
+    <!-- 人格（双人格）：内容取自 /skins.html 的 #skins-page，切到这一页时载入（ui/skins-view.js），只维护一份结构 -->
+    <section id="view-skins" class="view">
+      <div id="skins-host" class="asset-pane skins-pane"><div class="empty-hint">正在载入人格…</div></div>
     </section>
 
     <!-- 扩展功能（src/extensions/*）：每个功能一个独立页面，关闭时页面仍可查看数据、修配置 -->
@@ -489,5 +498,7 @@
   <script type="module" src="/ext-fun-tools.js"></script>
   <script type="module" src="/persona-studio.js"></script>
   <script type="module" src="/command-palette.js"></script>
+  <script type="module" src="/skins-view.js"></script>
+  <script type="module" src="/settings-polish.js"></script>
 </body>
 </html>
