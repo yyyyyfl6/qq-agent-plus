@@ -1,11 +1,12 @@
-// 插件接口 apiVersion 3：让插件接进**连续对话的工作流**（2026-11 加；第一个用户是「我会一直陪着你」移植插件）。
+// 插件接口 apiVersion 3：让插件接进**连续对话的工作流**（2026-11 加）。
 //
 //   cap.llm.complete  用「副 API」跑一次模型（插件设置里的 llmProvider / llmModel，取自控制台已添加的供应商；
-//                     Key 只在宿主里解析，插件拿不到）。每插件每天有次数上限。
+//                     Key 只在宿主里解析，插件拿不到）。每插件每天有次数上限。user 消息可带图（images：
+//                     data:image/… 的 base64，每次最多 2 张），副 API 选的模型得支持看图。
 //   cap.context.set   给某个会话挂一段"背景"（长任务的当前状态：此刻在做什么、心情、想说的事…）。
 //                     主模型每轮把它放进 user 内容（不动 system 前缀，不破坏前缀缓存）；有过期时间。
 //   cap.context.persona  读某个会话**当前正在运行的人格**（多人格切换后也跟着变）：插件的后台任务
-//                     （如陪伴插件的生活长任务）据此跟主对话用同一个角色，不另起一套设定。只读。
+//                     据此跟主对话用同一个角色，不另起一套设定。只读。
 //   cap.wake.request  请主模型对某个会话来一次主动唤醒（和冷场开话题同一条路：发不发、说什么由主模型决定）。
 //                     每会话最小间隔 + 每插件每天上限。
 //
@@ -25,6 +26,9 @@ const MAX_CONTEXT_CHATS = 50;
 const MAX_CONTEXT_TTL_MIN = 24 * 60;
 const MAX_LLM_INPUT_CHARS = 60000;
 const MAX_WAKE_NOTE = 280;
+const MAX_LLM_IMAGES = 2;
+const MAX_IMAGE_CHARS = 700_000;   // data URL 长度（约 500KB 的图）
+const IMAGE_RE = /^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/=]+$/;
 
 // ── 背景挂载（进程内单例：编排器每轮来读） ──────────────────────────────────
 const contexts = new Map();   // pluginId -> { name, chats: Map(chatKey -> { text, expiresAt }) }
@@ -92,11 +96,20 @@ export function createAgentCapabilities({ pluginId, manifest, dataDir, getSettin
     'cap.llm.complete': async ({ messages, maxTokens, temperature } = {}) => {
       if (!Array.isArray(messages) || !messages.length) throw fail('E_ARGS', 'messages 不能为空');
       let total = 0;
+      let images = 0;
       const clean = messages.slice(0, 40).map((m) => {
         const role = ['system', 'user', 'assistant'].includes(m?.role) ? m.role : 'user';
         const content = String(m?.content ?? '');
         total += content.length;
-        return { role, content };
+        const pics = Array.isArray(m?.images) ? m.images : [];
+        if (!pics.length) return { role, content };
+        if (role !== 'user') throw fail('E_ARGS', '只有 user 消息能带图');
+        images += pics.length;
+        if (images > MAX_LLM_IMAGES) throw fail('E_TOO_BIG', `每次最多带 ${MAX_LLM_IMAGES} 张图`);
+        for (const url of pics) {
+          if (typeof url !== 'string' || url.length > MAX_IMAGE_CHARS || !IMAGE_RE.test(url)) throw fail('E_ARGS', '图必须是 data:image/(png|jpeg|webp|gif);base64,…，且不超过约 500KB');
+        }
+        return { role, content: [{ type: 'text', text: content }, ...pics.map((url) => ({ type: 'image_url', image_url: { url } }))] };
       });
       if (total > MAX_LLM_INPUT_CHARS) throw fail('E_TOO_BIG', `输入太长（上限 ${MAX_LLM_INPUT_CHARS} 字符）`);
       const u = loadUsage();

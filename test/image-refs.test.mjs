@@ -1,5 +1,4 @@
 // 生图参考图（image-refs）：按触发词命中、body / edits 两种传图形状。
-// （原先同文件里的内置「陪伴」已移出宿主，改为独立插件：yyyyyfl6/astrbot_plugin_private_companion 的 qq-agent/）
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import fs from 'node:fs';

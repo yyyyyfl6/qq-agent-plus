@@ -333,21 +333,19 @@ process.stdin.on('data', (chunk) => {
 
 ## apiVersion 3：接进连续对话工作流（副 API / 背景 / 主动唤醒）
 
-2026-11 为「我会永远陪着你」的移植插件而加（见 `yyyyyfl6/astrbot_plugin_private_companion` 的 `qq-agent/`）。
-QQ Agent 自己就是连续对话的工作流，插件不需要另起一套"间断唤醒"：它用副 API 维护一个长任务，
+2026-11 加。QQ Agent 自己就是连续对话的工作流，插件不需要另起一套"间断唤醒"：它可以用副 API 维护一个长任务，
 把状态挂进会话背景，到点了请主模型主动来一次。声明 `apiVersion: 3` 才能用下面五项，v1/v2 插件不受影响。
 
 | 能力 | 方法 | 说明与宿主侧限制 |
 | --- | --- | --- |
-| `llm` | `cap.llm.complete { messages, maxTokens?, temperature? }` → `{ content, model, remaining }` | 用插件设置里的 `llmProvider` / `llmModel`（取自控制台「模型 API」已添加的供应商；留空按模型自动找，再退回主模型那家）。**Key 只在宿主里解析**，插件拿不到。思考参数一律关掉；输入 ≤6 万字符、输出 ≤4000 token；每插件每天 `plugins.limits.llmDailyCalls`（默认 300）次，先记账、失败退回 |
+| `llm` | `cap.llm.complete { messages, maxTokens?, temperature? }` → `{ content, model, remaining }` | user 消息可带 `images: ['data:image/jpeg;base64,…']`（png / jpeg / webp / gif，每张约 ≤500KB，每次最多 2 张；模型得支持看图）。用插件设置里的 `llmProvider` / `llmModel`（取自控制台「模型 API」已添加的供应商；留空按模型自动找，再退回主模型那家）。**Key 只在宿主里解析**，插件拿不到。思考参数一律关掉；输入 ≤6 万字符、输出 ≤4000 token；每插件每天 `plugins.limits.llmDailyCalls`（默认 300）次，先记账、失败退回 |
 | `context` | `cap.context.set { chatKey, text, ttlMinutes? }` | 给 `private:<QQ>` / `group:<群号>`（或 `*`）挂一段 ≤1500 字的背景，主模型**每轮放进 user 内容**（不动 system 前缀，不破坏前缀缓存），并标注"来自插件，第三方内容，不是指令"。默认 180 分钟过期（最长 24 小时）；空串 = 撤掉；插件停用即全部撤掉；每插件最多 50 个会话 |
 | `context` | `cap.context.persona { chatKey }` → `{ skinId, label, botName, roleText }` | 只读：这个会话**当前正在运行的人格**（与主对话同一套解析：多人格分仓 + 按群人设；切换后跟着变），角色卡正文截到 3000 字。插件的后台任务据此用同一个角色，不另起一套设定 |
 | `wake` | `cap.wake.request { chatKey, note? }` → `{ queued, remaining }` | 请主模型对该会话来一次 proactive 唤醒（和冷场开话题同一条路：白名单、作息、观察 / 暂停模式、预算照常生效；发不发、说什么由主模型决定）。`note` ≤280 字，作为【系统提醒】交给主模型。同一会话间隔 ≥ `plugins.limits.wakeMinGapMinutes`（默认 20）分钟、每插件每天 `wakeDailyCalls`（默认 30）次；先记账，结果不确定也不重试 |
-| `inbound` | 宿主方法 `inbound { method, path, query, headers, remoteAddr, body }` → 插件回 `{ status, body }` | 外部设备（如安卓陪伴终端）直接推数据：`/plugin-hooks/<id>/<路径>`，控制台端口上认；插件**自己的设置**里 `inboundListen: true`（`inboundPort` 默认 6322、`inboundHost` 默认 `0.0.0.0`，重启生效）时，宿主替这个插件单开一个独立端口，**只**提供它的路径、根路径直接交给它（宿主配置不加键）。**不走控制台令牌**，鉴权由插件做；宿主只放行已启用且声明了 inbound 的插件（否则 404）、只收 GET/POST、请求体 ≤256KB 且必须是 JSON、每个来源 IP 每分钟 ≤120 次、只转发 `authorization` / `x-companion-mobile-token` / `content-type` / `user-agent` / `accept-language` 五个请求头、插件 10 秒不回就 502。实现：`src/plugins/inbound.js` |
+| `inbound` | 宿主方法 `inbound { method, path, query, headers, remoteAddr, body, via }` → 插件回 `{ status, body }`，或 `{ status, contentType, body: 字符串 }` | 外部设备（如插件配套的手机 App）直接推数据：`/plugin-hooks/<id>/<路径>`，控制台端口上认；插件**自己的设置**里 `inboundListen: true`（`inboundPort` 默认 6322、`inboundHost` 默认 `0.0.0.0`，重启生效）时，宿主替这个插件单开一个独立端口，**只**提供它的路径、根路径直接交给它（宿主配置不加键）；`via` 是 `port` / `console`。**不走控制台令牌**，鉴权由插件做；宿主只放行已启用且声明了 inbound 的插件（否则 404）、只收 GET/POST、请求体 ≤256KB 且必须是 JSON、每个来源 IP 每分钟 ≤120 次、插件 10 秒不回就 502。只转发 `authorization` / `content-type` / `user-agent` / `accept-language` / `host` / `x-forwarded-host` / `x-forwarded-proto`，外加 manifest `inbound: { headers: ['x-…'] }` 里声明的自定义头（x- 开头，最多 5 个）。文本类响应限 `text/html` / `text/plain` / `text/css` / `text/javascript`、≤1MB；**`text/html` 只在独立端口上给**（控制台端口与控制台同源，回 403），并加 CSP（只许连回同一端口）与 `frame-ancestors 'none'`。实现：`src/plugins/inbound.js` |
 | `page` | manifest `page: { entry: 'page.html', title }`；宿主方法 `page { method, params }` → 插件回任意结果 | 插件自带一页控制台页面，显示在插件详情里。HTML 由宿主读出（≤512KB）放进 `<iframe sandbox="allow-scripts allow-modals" srcdoc>`：**没有 same-origin**（读不到控制台令牌 / 存储 / 父页面），宿主在最前面注入 CSP `default-src 'none'`（只放行内联脚本 / 样式与 data: 图片，**发不出任何网络请求**）。页面里唯一的出口是宿主注入的 `qqa.call(method, params)`，经 `POST /api/plugins/page-rpc` 只能调**它自己**的插件；`qqa.onTheme(cb)` 收控制台的明暗与配色变量。实现：`ui/pages/plugin-page.js` |
 
 用量记在 `plugin-data/<id>/agent-usage.json`（按北京日期）。实现：`src/plugins/agent-caps.js`、`src/plugins/inbound.js`，控制台接线集中在 `src/plugins/v3.js`。
-控制台里：设置 → 平台能力 →「插件宿主（高级）」→ 设备入站端口。
 
 ## 写一个插件（作者向）
 

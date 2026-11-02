@@ -7100,7 +7100,7 @@ html[data-glass='liquid'] #view-settings .settings-pane {
 /* ── 人格页嵌在控制台里时的外层 ── */
 .skins-pane { overflow-y: auto; }
 
-/* 勾选行（图片生成页、模型供应商弹窗共用；原「陪伴」页已改为独立插件） */
+/* 勾选行（图片生成页、模型供应商弹窗共用） */
 .cmp-checks { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 4px 0 10px; }
 .cmp-check { display: inline-flex; align-items: center; gap: 8px; font-size: var(--fs-md); cursor: pointer; }
 .cmp-check input { accent-color: var(--accent); width: 16px; height: 16px; }

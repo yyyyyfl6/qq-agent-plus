@@ -52,11 +52,27 @@ test('llm：按插件设置里的副 API 解析 Key，有每日上限，失败�
   await caps.methods['cap.llm.complete']({ messages: [{ role: 'user', content: '第二天' }] });
 });
 
+test('llm：user 消息可带图（data URL，最多 2 张），格式不对 / 非 user 消息带图就拒', async () => {
+  const calls = [];
+  const caps = createAgentCapabilities({
+    pluginId: 'pics', manifest: { name: '看图' }, dataDir,
+    getSettings: () => ({ llmProvider: 'p_side', llmModel: 'cheap-model' }),
+    complete: async (req) => { calls.push(req); return { message: { content: '一只猫' } }; }
+  });
+  const img = 'data:image/jpeg;base64,/9j/4AAQSkZJRg==';
+  await caps.methods['cap.llm.complete']({ messages: [{ role: 'user', content: '这是什么', images: [img] }] });
+  assert.deepEqual(calls[0].messages[0].content, [{ type: 'text', text: '这是什么' }, { type: 'image_url', image_url: { url: img } }]);
+  await assert.rejects(caps.methods['cap.llm.complete']({ messages: [{ role: 'user', content: 'x', images: [img, img, img] }] }), /最多/);
+  await assert.rejects(caps.methods['cap.llm.complete']({ messages: [{ role: 'user', content: 'x', images: ['https://e.com/a.png'] }] }), /data:image/);
+  await assert.rejects(caps.methods['cap.llm.complete']({ messages: [{ role: 'system', content: 'x', images: [img] }] }), /user/);
+  assert.equal(calls.length, 1, '被拒的不调模型、不记账');
+});
+
 test('context：挂到会话、按 chatKey 取、过期与停用即撤', () => {
   let now = 1_000_000;
-  const caps = createAgentCapabilities({ pluginId: 'ctx', manifest: { name: '陪伴' }, dataDir, now: () => now, getSettings: () => ({}) });
+  const caps = createAgentCapabilities({ pluginId: 'ctx', manifest: { name: '生活' }, dataDir, now: () => now, getSettings: () => ({}) });
   caps.methods['cap.context.set']({ chatKey: 'private:10001', text: '此刻在图书馆看书', ttlMinutes: 30 });
-  assert.match(pluginContextFor('private:10001', now), /插件「陪伴」.*\n此刻在图书馆看书/);
+  assert.match(pluginContextFor('private:10001', now), /插件「生活」.*\n此刻在图书馆看书/);
   assert.equal(pluginContextFor('private:20002', now), '');
   assert.throws(() => caps.methods['cap.context.set']({ chatKey: 'bad', text: 'x' }), /chatKey/);
   assert.throws(() => caps.methods['cap.context.set']({ chatKey: 'private:10001', text: 'x'.repeat(2000) }), /太长/);
@@ -70,13 +86,13 @@ test('wake：交给主链路 proactive 唤醒，有会话间隔与每日上限',
   let now = Date.parse('2026-11-01T12:00:00+08:00');
   const woke = [];
   const caps = createAgentCapabilities({
-    pluginId: 'wk', manifest: { name: '陪伴' }, dataDir, now: () => now, getSettings: () => ({}),
+    pluginId: 'wk', manifest: { name: '生活' }, dataDir, now: () => now, getSettings: () => ({}),
     getAgent: () => ({ wake: async (k, o) => { woke.push([k, o]); } }), limits: { wakeDailyCalls: 2, wakeMinGapMinutes: 20 }
   });
   await caps.methods['cap.wake.request']({ chatKey: 'private:10001', note: '你刚下课，想问问对方午饭吃了啥' });
   assert.equal(woke[0][0], 'private:10001');
   assert.equal(woke[0][1].proactive, true);
-  assert.match(woke[0][1].wakeNote, /^【系统提醒】（插件「陪伴」）你刚下课/);
+  assert.match(woke[0][1].wakeNote, /^【系统提醒】（插件「生活」）你刚下课/);
   await assert.rejects(caps.methods['cap.wake.request']({ chatKey: 'private:10001' }), /分钟内已经唤醒过/);
   now += 21 * 60_000;
   await caps.methods['cap.wake.request']({ chatKey: 'private:10001' });

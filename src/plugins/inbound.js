@@ -1,21 +1,31 @@
-// 插件 v3 的入站 HTTP（能力 `inbound`）：让外部设备（如「我会永远陪着你」移植插件配套的安卓陪伴终端）
-// 直接把数据推给插件。
+// 插件 v3 的入站 HTTP（能力 `inbound`）：让外部设备（如插件配套的手机 App）直接把数据推给插件。
 //
 //   路径：/plugin-hooks/<插件id>/<其余路径>     —— 控制台端口上认
 //   独立端口：插件设置里 inboundListen = true（端口 inboundPort，默认 6322）时，宿主替**这个插件**单开一个端口，
-//   **只**提供它的路径、根路径（/pair、/status …）直接交给它，不暴露控制台 ——
-//   原插件的手机网关就是 6322 端口、根路径，配套 App 不用改地址格式。开关放在插件自己的设置里，宿主配置不加键。
+//   **只**提供它的路径、根路径直接交给它，不暴露控制台。开关放在插件自己的设置里，宿主配置不加键。
 //
-// 这条路**不走控制台令牌**（手机拿不到也不该拿到控制台令牌）：鉴权由插件自己做（配对令牌 → 会话令牌）。
+// 这条路**不走控制台令牌**（设备拿不到也不该拿到控制台令牌）：鉴权由插件自己做。
 // 所以宿主在这里守住它能守的：插件必须已启用且声明了 inbound（否则一律 404，不泄露装了什么）、
-// 请求体 ≤256KB、每个来源 IP 每分钟 ≤120 次、只转发白名单里的请求头、插件 10 秒没回就 502。
+// 请求体 ≤256KB、每个来源 IP 每分钟 ≤120 次、只转发白名单里的请求头（通用的几个 + manifest
+// `inbound.headers` 里声明的 x- 头）、插件 10 秒没回就 502。
+//
+// 响应默认是 JSON（插件回 { status, body }）。插件也可以回一页给浏览器看的东西
+// （{ status, contentType, body: 字符串 }，类型限 text/html、text/plain、text/css、text/javascript，≤1MB）：
+// **HTML 只在独立端口上给**——控制台端口与控制台同源，插件页面在那里能读到控制台令牌；
+// 独立端口上也加 CSP（只许连回同一端口）与 frame-ancestors 'none'。请求里的 via 告诉插件这次走的是哪个端口。
 // 这是 app.js 里路由表 auth:false 白名单之外唯一的免令牌入口，审计用例见 test/plugin-inbound.test.mjs。
 import http from 'node:http';
 
 export const INBOUND_PREFIX = '/plugin-hooks/';
 const MAX_BODY_BYTES = 256 * 1024;
 const RATE_PER_MIN = 120;
-const FORWARD_HEADERS = ['authorization', 'x-companion-mobile-token', 'content-type', 'user-agent', 'accept-language'];
+const MAX_TEXT_BYTES = 1024 * 1024;
+// 通用请求头；host / x-forwarded-* 让插件能拼出给设备打开的绝对地址（反代后面也对）
+const FORWARD_HEADERS = ['authorization', 'content-type', 'user-agent', 'accept-language', 'host', 'x-forwarded-host', 'x-forwarded-proto'];
+const TEXT_TYPES = new Set(['text/html', 'text/plain', 'text/css', 'text/javascript']);
+const PAGE_CSP = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+  + "img-src 'self' data: blob:; media-src 'self' data: blob:; connect-src 'self'; font-src 'self' data:; "
+  + "frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 const ID_RE = /^[a-z0-9][a-z0-9-]{1,31}$/;
 
 function send(res, status, body) {
@@ -25,6 +35,32 @@ function send(res, status, body) {
     'cache-control': 'no-store',
     'x-content-type-options': 'nosniff'
   });
+  res.end(text);
+}
+
+/** 插件回的文本类响应（HTML 只在独立端口上给）。不合规的一律当 502，不把半截内容交给浏览器。 */
+function sendText(res, result, { onPluginPort }) {
+  const type = String(result.contentType || '').toLowerCase().split(';')[0].trim();
+  const text = typeof result.body === 'string' ? result.body : null;
+  if (!TEXT_TYPES.has(type) || text === null || Buffer.byteLength(text) > MAX_TEXT_BYTES) {
+    send(res, 502, { ok: false, message: '插件返回的内容不合规' });
+    return;
+  }
+  if (type === 'text/html' && !onPluginPort) {
+    send(res, 403, { ok: false, message: '页面只在插件的独立端口上提供（插件设置里打开 inboundListen）' });
+    return;
+  }
+  const headers = {
+    'content-type': `${type}; charset=utf-8`,
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+    'referrer-policy': 'no-referrer'
+  };
+  if (type === 'text/html') {
+    headers['content-security-policy'] = PAGE_CSP;
+    headers['x-frame-options'] = 'DENY';
+  }
+  res.writeHead(result.status, headers);
   res.end(text);
 }
 
@@ -47,7 +83,7 @@ function readBody(req) {
 }
 
 /**
- * @param getRegistry  () => PluginRegistry（有 inbound(id, request)）
+ * @param getRegistry  () => { inbound(id, request), headersFor?(id) → manifest 里声明的额外请求头 }
  * @param getConfig    () => 完整配置（读 plugins.enabled / enabledIds / settings[id].inboundListen）
  */
 export function createInboundHandler({ getRegistry, getConfig = () => ({}), log = () => {}, now = () => Date.now() } = {}) {
@@ -84,7 +120,7 @@ export function createInboundHandler({ getRegistry, getConfig = () => ({}), log 
     } else {
       return false;
     }
-    if (!ID_RE.test(id)) { send(res, 404, { ok: false, message: 'not found' }); return true; }
+    if (!ID_RE.test(id) || (rootPlugin && id !== rootPlugin)) { send(res, 404, { ok: false, message: 'not found' }); return true; }
     const ip = String(req.socket?.remoteAddress || '');
     if (limited(ip)) { send(res, 429, { ok: false, message: '请求过于频繁，请稍后再试' }); return true; }
     const method = String(req.method || 'GET').toUpperCase();
@@ -100,19 +136,23 @@ export function createInboundHandler({ getRegistry, getConfig = () => ({}), log 
     if (raw) {
       try { body = JSON.parse(raw); } catch { send(res, 400, { ok: false, message: '请求体必须是 JSON' }); return true; }
     }
+    const registry = registryOf?.();
+    if (!registry?.inbound) { send(res, 404, { ok: false, message: 'not found' }); return true; }
+    const extra = (typeof registry.headersFor === 'function' ? registry.headersFor(id) : []) || [];
     const headers = {};
-    for (const name of FORWARD_HEADERS) {
+    for (const name of [...FORWARD_HEADERS, ...extra.filter((h) => /^x-[a-z0-9-]{1,40}$/.test(h)).slice(0, 5)]) {
       const value = req.headers?.[name];
       if (typeof value === 'string' && value) headers[name] = value.slice(0, 512);
     }
     const query = {};
     for (const [key, value] of [...url.searchParams.entries()].slice(0, 20)) query[key.slice(0, 40)] = value.slice(0, 200);
-    const registry = registryOf?.();
-    if (!registry?.inbound) { send(res, 404, { ok: false, message: 'not found' }); return true; }
+    const onPluginPort = Boolean(rootPlugin) && rootPlugin === id;
     const result = await registry.inbound(id, {
-      method, path: rest.slice(0, 300), query, headers, remoteAddr: ip.slice(0, 64), body: body ?? {}
+      method, path: rest.slice(0, 300), query, headers, remoteAddr: ip.slice(0, 64), body: body ?? {},
+      via: onPluginPort ? 'port' : 'console'
     });
-    send(res, result.status, result.body);
+    if (result.contentType) sendText(res, result, { onPluginPort });
+    else send(res, result.status, result.body);
     return true;
   }
 

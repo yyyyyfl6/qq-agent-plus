@@ -44,10 +44,13 @@ export function createPluginV3({ getRegistry, getOrchestrator, getSkins, log = (
     try {
       const result = await hit.ready.inbound(request);
       const status = Number(result?.status);
-      return {
+      const out = {
         status: Number.isInteger(status) && status >= 200 && status <= 599 ? status : 200,
         body: result?.body === undefined ? { ok: true } : result.body
       };
+      // 文本类响应（页面等）：类型与体积在 inbound.js 出口处再校验
+      if (typeof result?.contentType === 'string' && result.contentType) out.contentType = result.contentType.slice(0, 60);
+      return out;
     } catch (error) {
       log(`插件 ${id} 处理入站请求失败：${error?.message ?? error}`);
       return { status: error?.code === 'E_BUSY' ? 503 : 502, body: { ok: false, message: '插件处理失败' } };
@@ -74,7 +77,12 @@ export function createPluginV3({ getRegistry, getOrchestrator, getSkins, log = (
     return hit.ready.pageCall(method, params);
   }
 
-  const inboundHandler = createInboundHandler({ getRegistry: () => ({ inbound }), getConfig, log });
+  // manifest 里声明的额外请求头（inbound.headers），只有已启用且声明了 inbound 的插件才有
+  const headersFor = (id) => {
+    const host = registryOf()?.hosts?.get?.(String(id || ''));
+    return host?.manifest?.capabilities?.includes('inbound') ? (host.manifest.inbound?.headers || []) : [];
+  };
+  const inboundHandler = createInboundHandler({ getRegistry: () => ({ inbound, headersFor }), getConfig, log });
   let servers = [];
 
   return {
@@ -83,7 +91,10 @@ export function createPluginV3({ getRegistry, getOrchestrator, getSkins, log = (
     pageSource,
     pageCall,
     handleHttp: (req, res) => (String(req.url || '').startsWith(INBOUND_PREFIX) ? inboundHandler.handle(req, res) : false),
-    registerRoutes(router, { json, readBody }) {
+    registerRoutes(router, helpers) {
+      // 显式取别名而不是解构参数：ops scan 的未定义调用扫描器不认识解构参数（见 console/router.js）
+      const json = helpers.json;
+      const readBody = helpers.readBody;
       // 页面放进沙箱 iframe（allow-scripts、opaque origin、CSP 断网），按钮只能经 page-rpc 调**它自己**的插件
       router.add('GET', '/api/plugins/page', async (req, res, params, url) => {
         const id = String(url.searchParams.get('id') || '').trim();

@@ -393,6 +393,24 @@ export function parsePluginManifest(raw, { dir = '' } = {}) {
     page = { entry: dir ? pageAbs : pageEntry, title: str(rawPage?.title).slice(0, 20) || name };
   }
 
+  // v3 入站：manifest.inbound = { headers: ['x-…'] } —— 宿主默认只转发几个通用请求头，
+  // 插件配套设备用的自定义头（必须 x- 开头）在这里声明，宿主才转发给它。
+  let inbound = null;
+  if (capabilities.includes('inbound')) {
+    const rawInbound = isPlainObject(raw.inbound) ? raw.inbound : {};
+    const rawHeaders = rawInbound.headers === undefined ? [] : rawInbound.headers;
+    if (!Array.isArray(rawHeaders) || rawHeaders.length > 5) return { ok: false, error: 'inbound.headers 必须是数组，最多 5 项' };
+    const headers = [];
+    for (const h of rawHeaders) {
+      const v = str(h).toLowerCase();
+      if (!/^x-[a-z0-9-]{1,40}$/.test(v)) return { ok: false, error: `inbound.headers 里的 ${JSON.stringify(h)} 不合法（必须是 x- 开头的请求头名）` };
+      if (!headers.includes(v)) headers.push(v);
+    }
+    inbound = { headers };
+  } else if (raw.inbound !== undefined) {
+    return { ok: false, error: '声明了 inbound 就必须在 capabilities 里带上 "inbound"' };
+  }
+
   const rawTools = raw.tools ?? [];
   if (!Array.isArray(rawTools)) return { ok: false, error: 'tools 必须是数组' };
   if (rawTools.length > MAX_TOOLS) return { ok: false, error: `工具数超过上限 ${MAX_TOOLS} 个（每个工具都会占提示词预算）` };
@@ -495,6 +513,7 @@ export function parsePluginManifest(raw, { dir = '' } = {}) {
       httpDomains,
       httpMaxBytes,
       page,
+      inbound,
       engines: enginesResult.engines
     }
   };

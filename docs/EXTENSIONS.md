@@ -93,13 +93,6 @@ Windows 上执行 `.cmd/.bat` 时加 `LAB_BRIDGE_SHELL=1`。接收端默认只�
 - `tarot`：22 张大阿卡纳，单张指引或过去/现在/未来三张，正逆位随机。
 - 结果由代码决定，模型只负责用自己的口吻说出来——不会同一个人一会儿 90 一会儿 12。
 
-## 陪伴 → 改为独立插件
-
-「我会永远陪着你」（原作 menglimi）已改为 QQ Agent 插件，代码在
-[yyyyyfl6/astrbot_plugin_private_companion](https://github.com/yyyyyfl6/astrbot_plugin_private_companion/tree/qq-agent-port/qq-agent)
-的 `qq-agent/`（已获原作者授权）：副 API 维护角色的生活长任务并挂进私聊背景，按不规则间隔提示主模型主动联系，私聊按日期记日记。
-它依赖插件接口 apiVersion 3（`llm` / `context` / `wake`，见 [PLUGINS.md](PLUGINS.md)）。宿主里原先的内置「陪伴」页与 `companion` 配置段已移除。
-
 ## 生图参考图（提示词触发）
 
 代码：`src/extensions/image-refs.js`，页面：侧栏「图片生成」（也是生图功能的总入口：状态、试画、直达生图设置）。
@@ -149,7 +142,7 @@ Windows 上执行 `.cmd/.bat` 时加 `LAB_BRIDGE_SHELL=1`。接收端默认只�
 ## 界面
 
 配色、明暗、材质、字体、圆角等外观全部由上游的外观系统（设置 → 外观，`ui/core/appearance.js`）负责；
-图标统一用上游的线条 SVG 图标库（`ui/core/icons.js`，本次补了 `fish` / `mask` / `dice` / `summary` / `heart`）。
+图标统一用上游的线条 SVG 图标库（`ui/core/icons.js`，本次补了 `fish` / `mask` / `dice` / `summary`）。
 
 ## 搜索：谷歌与 Edge
 

@@ -83,7 +83,8 @@ function ensureListener() {
 }
 
 async function hydratePluginPage(id) {
-  const block = document.querySelector(`[data-pd-page="${CSS.escape(String(id))}"]`);
+  // 插件 id 只会是 [a-z0-9-]（manifest 校验过）；不用 CSS.escape：渲染测试的 vm 沙箱里没有 CSS 全局
+  const block = document.querySelector(`[data-pd-page="${String(id).replace(/[^a-z0-9-]/gi, '')}"]`);
   if (!block) return;
   const body = block.querySelector('.plugin-page-body');
   try {

@@ -1,6 +1,6 @@
 // 插件 v3 入站 HTTP（src/plugins/inbound.js）：不走控制台令牌的唯一入口，宿主在这里守住能守的。
-// 钉住：只认 /plugin-hooks/<id>/（独立端口可设根路径插件）、只转发白名单请求头、体积 / 频率 / 方法上限、
-// JSON 解析、注册表默认拒（未启用 / 没声明 inbound → 404）。
+// 钉住：只认 /plugin-hooks/<id>/（独立端口可设根路径插件）、只转发白名单请求头（+ manifest 声明的 x- 头）、
+// 体积 / 频率 / 方法上限、JSON 解析、注册表默认拒（未启用 / 没声明 inbound → 404）、HTML 只在独立端口上给。
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import http from 'node:http';
@@ -11,10 +11,14 @@ function fakeRegistry() {
   const seen = [];
   return {
     seen,
+    headersFor: (id) => (id === 'phone' ? ['x-device-token'] : []),
     inbound: async (id, request) => {
       seen.push({ id, request });
       if (id !== 'phone') return { status: 404, body: { ok: false, message: 'not found' } };
-      return { status: 200, body: { ok: true, data: { path: request.path } } };
+      if (request.path === '/page') return { status: 200, contentType: 'text/html', body: '<p>hi</p>' };
+      if (request.path === '/huge') return { status: 200, contentType: 'text/plain', body: 'x'.repeat(1024 * 1024 + 1) };
+      if (request.path === '/weird') return { status: 200, contentType: 'application/octet-stream', body: 'x' };
+      return { status: 200, body: { ok: true, data: { path: request.path, via: request.via } } };
     }
   };
 }
@@ -28,10 +32,15 @@ async function serve(handler, opts = {}) {
   return { base, close: () => new Promise((r) => server.close(r)) };
 }
 
-test('manifest：inbound 只有 apiVersion 3 能声明', () => {
+test('manifest：inbound 只有 apiVersion 3 能声明；inbound.headers 只收 x- 头、最多 5 个', () => {
   const base = { id: 'phone', name: 'x', version: '1.0.0' };
   assert.equal(parsePluginManifest({ ...base, apiVersion: 2, capabilities: ['inbound'] }).ok, false);
   assert.equal(parsePluginManifest({ ...base, apiVersion: 3, capabilities: ['inbound'] }).ok, true);
+  const ok = parsePluginManifest({ ...base, apiVersion: 3, capabilities: ['inbound'], inbound: { headers: ['X-Device-Token'] } });
+  assert.deepEqual(ok.manifest.inbound.headers, ['x-device-token']);
+  assert.equal(parsePluginManifest({ ...base, apiVersion: 3, capabilities: ['inbound'], inbound: { headers: ['cookie'] } }).ok, false);
+  assert.equal(parsePluginManifest({ ...base, apiVersion: 3, capabilities: ['inbound'], inbound: { headers: ['x-a', 'x-b', 'x-c', 'x-d', 'x-e', 'x-f'] } }).ok, false);
+  assert.equal(parsePluginManifest({ ...base, apiVersion: 3, capabilities: ['tools'], inbound: { headers: [] } }).ok, false);
 });
 
 test('转发：路径、白名单请求头、JSON 体；非插件路径不处理', async () => {
@@ -40,16 +49,17 @@ test('转发：路径、白名单请求头、JSON 体；非插件路径不处理
   try {
     const r = await fetch(`${s.base}/plugin-hooks/phone/pair?x=1`, {
       method: 'POST',
-      headers: { authorization: 'Bearer abc', 'x-companion-mobile-token': 't', cookie: 'secret=1', 'content-type': 'application/json' },
+      headers: { authorization: 'Bearer abc', 'x-device-token': 't', 'x-other': 'no', cookie: 'secret=1', 'content-type': 'application/json' },
       body: JSON.stringify({ device_name: 'Pixel' })
     });
     assert.equal(r.status, 200);
-    assert.deepEqual((await r.json()).data, { path: '/pair' });
+    assert.deepEqual((await r.json()).data, { path: '/pair', via: 'console' });
     const got = reg.seen[0].request;
     assert.equal(reg.seen[0].id, 'phone');
     assert.equal(got.method, 'POST');
     assert.equal(got.headers.authorization, 'Bearer abc');
-    assert.equal(got.headers['x-companion-mobile-token'], 't');
+    assert.equal(got.headers['x-device-token'], 't', 'manifest 声明的头转发');
+    assert.equal(got.headers['x-other'], undefined, '没声明的 x- 头不转发');
     assert.equal(got.headers.cookie, undefined, 'cookie 不转发');
     assert.deepEqual(got.body, { device_name: 'Pixel' });
     assert.deepEqual(got.query, { x: '1' });
@@ -68,8 +78,26 @@ test('独立端口：根路径交给 defaultPlugin', async () => {
   try {
     const r = await fetch(`${s.base}/status`);
     assert.equal(r.status, 200);
-    assert.deepEqual((await r.json()).data, { path: '/status' });
+    assert.deepEqual((await r.json()).data, { path: '/status', via: 'port' });
+    assert.equal((await fetch(`${s.base}/plugin-hooks/other/status`)).status, 404, '独立端口上不认别的插件');
   } finally { await s.close(); }
+});
+
+test('文本响应：HTML 只在独立端口上给（带 CSP）；类型 / 体积不合规 → 502', async () => {
+  const reg = fakeRegistry();
+  const consolePort = await serve(createInboundHandler({ getRegistry: () => reg }));
+  const pluginPort = await serve(createInboundHandler({ getRegistry: () => reg }), { rootPlugin: 'phone' });
+  try {
+    assert.equal((await fetch(`${consolePort.base}/plugin-hooks/phone/page`)).status, 403, '控制台端口与控制台同源，不给 HTML');
+    const r = await fetch(`${pluginPort.base}/page`);
+    assert.equal(r.status, 200);
+    assert.match(r.headers.get('content-type'), /^text\/html/);
+    assert.match(r.headers.get('content-security-policy'), /connect-src 'self'/);
+    assert.match(r.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+    assert.equal(await r.text(), '<p>hi</p>');
+    assert.equal((await fetch(`${pluginPort.base}/huge`)).status, 502);
+    assert.equal((await fetch(`${pluginPort.base}/weird`)).status, 502);
+  } finally { await consolePort.close(); await pluginPort.close(); }
 });
 
 test('每个来源 IP 每分钟 120 次', async () => {
@@ -95,6 +123,6 @@ test('独立端口按插件设置开：只给 enabledIds 里 inboundListen=true 
     assert.deepEqual(servers.map((s) => s.id), ['phone']);
     await new Promise((r) => (servers[0].server.listening ? r() : servers[0].server.once('listening', r)));
     const r = await fetch(`http://127.0.0.1:${cfg.plugins.settings.phone.inboundPort}/status`);
-    assert.deepEqual((await r.json()).data, { path: '/status' });
+    assert.deepEqual((await r.json()).data, { path: '/status', via: 'port' });
   } finally { await Promise.all(servers.map((s) => s.close())); }
 });
