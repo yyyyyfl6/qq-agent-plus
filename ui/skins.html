@@ -40,6 +40,7 @@
       <div><h2>人格 <span class="personas-count" id="skins-count"></span></h2><p class="muted">点卡片上的「编辑」改名称、角色卡、模型与指令；「设为默认」决定还没绑定过的会话用谁。</p></div>
       <button id="skin-add" type="button" class="btn btn-primary" disabled>＋ 新增人格</button>
     </div>
+    <div id="skins-default-ref" class="persona-solo"></div>
     <div id="skins-list" class="personas-list"></div>
   </section>
 
@@ -84,6 +85,27 @@
       <label>专属切换指令（每行一条，完整匹配）<textarea id="persona-commands" rows="3" placeholder="例如：切换鲸鱼娘&#10;/whale"></textarea></label>
       <p id="persona-error" class="personas-error" role="alert"></p>
       <div class="personas-actions"><button id="persona-cancel" type="button" class="btn">取消</button><button id="persona-save" type="submit" class="btn btn-primary">保存人格</button></div>
+    </form>
+  </dialog>
+  <dialog id="persona-ref-dialog" aria-labelledby="persona-ref-title">
+    <form id="persona-ref-form">
+      <h2 id="persona-ref-title">人物设定图</h2>
+      <p class="muted">这张图就是这个人格"自己"的样子：卡片头像显示它；模型画它自己（自拍、自画像、合照…）时，生图会带上这张图，保证每次长得一样。PNG / JPEG / WebP，≤4 MB。</p>
+      <div class="persona-ref-body">
+        <label class="persona-ref-drop" id="persona-ref-drop" title="点击选择图片">
+          <img id="persona-ref-preview" alt="" hidden>
+          <span id="persona-ref-empty">点击选择设定图</span>
+          <input id="persona-ref-file" type="file" accept="image/png,image/jpeg,image/webp" hidden>
+        </label>
+        <label>外貌要点（可空，会补进生图提示词）<textarea id="persona-ref-hint" rows="4" maxlength="300" placeholder="例如：银白短发、蓝色眼睛、左眼下有颗泪痣、常穿深蓝连帽衫"></textarea></label>
+      </div>
+      <p id="persona-ref-error" class="personas-error" role="alert"></p>
+      <div class="personas-actions">
+        <button id="persona-ref-remove" type="button" class="btn btn-ghost-danger">移除设定图</button>
+        <span class="spacer"></span>
+        <button id="persona-ref-cancel" type="button" class="btn">取消</button>
+        <button id="persona-ref-save" type="submit" class="btn btn-primary">保存</button>
+      </div>
     </form>
   </dialog>
 </main><script type="module" src="/skins.js"></script></body></html>

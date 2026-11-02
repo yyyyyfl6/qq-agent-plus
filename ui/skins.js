@@ -5,6 +5,8 @@
 //   · 会话行：下拉框改了才亮「切换」按钮，筛选框按群号 / QQ 过滤；
 //   · 交接设置收进「切换与交接设置」，有未保存改动时保存条才提示；
 //   · 页内没有 #锚点（嵌在控制台里会改掉地址栏 hash）。
+// 人物设定图（src/extensions/persona-refs.js）：每张卡的头像就是该人格的设定图，点头像或「设定图」上传 / 更换；
+//   多人格没开时用的那一套（设置 → 人设）记在 default 名下，列表上方单独一块。生图画"自己"时带上这张图。
 import { api } from './core/api.js';
 import { esc } from './core/dom.js';
 
@@ -17,11 +19,18 @@ async function initSkinsPage() {
   const option = (value, label, selected) => `<option value="${esc(value)}" ${value === selected ? 'selected' : ''}>${esc(label)}</option>`;
   const modelIds = (p) => (p?.models || []).map((m) => typeof m === 'string' ? m : m.id).filter(Boolean);
   const hue = (text) => [...String(text)].reduce((h, ch) => (h * 31 + ch.codePointAt(0)) % 360, 7);
+  // 头像：有设定图就显示设定图，否则首字
+  const avatar = (key, name, cls) => (refs[key]
+    ? `<span class="${cls} has-ref"><img src="${esc(refs[key].url)}" alt="" loading="lazy"></span>`
+    : `<span class="${cls}" aria-hidden="true">${esc([...name][0] || '?')}</span>`);
   const chatLabel = (key) => {
     const m = /^(group|private):(\d+)$/.exec(String(key));
     return m ? `${m[1] === 'group' ? '群' : '私聊'} ${m[2]}` : String(key);
   };
   let data;
+  let refs = {};
+  let refKey = '';
+  let refImage = '';
   let bindings = { chats: [] };
   let editing;
   let busy = false;
@@ -71,7 +80,7 @@ async function initSkinsPage() {
       const current = skins.list.find((s) => s.id === c.skinId);
       const name = current?.label || c.skinId || '默认';
       return `<div class="skin-row" data-chat="${esc(c.chatKey)}" data-current="${esc(c.skinId || '')}">
-        <span class="skin-dot" style="--persona-hue:${hue(name)}" aria-hidden="true">${esc([...name][0] || '?')}</span>
+        ${avatar(c.skinId, name, 'skin-dot').replace('<span class="skin-dot', `<span style="--persona-hue:${hue(name)}" class="skin-dot`)}
         <div class="skin-row-name"><strong>${esc(chatLabel(c.chatKey))}</strong><span class="muted">正在用：${esc(name)}</span></div>
         <select aria-label="${esc(c.chatKey)} 的人格">${skins.list.map((s) => option(s.id, s.label, c.skinId)).join('')}</select>
         <button type="button" class="btn btn-small" ${skins.enabled ? '' : 'disabled'} title="${skins.enabled ? '' : '先打开右上角「多人格」开关'}">切换</button></div>`;
@@ -106,17 +115,19 @@ async function initSkinsPage() {
         : '<span class="muted">没有专属指令</span>';
       return `<article class="persona-card ${isDefault ? 'is-default' : ''}" style="--persona-hue:${hue(name)}">
         <header>
-          <div class="persona-avatar" aria-hidden="true">${esc([...name][0] || '?')}</div>
+          <button type="button" class="persona-avatar-btn" data-ref="${esc(p.id)}" title="${refs[p.id] ? '更换设定图' : '上传设定图'}">${avatar(p.id, name, 'persona-avatar')}</button>
           <div class="persona-title"><h3>${esc(name)}</h3><span class="persona-id">${esc(p.id)}</span></div>
           <div class="persona-badges">${isDefault ? '<span class="persona-badge">默认</span>' : ''}${used ? `<span class="persona-badge soft">${used} 个会话</span>` : ''}</div>
         </header>
         <dl>
           <div><dt>角色卡</dt><dd>${esc(data.templates[p.templateId]?.name || p.templateId)}</dd></div>
           <div><dt>模型</dt><dd>${esc(p.model || data.globalApi.model || '全局模型')}</dd></div>
+          <div><dt>设定图</dt><dd>${refs[p.id] ? (refs[p.id].hint ? esc(refs[p.id].hint) : '已上传') : '<span class="muted">没有（画自己时长相不固定）</span>'}</dd></div>
         </dl>
         <div class="persona-cmds">${commands}</div>
         <footer class="personas-actions">
           <button type="button" class="btn btn-small" data-edit="${esc(p.id)}">编辑</button>
+          <button type="button" class="btn btn-small" data-ref="${esc(p.id)}">设定图</button>
           ${isDefault ? '' : `<button type="button" class="btn btn-small" data-default="${esc(p.id)}">设为默认</button>`}
           <span class="spacer"></span>
           <button type="button" class="btn btn-small btn-ghost-danger" data-remove="${esc(p.id)}" ${s.list.length === 1 ? 'disabled' : ''}>移除</button>
@@ -125,7 +136,9 @@ async function initSkinsPage() {
     }).join('');
     const count = el('skins-count');
     if (count) count.textContent = `${s.list.length} / 16`;
+    renderSoloRef();
     for (const button of el('skins-list').querySelectorAll('[data-edit]')) button.onclick = () => openEditor(button.dataset.edit);
+    for (const button of el('skins-list').querySelectorAll('[data-ref]')) button.onclick = () => openRef(button.dataset.ref);
     for (const button of el('skins-list').querySelectorAll('[data-default]')) button.onclick = async () => {
       if (busy) return;
       busy = true; button.disabled = true;
@@ -147,6 +160,57 @@ async function initSkinsPage() {
     };
     el('skin-add').disabled = s.list.length >= 16;
     updateDefault();
+  };
+  // ── 人物设定图 ──
+  const renderSoloRef = () => {
+    const box = el('skins-default-ref');
+    if (!box) return;
+    const name = data.persona?.botName || '单人格';
+    box.innerHTML = `<button type="button" class="persona-avatar-btn" data-ref="default" title="${refs.default ? '更换设定图' : '上传设定图'}">${avatar('default', name, 'persona-avatar')}</button>
+      <div class="persona-solo-copy"><strong>多人格未启用时：${esc(name)}</strong><span class="muted">设置 → 人设 里那一套的设定图${refs.default ? (refs.default.hint ? `：${esc(refs.default.hint)}` : '（已上传）') : '（还没有）'}</span></div>
+      <button type="button" class="btn btn-small" data-ref="default">设定图</button>`;
+    box.classList.toggle('is-active', !data.skins.enabled);
+    for (const button of box.querySelectorAll('[data-ref]')) button.onclick = () => openRef('default');
+  };
+  const refName = (key) => (key === 'default' ? (data.persona?.botName || '单人格') : (data.skins.list.find((x) => x.id === key)?.label || key));
+  const showPreview = (src) => {
+    el('persona-ref-preview').hidden = !src;
+    if (src) el('persona-ref-preview').src = src; else el('persona-ref-preview').removeAttribute('src');
+    el('persona-ref-empty').textContent = src ? '' : '点击选择设定图';
+  };
+  const openRef = (key) => {
+    if (busy) return;
+    refKey = key; refImage = '';
+    el('persona-ref-form').reset();
+    el('persona-ref-title').textContent = `「${refName(key)}」的人物设定图`;
+    el('persona-ref-hint').value = refs[key]?.hint || '';
+    showPreview(refs[key]?.url || '');
+    el('persona-ref-remove').hidden = !refs[key];
+    report(el('persona-ref-error'), '');
+    el('persona-ref-dialog').showModal();
+  };
+  // 超过 3.5MB 或边长 > 2048 才压一下（设定图要清楚，尽量不动原图）
+  const readImage = (file) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('读不了这张图'));
+    reader.onload = () => {
+      const url = String(reader.result || '');
+      const img = new Image();
+      img.onerror = () => reject(new Error('不是能识别的图片'));
+      img.onload = () => {
+        if (file.size <= 3.5 * 1024 * 1024 && Math.max(img.width, img.height) <= 2048) { resolve(url); return; }
+        const scale = Math.min(1, 2048 / Math.max(img.width, img.height));
+        const c = document.createElement('canvas');
+        c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+        resolve(c.toDataURL('image/jpeg', 0.9));
+      };
+      img.src = url;
+    };
+    reader.readAsDataURL(file);
+  });
+  const loadRefs = async () => {
+    try { refs = (await api('/api/persona-refs')).refs || {}; } catch { refs = {}; }
   };
   const saveSettings = async (skins) => {
     const result = await api('/api/skins', { method: 'POST', body: JSON.stringify({ skins }) });
@@ -181,8 +245,39 @@ async function initSkinsPage() {
     el('skins-summary-recent').value = skins.handoffOnSwitch.recentMessages; el('skins-summary-chars').value = skins.handoffOnSwitch.maxChars;
     el('skins-summary-provider').onchange = () => updateModels(el('skins-summary-model'), el('summary-model-options'), el('skins-summary-provider').value);
     updateModels(el('skins-summary-model'), el('summary-model-options'), skins.handoffOnSwitch.provider);
+    await loadRefs();
     paintMaster(); renderPersonas(); report(status, summaryLine());
     el('skin-add').onclick = () => openEditor();
+    el('persona-ref-file').onchange = async () => {
+      const file = el('persona-ref-file').files?.[0];
+      if (!file) return;
+      try { refImage = await readImage(file); showPreview(refImage); report(el('persona-ref-error'), ''); }
+      catch (error) { report(el('persona-ref-error'), error.message, true); }
+    };
+    el('persona-ref-cancel').onclick = () => { if (!busy) el('persona-ref-dialog').close(); };
+    el('persona-ref-dialog').oncancel = (event) => { if (busy) event.preventDefault(); };
+    el('persona-ref-dialog').onclick = (event) => { if (event.target === el('persona-ref-dialog') && !busy) el('persona-ref-dialog').close(); };
+    el('persona-ref-remove').onclick = async () => {
+      if (busy || !confirm(`移除「${refName(refKey)}」的设定图？之后画它自己时长相就不固定了。`)) return;
+      busy = true;
+      try {
+        await api(`/api/persona-refs/${encodeURIComponent(refKey)}`, { method: 'DELETE' });
+        await loadRefs(); renderPersonas(); renderBindings();
+        el('persona-ref-dialog').close(); report(status, `已移除「${refName(refKey)}」的设定图`);
+      } catch (error) { report(el('persona-ref-error'), '移除失败：' + error.message, true); }
+      finally { busy = false; }
+    };
+    el('persona-ref-form').onsubmit = async (event) => {
+      event.preventDefault(); if (busy) return;
+      if (!refImage && !refs[refKey]) { report(el('persona-ref-error'), '先选一张图。', true); return; }
+      busy = true; el('persona-ref-save').disabled = true;
+      try {
+        await api(`/api/persona-refs/${encodeURIComponent(refKey)}`, { method: 'POST', body: JSON.stringify({ ...(refImage ? { image: refImage } : {}), hint: el('persona-ref-hint').value.trim() }) });
+        await loadRefs(); renderPersonas(); renderBindings();
+        el('persona-ref-dialog').close(); report(status, `「${refName(refKey)}」的设定图已保存，画它自己时会带上`);
+      } catch (error) { report(el('persona-ref-error'), '保存失败：' + error.message, true); }
+      finally { busy = false; el('persona-ref-save').disabled = false; }
+    };
     el('persona-provider').onchange = () => updateModels(el('persona-model'), el('persona-model-options'), el('persona-provider').value);
     el('persona-cancel').onclick = () => { if (!busy) el('persona-dialog').close(); };
     el('persona-dialog').oncancel = (event) => { if (busy) event.preventDefault(); };

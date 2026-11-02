@@ -42,19 +42,19 @@
 #skins-page code { font-family: var(--mono); font-size: var(--fs-xs); }
 
 /* ── 表单控件 ── */
-#skins-page label, #persona-dialog label { display: flex; flex-direction: column; min-width: 0; gap: 6px; margin: 10px 0; font-size: var(--fs-sm); color: var(--muted); font-weight: 500; }
+#skins-page label, #persona-dialog label, #persona-ref-dialog label { display: flex; flex-direction: column; min-width: 0; gap: 6px; margin: 10px 0; font-size: var(--fs-sm); color: var(--muted); font-weight: 500; }
 #skins-page input:not([type=checkbox]), #skins-page select, #skins-page textarea,
-#persona-dialog input:not([type=checkbox]), #persona-dialog select, #persona-dialog textarea {
+#persona-dialog input:not([type=checkbox]), #persona-dialog select, #persona-dialog textarea, #persona-ref-dialog input:not([type=checkbox]), #persona-ref-dialog select, #persona-ref-dialog textarea {
   width: 100%; min-width: 0; box-sizing: border-box; padding: 9px 12px; font: inherit; font-size: var(--fs-md);
   color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-input);
 }
 #skins-page input:focus, #skins-page select:focus, #skins-page textarea:focus,
-#persona-dialog input:focus, #persona-dialog select:focus, #persona-dialog textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
-#skins-page textarea, #persona-dialog textarea { resize: vertical; line-height: 1.6; }
+#persona-dialog input:focus, #persona-dialog select:focus, #persona-dialog textarea:focus, #persona-ref-dialog input:focus, #persona-ref-dialog select:focus, #persona-ref-dialog textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
+#skins-page textarea, #persona-dialog textarea, #persona-ref-dialog textarea { resize: vertical; line-height: 1.6; }
 #skins-page .check-label { flex-direction: row; align-items: center; gap: 10px; color: var(--text); font-size: var(--fs-md); }
 #skins-page .check-label input { accent-color: var(--accent); width: 16px; height: 16px; }
-#skins-page .personas-fields, #persona-dialog .personas-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }
-#persona-dialog .field-note { font-size: var(--fs-xs); color: var(--faint); font-weight: 400; }
+#skins-page .personas-fields, #persona-dialog .personas-fields, #persona-ref-dialog .personas-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }
+#persona-dialog .field-note, #persona-ref-dialog .field-note { font-size: var(--fs-xs); color: var(--faint); font-weight: 400; }
 
 /* ── 人格卡片网格 ── */
 #skins-page .personas-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
@@ -84,7 +84,7 @@
 #skins-page .persona-card dd { margin: 0; font-size: var(--fs-md); line-height: 1.45; word-break: break-word; }
 #skins-page .persona-cmds { display: flex; flex-wrap: wrap; gap: 6px; min-height: 22px; }
 #skins-page .persona-cmd { padding: 2px 9px; border-radius: var(--r-pill); background: var(--bg-3); color: var(--text); }
-#skins-page .personas-actions, #persona-dialog .personas-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+#skins-page .personas-actions, #persona-dialog .personas-actions, #persona-ref-dialog .personas-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 #skins-page .persona-card footer { margin-top: auto; padding-top: 10px; border-top: 1px solid var(--border); }
 #skins-page .personas-actions .spacer { flex: 1; }
 #skins-page .btn-ghost-danger { color: var(--muted); }
@@ -120,23 +120,40 @@
 #skins-page #skins-dirty.is-dirty { color: var(--amber, var(--accent)); font-weight: 600; }
 
 /* ── 编辑弹窗 ── */
-#persona-dialog {
+#persona-dialog, #persona-ref-dialog {
   width: min(560px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); margin: auto; padding: 24px;
   overflow: auto; box-sizing: border-box; color: var(--text); background: var(--bg-2);
   border: 1px solid var(--border); border-radius: var(--r-float); box-shadow: var(--shadow-lg);
 }
-#persona-dialog::backdrop { background: var(--overlay, rgba(0, 0, 0, .55)); backdrop-filter: blur(2px); }
-#persona-dialog h2 { margin: 0 0 8px; font-size: var(--fs-xl); }
-#persona-dialog .personas-actions { justify-content: flex-end; margin-top: 18px; }
+#persona-dialog::backdrop, #persona-ref-dialog::backdrop { background: var(--overlay, rgba(0, 0, 0, .55)); backdrop-filter: blur(2px); }
+#persona-dialog h2, #persona-ref-dialog h2 { margin: 0 0 8px; font-size: var(--fs-xl); }
+#persona-dialog .personas-actions, #persona-ref-dialog .personas-actions { justify-content: flex-end; margin-top: 18px; }
 #persona-error:empty { display: none; }
-#skins-page .personas-error, #persona-dialog .personas-error { color: var(--red); }
+#skins-page .personas-error, #persona-dialog .personas-error, #persona-ref-dialog .personas-error { color: var(--red); }
 
 @media (max-width: 640px) {
   #skins-page { padding: 18px 14px 40px; }
   #skins-page .personas-hero { flex-direction: column; }
-  #skins-page .personas-fields, #persona-dialog .personas-fields, #skins-page .persona-card dl { grid-template-columns: minmax(0, 1fr); }
+#skins-page .personas-fields, #persona-dialog .personas-fields, #skins-page .persona-card dl, #persona-ref-dialog .personas-fields { grid-template-columns: minmax(0, 1fr); }
   #skins-page .personas-list { grid-template-columns: minmax(0, 1fr); }
   #skins-page input.personas-filter { width: 100%; }
   #skins-page .skin-row { flex-wrap: wrap; }
   #skins-page .skin-row select { flex: 1; }
 }
+
+/* 人物设定图（persona-refs）：头像就是设定图；点头像或「设定图」上传 / 更换 */
+#skins-page .persona-avatar-btn { all: unset; cursor: pointer; border-radius: var(--r-lg); flex: 0 0 auto; }
+#skins-page .persona-avatar-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#skins-page .persona-card .persona-avatar { width: 56px; height: 56px; }
+#skins-page .persona-avatar.has-ref, #skins-page .skin-dot.has-ref { background: var(--bg-3); overflow: hidden; padding: 0; }
+#skins-page .persona-avatar.has-ref img, #skins-page .skin-dot.has-ref img { width: 100%; height: 100%; object-fit: cover; object-position: top; display: block; }
+#skins-page .persona-solo { display: flex; align-items: center; gap: 12px; margin: 0 0 14px; padding: 12px 16px; border-radius: var(--r-card); background: var(--bg-2); box-shadow: var(--shadow-sm); opacity: .75; --persona-hue: 200; }
+#skins-page .persona-solo.is-active { opacity: 1; border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); }
+#skins-page .persona-solo-copy { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+#skins-page .persona-solo-copy .muted { font-size: var(--fs-xs); }
+#persona-ref-dialog .persona-ref-body { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 16px; align-items: start; margin-top: 10px; }
+#persona-ref-dialog .persona-ref-drop { margin: 0; aspect-ratio: 3 / 4; border: 1px dashed var(--border); border-radius: var(--r-lg); display: grid; place-items: center; cursor: pointer; overflow: hidden; background: var(--bg); color: var(--faint); text-align: center; }
+#persona-ref-dialog .persona-ref-drop:hover { border-color: var(--accent); }
+#persona-ref-dialog .persona-ref-drop img { width: 100%; height: 100%; object-fit: contain; }
+#persona-ref-dialog .persona-ref-body > label { margin: 0; }
+@media (max-width: 560px) { #persona-ref-dialog .persona-ref-body { grid-template-columns: minmax(0, 1fr); } #persona-ref-dialog .persona-ref-drop { max-width: 220px; } }

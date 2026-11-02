@@ -103,6 +103,20 @@ Windows 上执行 `.cmd/.bat` 时加 `LAB_BRIDGE_SHELL=1`。接收端默认只�
   豆包 Seedream 4.x、通义万相与多数网关认这个；字段名可改）/ `edits`。魔搭走 `image_url`；免 Key 的 pollinations 不支持，照常按纯文字画并在工具结果里说明。
 - 文件：`data/image-refs/<id>.<ext>`；关掉后保留。
 
+## 人格设定图（画"自己"时带上）
+
+代码：`src/extensions/persona-refs.js`，界面：侧栏「人格」每张人格卡（点头像或「设定图」）。
+
+- 每个人格一张人物设定图 + 一句外貌要点；卡片头像、会话列表里的小头像都显示这张图。多人格没开时用的那一套（设置 → 人设）
+  记在 `default` 名下，人格列表上方单独一块。
+- `generate_image` 多了 `self` 参数：模型画**它自己**（自拍、自画像、合照、它在做什么）时传 `self:true`；模型忘了传时，
+  对方原话里有"你自己 / 自拍 / 你长什么样…"、或画面描述里出现了它的名字也算。命中就把**本轮正在运行的那个人格**的设定图交给生图模型
+  （传图方式沿用「生图参考图」的 `imageRefs.mode` / `bodyField`，不用先打开参考图开关），提示词末尾补上外貌要点。
+- 多人格：设定图跟着本轮人格走（`skins.scope`），切人格后画的是新人格；某个人格没传设定图时**不会**再按触发词套「生图参考图」里的通用图
+  （那多半是别的人格的脸），点名的参考图照用。单人格保持旧行为。
+- 优先级：`reference` 点名 > 人格设定图 > 触发词命中的通用参考图。
+- 文件：`data/persona-refs/<人格 id>.<ext>` + `meta.json`（不进 config.json）；移除人格不删图。接口：`GET/POST/DELETE /api/persona-refs[/:id]`、`GET /api/persona-refs/:id/image`。
+
 ## 模型供应商（设置 → 模型 API）
 
 参照 AstrBot 的"添加供应商 → 选模型"：左列供应商、右列它的模型，点「使用」即切换当前模型；
@@ -131,13 +145,13 @@ Windows 上执行 `.cmd/.bat` 时加 `LAB_BRIDGE_SHELL=1`。接收端默认只�
 | --- | --- |
 | `src/tools/tools.js` | `buildToolDefs()` 末尾追加 `extensionToolDefs()` |
 | `src/core/orchestrator.js` | 工具过滤加 `extensionToolAvailable()`（权限判断复用上游已有的 `ctx.triggerEntries`）；每轮 user 内容加 `pluginContextFor()`（插件 v3 挂的背景） |
-| `src/tools/tools-core.js` | `generate_image` 调用前问一次 `getImageRefs().resolve()`，命中就带参考图 |
+| `src/tools/tools-core.js` | `generate_image` 调用前先问人格设定图（画自己时），再问 `getImageRefs().resolve()`，命中就带参考图；工具参数加 `self` |
 | `src/llm/image-gen.js` | `generateImage({ reference })`：请求体 / `/images/edits` 两种带图形状 |
 | `src/core/providers.js` | `removeProvider` / `renameProvider`，新建可带名称 |
 | `src/console/app.js` | `initExtensions`（读写包一层 `skins.scope`）；`PluginRegistry` 的 `getAgent`（插件 v3 的主动唤醒走 `orchestrator.wake`）/ `ExtensionCommands.consume`（紧跟人格切换指令）/ 路由 / 启停；`registerPersonaRoutes` |
 | `src/core/config-legacy.js` | 三个配置段与谷歌 / Edge 搜索的默认值（全部关闭） |
 
-回滚：把各配置段（chatSummary / labBridge / funTools / imageRefs）的 `enabled` 关掉即恢复原行为；数据文件保留，删掉 `data/lab-bridge/`、`data/image-refs/` 即彻底清除。
+回滚：把各配置段（chatSummary / labBridge / funTools / imageRefs）的 `enabled` 关掉即恢复原行为；数据文件保留，删掉 `data/lab-bridge/`、`data/image-refs/`、`data/persona-refs/` 即彻底清除。
 
 ## 界面
 

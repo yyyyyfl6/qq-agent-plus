@@ -5,7 +5,8 @@
 // 工具命名去掉了 qq_ 前缀（更短，省 token）。
 import crypto from 'node:crypto';
 import { getConfig, imageGenAvailable, imageGenMaxPerHour } from '../core/config.js';
-import { getImageRefs } from '../extensions/image-refs.js';
+import { getImageRefs, imageRefsConfig, resolveRefMode } from '../extensions/image-refs.js';
+import { activePersonaKey, getPersonaRefs, wantsSelf } from '../extensions/persona-refs.js';
 import { imageType } from '../core/image-type.js';
 import { nextAtFromHHMM, normalizeRepeat, nextOccurrenceAt } from '../core/reminders.js';
 import { synthesizeSpeech, ttsConfigured } from '../llm/tts.js';
@@ -798,6 +799,8 @@ export function buildToolDefs() {
       description: '自己画一张图（调用图片生成服务，按张计费、有每小时上限）。适合群友点名要"画一张"：梗图、应景的图。'
         + 'prompt 要写清楚画面内容（主体、风格、氛围）；要在图上带中文文字时，把文字用引号原样写进 prompt'
         + '（例如：…画面上有中文文字"事已至此，先吃饭吧"——能不能写对取决于所选图模型）。'
+        + '要画**你自己**（自拍、自画像、你在做什么、和对方的合照）就传 self:true：会带上你这个人格的人物设定图，'
+        + 'prompt 里写场景、动作、表情与风格就好，长相以设定图为准，不用自己编外貌。'
         + '默认生成后直接发到当前会话（配置可关掉自动发送），并同时存进表情库供以后复用；只想收藏、这次不发就传 send:false。'
         + '别频繁用（一次调用就是一次真实花费）。',
       parameters: {
@@ -806,6 +809,7 @@ export function buildToolDefs() {
           prompt: { type: 'string', description: '画面描述：主体 + 风格 + 氛围（如"一只橘猫戴着草帽坐在海边，卡通风格"）' },
           note: { type: 'string', description: '可选：给这张图起的短语（存进表情库便于以后找）' },
           send: { type: 'boolean', description: '传 false：这次只存进表情库、不发送；不传时按图片生成设置里的「生成后直接发送」处理' },
+          self: { type: 'boolean', description: '画面里有**你自己**（你这个角色：自拍、自画像、你在做某事、和对方的合照…）时传 true —— 宿主会把你当前人格的人物设定图交给生图模型，保证长得像你；画别的东西传 false 或不传' },
           reference: { type: 'string', description: '可选：参考图名称。配置了参考图时，对方的话命中触发词（如"画你自己"）会自动带上，一般不用填' }
         },
         required: ['prompt']
@@ -833,13 +837,21 @@ export function buildToolDefs() {
           let buffer; let revisedPrompt; let referenceNote;
           const label = String(args.note || '').trim() || prompt;
           let entry;
-          // 参考图：对方原话（或模型写的画面描述）命中触发词时，把那张图一起交给生图模型
-          const ref = getImageRefs()?.resolve({
-            userText: String(ctx.session?.triggerText || ''),
-            prompt,
-            reference: String(args.reference || ''),
-            model: cfg.imageGen?.model
-          }) || null;
+          // 参考图，两种来源（只带一张）：
+          //   ① 画它自己 → 当前人格的设定图（人格页上传；多人格时跟着本轮人格走，见 extensions/persona-refs.js）
+          //   ② 否则：对方原话（或模型写的画面描述）命中触发词的参考图（图片生成页，extensions/image-refs.js）
+          // 显式点名了某张参考图（reference）时以点名为准
+          const userText = String(ctx.session?.triggerText || '');
+          const named = String(args.reference || '').trim();
+          const selfRef = named ? null : (getPersonaRefs()?.resolveSelf(cfg, { self: args.self, userText, prompt }) || null);
+          const refCfg = imageRefsConfig(cfg);
+          // 多人格时画自己、但这个人格还没传设定图：不按触发词去套图片生成页里的通用参考图
+          // （那张多半是别的人格的脸）；点名的照用。单人格保持旧行为。
+          const otherFace = !selfRef && !named && cfg.skins?.enabled === true && activePersonaKey(cfg) !== 'default'
+            && wantsSelf({ self: args.self, userText, prompt, botName: cfg.persona?.botName });
+          const ref = selfRef
+            ? { item: { label: '人格设定图', hint: selfRef.hint }, buffer: selfRef.buffer, mime: selfRef.mime, mode: resolveRefMode(refCfg.mode, cfg.imageGen?.model), field: refCfg.bodyField }
+            : (otherFace ? null : (getImageRefs()?.resolve({ userText, prompt, reference: named, model: cfg.imageGen?.model }) || null));
           try {
             ({ buffer, revisedPrompt, referenceNote } = await generateImage({
               cfg,

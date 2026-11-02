@@ -10,11 +10,13 @@ import { ChatSummaryRuntime, chatSummaryToolDefs, registerChatSummaryRoutes } fr
 import { LabBridgeRuntime, labBridgeToolDefs, registerLabBridgeRoutes } from './lab-bridge.js';
 import { funToolDefs, registerFunToolsRoutes } from './fun-tools.js';
 import { ImageRefs, registerImageRefsRoutes } from './image-refs.js';
+import { PersonaRefs, registerPersonaRefsRoutes } from './persona-refs.js';
 
 const runtimes = {
   chatSummary: null,
   labBridge: null,
-  imageRefs: null
+  imageRefs: null,
+  personaRefs: null
 };
 
 export function initExtensions({ dataDir, store, sender, log = console.log } = {}) {
@@ -22,6 +24,7 @@ export function initExtensions({ dataDir, store, sender, log = console.log } = {
   runtimes.chatSummary = new ChatSummaryRuntime({ store, sender, log });
   runtimes.labBridge = new LabBridgeRuntime({ dataDir, sender, log });
   runtimes.imageRefs = new ImageRefs({ dataDir });
+  runtimes.personaRefs = new PersonaRefs({ dataDir });
   return runtimes;
 }
 
@@ -62,4 +65,5 @@ export function registerExtensionRoutes(router, deps) {
   registerLabBridgeRoutes(router, { ...deps, getRuntime: () => runtimes.labBridge });
   registerFunToolsRoutes(router, deps);
   registerImageRefsRoutes(router, { ...deps, getRuntime: () => runtimes.imageRefs });
+  registerPersonaRefsRoutes(router, { ...deps, getRuntime: () => runtimes.personaRefs });
 }

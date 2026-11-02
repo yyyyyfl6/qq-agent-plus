@@ -5936,7 +5936,9 @@ export function createApp({
     skins: skins.settings,
     providers: currentProviders().map((p) => ({ id: p.id, name: p.displayName || p.name || p.id, baseURL: p.baseURL || p.baseUrl, models: p.models || [], hasKey: Boolean(p.apiKey) })),
     templates: Object.fromEntries([...Object.entries(PERSONAS).map(([id, p]) => [id, { name: p.name }]), ...(getConfig({ unscoped: true }).customPersonas || []).map((p, i) => [`custom_${i}`, { name: p.name }])]),
-    globalApi: { baseUrl: getConfig({ unscoped: true }).api?.baseUrl || '', model: getConfig({ unscoped: true }).api?.model || '', hasKey: Boolean(getConfig({ unscoped: true }).api?.apiKey) }
+    globalApi: { baseUrl: getConfig({ unscoped: true }).api?.baseUrl || '', model: getConfig({ unscoped: true }).api?.model || '', hasKey: Boolean(getConfig({ unscoped: true }).api?.apiKey) },
+    // 多人格没开时那一套（设置 → 人设）的名字：人格页上它的设定图那一块要显示
+    persona: { botName: String(getConfig({ unscoped: true }).persona?.botName || '') }
   }));
   router.add('POST', '/api/skins', async (req, res) => {
     try {
